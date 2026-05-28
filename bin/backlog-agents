@@ -1339,6 +1339,8 @@ JSON
       (( sweep_flagged > 0 )) && summary="${summary}${YL}${sweep_flagged} flagged${RS}"
       echo "  ${DIM}══════════════════════════════════════${RS}"
       echo "  ${summary}"
+    else
+      echo "  ${DIM}━━ sweep ${sweeps_total} OK (no issues)━━${RS}"
     fi
 
     _write_status $(( sweep_fixed > 0 || sweep_flagged > 0 ? 1 : 0 ))

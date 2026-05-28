@@ -1088,6 +1088,47 @@ do_uninstall_monitor() {
   fi
 }
 
+# ---- subcommand: migrate-daemons ----
+
+# Migrate old-style plists (com.${USER}.*.backlog.plist and
+# com.${USER}.*.backlog-loop.plist) to the canonical
+# com.${USER}.*.backlog-agent.plist format.  Runs `backlog-agent
+# install-daemon` inside each affected project directory, which boots
+# out old daemons, removes old plists, and creates the new plist.
+# Safe to run on machines that are already migrated — it's a no-op
+# when only .backlog-agent plists exist.
+do_migrate_daemons() {
+  local migrated=0 skipped=0
+  local plist label name repo
+  for plist in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$plist" ]] || continue
+    label="$(basename "$plist" .plist)"
+    name="${label#com.${USER}.}"
+    name="${name%.backlog}"
+    name="${name%.backlog-loop}"
+    repo="$ACTIVE_ROOT/$name"
+    if [[ ! -d "$repo" ]]; then
+      warn "$label: project $name not found under $ACTIVE_ROOT; skipping"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    info "migrating $label → .backlog-agent.plist"
+    if ( cd "$repo" && "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent" install-daemon 2>&1 ); then
+      ok "$name migrated"
+      migrated=$((migrated + 1))
+    else
+      warn "$name migration failed"
+      skipped=$((skipped + 1))
+    fi
+  done
+  if (( migrated == 0 && skipped == 0 )); then
+    info "no old-style plists found — already migrated"
+  else
+    ok "$migrated daemon(s) migrated, $skipped skipped"
+  fi
+}
+
 # ---- subcommand: monitor ----
 
 do_monitor() {
@@ -1434,6 +1475,7 @@ case "$cmd" in
   uninstall-watchdog) do_uninstall_watchdog ;;
   install-monitor) do_install_monitor ;;
   uninstall-monitor) do_uninstall_monitor ;;
+  migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
     sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'

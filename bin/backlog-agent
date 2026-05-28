@@ -346,16 +346,17 @@ reclaim_stale_claims() {
   branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
   [[ -z "$branch" ]] && return
 
-  # The liveness signal is the most recent status-commit timestamp. A
-  # daemon pushes a status commit every tick (≤30 min); if none has
-  # appeared in 90 min, no daemon is running anywhere and all [~]
-  # items are stale regardless of which machine claimed them.
-  last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" --grep="backlog-agent-status" -1 2>/dev/null || echo "")"
-  if [[ -z "$last_status_ts" ]]; then
-    last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" -1 2>/dev/null || echo "")"
+  # On daemon startup (first tick), any [~] items are owned by a dead
+  # incarnation. Skip the stale-commit check and reclaim immediately.
+  if [[ "${STARTUP_RECLAIM:-0}" != "1" ]]; then
+    last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" --grep="backlog-agent-status" -1 2>/dev/null || echo "")"
+    if [[ -z "$last_status_ts" ]]; then
+      last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" -1 2>/dev/null || echo "")"
+    fi
+    [[ -z "$last_status_ts" ]] && return
+    (( now - last_status_ts <= stale_secs )) && return
   fi
-  [[ -z "$last_status_ts" ]] && return
-  (( now - last_status_ts <= stale_secs )) && return
+  STARTUP_RECLAIM=0
 
   while IFS= read -r line; do
     line_num="$(echo "$line" | cut -d: -f1)"
@@ -1009,6 +1010,7 @@ do_run() {
   acquire_lock
   trap 'release_lock' EXIT
   trap 'exit 130' INT TERM
+  STARTUP_RECLAIM=1
   if command -v fswatch >/dev/null 2>&1; then
     (
       fswatch -0 "$BACKLOG_FILE" | while IFS= read -r -d '' _; do

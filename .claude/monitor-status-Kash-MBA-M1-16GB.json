@@ -1,9 +1,11 @@
 {
-  "last_sweep_at": "2026-05-28T14:13:49Z",
-  "running": true,
+  "last_sweep_at": "2026-05-28T14:16:59Z",
+  "running": false,
+  "exit_code": 1,
+  "exit_state": "crashed",
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 4,
+  "sweeps_total": 0,
   "fixed_total": 0,
   "flagged_total": 0,
   "recent_actions": []

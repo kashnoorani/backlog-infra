@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-28T12:14:31Z",
+  "last_sweep_at": "2026-05-28T12:15:34Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 3,
+  "sweeps_total": 4,
   "fixed_total": 7,
   "flagged_total": 0,
   "recent_actions": [{"ts":"2026-05-28T12:13:28Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"backlog-infra","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T12:13:28Z","project":"sacred-geography","action":"stale_lock","result":"fixed"}]

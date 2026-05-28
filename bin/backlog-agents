@@ -550,13 +550,26 @@ snapshot() {
   for proj_dir in "${unique[@]}"; do
     local cd_file="$proj_dir/.claude/agent-cooldown.json"
     if [[ -f "$cd_file" ]]; then
-      local cd_until_epoch cd_active=0 cd_reason
+      local cd_until_epoch cd_active=0 cd_reason cd_parsed
       cd_until_epoch="$(jq -r '.until_epoch // 0' "$cd_file" 2>/dev/null || echo 0)"
       [[ "$cd_until_epoch" =~ ^[0-9]+$ ]] && (( cd_until_epoch > now )) && cd_active=1
       if (( cd_active )); then
         local cd_name; cd_name="$(basename "$proj_dir")"
         cd_reason="$(jq -r '.reason // "plan-limit"' "$cd_file" 2>/dev/null)"
-        alert_lines+=("  ${RD}${cd_name}${RS} cooldown (${cd_reason}) until $(date -j -f '%s' "$cd_until_epoch" '+%H:%M' 2>/dev/null || echo '?' )")
+        cd_parsed="$(jq -r '.parsed_from_reset // false' "$cd_file" 2>/dev/null)"
+        local remaining=$(( cd_until_epoch - now ))
+        local remain_str=""
+        if (( remaining >= 3600 )); then
+          remain_str="$(printf '%dh %dm' $((remaining/3600)) $(((remaining%3600)/60))) left"
+        elif (( remaining >= 60 )); then
+          remain_str="$((remaining/60))m left"
+        else
+          remain_str="${remaining}s left"
+        fi
+        local precise_tag=""
+        [[ "$cd_parsed" == "true" ]] && precise_tag="${YL}(precise)${RS} " || precise_tag="${DIM}(~estimated)${RS} "
+        local until_time; until_time="$(date -j -f '%s' "$cd_until_epoch" '+%H:%M' 2>/dev/null || echo '?')"
+        alert_lines+=("  ${RD}${cd_name}${RS} ${precise_tag}cooldown (${cd_reason}) — ${remain_str} (until ${until_time})")
         alert_n=$((alert_n + 1))
       fi
     fi

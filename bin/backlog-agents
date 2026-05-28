@@ -1303,6 +1303,7 @@ JSON
         elif [[ "$cd_parsed" == "false" ]]; then
           fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: cooldown fallback — couldn't parse reset time")
           sweep_flagged=$((sweep_flagged + 1))
+          _notify "backlog-monitor — cooldown issue" "${name}: couldn't parse reset time from Anthropic plan-limit message"
         elif (( cd_duration <= 0 )); then
           if (( fix )); then
             rm -f "$cd_file" 2>/dev/null || true
@@ -1317,6 +1318,7 @@ JSON
       if echo "$recent" | grep -q '_run_status_hook: command not found'; then
         fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: _run_status_hook not defined (known code bug)")
         sweep_flagged=$((sweep_flagged + 1))
+        _notify "backlog-monitor — code bug" "${name}: _run_status_hook not defined"
       fi
 
       # Pattern 7: repeated tick failures without cooldown

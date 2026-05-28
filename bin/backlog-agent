@@ -451,15 +451,7 @@ tick_once() {
     local cd_until; cd_until="$(cooldown_until_str)"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-limit cooldown active until ${cd_until:-?}; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
     pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
-    if [[ -n "$HOOK" ]]; then
-      node "$HOOK" \
-        --item "" \
-        --exit-code 0 \
-        --mode loop \
-        --pre-head "$pre_head" \
-        --pulled 0 \
-        >> "$LOG_FILE" 2>&1 || true
-    fi
+    _run_status_hook "" 0 loop "$pre_head" 0
     _post_tick_cleanup
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (cooldown)" | tee -a "$LOG_FILE"
     return 0
@@ -540,15 +532,7 @@ tick_once() {
   # the daemon is alive, but we don't burn tokens on an idle tick.
   if [[ -z "$item_title" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] no open items; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
-    if [[ -n "$HOOK" ]]; then
-      node "$HOOK" \
-        --item "" \
-        --exit-code 0 \
-        --mode loop \
-        --pre-head "$pre_head" \
-        --pulled "$pulled" \
-        >> "$LOG_FILE" 2>&1 || true
-    fi
+    _run_status_hook "" 0 loop "$pre_head" "$pulled"
     _post_tick_cleanup
     [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (idle)" | tee -a "$LOG_FILE"
@@ -648,15 +632,7 @@ tick_once() {
   fi
   rm -f "$capture_file" 2>/dev/null || true
 
-  if [[ -n "$HOOK" ]]; then
-    node "$HOOK" \
-      --item "$item_title" \
-      --exit-code "$claude_exit" \
-      --mode loop \
-      --pre-head "$pre_head" \
-      --pulled "$pulled" \
-      >> "$LOG_FILE" 2>&1 || true
-  fi
+  _run_status_hook "$item_title" "$claude_exit" loop "$pre_head" "$pulled"
 
   _post_tick_cleanup
   [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"

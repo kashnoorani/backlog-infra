@@ -32,6 +32,8 @@
 #   --watch    refresh every 10s (Ctrl-C to exit)
 #   --effort   add log-size column
 #   --day      bucket right column by today instead of 7d
+#   --compact  single-line per project, skip machines table
+#   --artefacts show uncommitted changes per host per project
 #
 # Sync flags:
 #   --no-pull         skip dotfiles + project pulls (just restart agents)
@@ -347,8 +349,23 @@ snapshot() {
       log_mb="$(awk -v b="$(wc -c < "$log")" 'BEGIN{printf "%.2fM", b/1048576}')"
     fi
 
-    rows+=("$name|$age_str|$active_host_short|$item_short|$state|$state_color|$(fmt_tok $sum_5h)|$(fmt_tok $sum_right)|$last_pull|$log_mb|$other_hosts")
+    # Sort key: projects with open items first, then by freshness, then by recency.
+    local has_item=1; [[ -n "${current_item:-}" ]] && has_item=0
+    local state_rank=2
+    case "$state" in fresh) state_rank=0 ;; idle) state_rank=1 ;; STALE) state_rank=2 ;; esac
+    local sort_key; printf -v sort_key '%d%d%06d' "$has_item" "$state_rank" "$age"
+
+    rows+=("$sort_key|$name|$age_str|$active_host_short|$item_short|$state|$state_color|$(fmt_tok $sum_5h)|$(fmt_tok $sum_right)|$last_pull|$log_mb|$other_hosts|$age")
   done
+
+  # Sort rows by priority: open items first, then freshness, then recency.
+  if (( ${#rows[@]} > 1 )); then
+    local -a sorted=()
+    while IFS= read -r r; do
+      [[ -n "$r" ]] && sorted+=("$r")
+    done < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1n)
+    rows=("${sorted[@]}")
+  fi
 
   # ---- header ----
   # right_label feeds the per-project table column header below ("5h | week"
@@ -371,7 +388,7 @@ snapshot() {
   # Health summary: count daemon states and watchdog status.
   local fresh=0 idle=0 stale=0
   for row in "${rows[@]}"; do
-    local st; st="${row#*|*|*|*|}"
+    local st; st="${row#*|*|*|*|*|}"
     st="${st%%|*}"
     case "$st" in
       fresh) fresh=$((fresh + 1)) ;;
@@ -439,6 +456,7 @@ snapshot() {
   echo
 
   # ---- MACHINES table ----
+  if (( ! COMPACT )); then
   if (( ${#_map_keys[@]} > 0 )); then
     local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
     printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
@@ -455,7 +473,8 @@ snapshot() {
       local mh_short="${mh%.local}"
       mh_short="${mh_short#Kash-MBA-}"
       (( ${#mh_short} > 14 )) && mh_short="${mh_short:0:11}…"
-      local m5h; m5h="$(fmt_tok ${_map_5h[$mi]:-0})"
+      local t5h_raw=${_map_5h[$mi]:-0}
+      local m5h; m5h="$(fmt_tok $t5h_raw)"
       local mr; mr="$(fmt_tok ${_map_right[$mi]:-0})"
       local mseen=${_map_seen[$mi]:-0}
       local mseen_str="—"
@@ -468,6 +487,14 @@ snapshot() {
         else                       ms="stale"; msc="$RD"
         fi
       fi
+      # Token burn rate: tokens-per-minute in the 5h window.
+      # For the local machine we can refine using the actual earliest tick; for
+      # remote we use a flat 5h (300 min) divisor so the rate is comparable.
+      local rate_str=""
+      if (( t5h_raw > 0 )); then
+        local rate; rate=$(( t5h_raw / 300 ))
+        rate_str=" $(fmt_tok $rate)/m"
+      fi
       local daemon_str=""
       if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
         daemon_str="${local_daemons}"
@@ -477,12 +504,15 @@ snapshot() {
       else
         daemon_str="${_map_proj[$mi]:-0} d"
       fi
-      printf '  %-20s %-10s %-11s %-11s %-9s %s%-7s%s\n' \
-        "$mh_short" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+      printf '  %-20s %s%-10s%s%s %-11s %-11s %-9s %s%-7s%s\n' \
+        "$mh_short" "$B" "$m5h" "$RS" "${DIM}${rate_str}${RS}" \
+        "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
     done <<< "$sorted_hosts"
 
     echo
   fi
+
+  if (( ! COMPACT )); then
 
   if (( EFFORT )) ; then
     printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-7s %-7s %-8s%s\n' \
@@ -492,8 +522,8 @@ snapshot() {
       "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
-    local name age host item state state_color s5h sR pulled log_mb other_hosts
-    IFS='|' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
+    local name age host item state state_color s5h sR pulled log_mb other_hosts _sort _age
+    IFS='|' read -r _sort name age host item state state_color s5h sR pulled log_mb other_hosts _age <<< "$row"
     (( ${#other_hosts} > 9 )) && other_hosts="${other_hosts:0:6}…"
     if (( EFFORT )); then
       printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s %-8s\n' \
@@ -503,6 +533,82 @@ snapshot() {
         "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
     fi
   done
+  fi  # ! COMPACT
+
+  # ---- health alerts ----
+  local alert_n=0
+  local alert_lines=()
+  for proj_dir in "${unique[@]}"; do
+    local cd_file="$proj_dir/.claude/agent-cooldown.json"
+    if [[ -f "$cd_file" ]]; then
+      local cd_until_epoch cd_active=0 cd_reason
+      cd_until_epoch="$(jq -r '.until_epoch // 0' "$cd_file" 2>/dev/null || echo 0)"
+      [[ "$cd_until_epoch" =~ ^[0-9]+$ ]] && (( cd_until_epoch > now )) && cd_active=1
+      if (( cd_active )); then
+        local cd_name; cd_name="$(basename "$proj_dir")"
+        cd_reason="$(jq -r '.reason // "plan-limit"' "$cd_file" 2>/dev/null)"
+        alert_lines+=("  ${RD}${cd_name}${RS} cooldown (${cd_reason}) until $(date -j -f '%s' "$cd_until_epoch" '+%H:%M' 2>/dev/null || echo '?' )")
+        alert_n=$((alert_n + 1))
+      fi
+    fi
+  done
+  if (( alert_n > 0 )); then
+    echo
+    printf '  %sALERTS%s\n' "${B}${YL}" "${RS}"
+    for line in "${alert_lines[@]}"; do printf '%s\n' "$line"; done
+    echo
+  fi
+
+  # ---- artefacts ----
+  if (( ARTEFACTS )); then
+    local art_n=0 art_any=0
+    local art_lines=()
+    for proj_dir in "${unique[@]}"; do
+      local pname; pname="$(basename "$proj_dir")"
+      for host_status in "$proj_dir/.claude/backlog-status-"*.json; do
+        [[ -f "$host_status" ]] || continue
+        local hname; hname="$(basename "$host_status" .json)"
+        hname="${hname#backlog-status-}"
+        hname="${hname%.local}"
+        hname="${hname#Kash-MBA-}"
+        local uncommitted
+        uncommitted="$(jq -r '
+          (.artifacts.uncommitted // []) |
+          if length == 0 then empty
+          else .[] | "\(.status) \(.path)"
+          end
+        ' "$host_status" 2>/dev/null)"
+        if [[ -n "$uncommitted" ]]; then
+          art_any=1
+          while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            art_lines+=("  ${pname}  ${DIM}${hname}${RS}  ${line}")
+            art_n=$((art_n + 1))
+          done <<< "$uncommitted"
+        fi
+      done
+    done
+    if (( art_any )); then
+      printf '  %sARTEFACTS%s (%d file(s))\n' "${B}${CY}" "${RS}" "$art_n"
+      for line in "${art_lines[@]}"; do printf '%s\n' "$line"; done
+    echo
+  fi
+  fi  # ! COMPACT
+  fi
+
+  # ---- compact mode: skip everything below, render single-line per project ----
+  if (( COMPACT )); then
+    echo
+    printf '  %-18s %-7s %-9s %-6s %-7s %s\n' "PROJECT" "STATE" "LAST BY" "PULL" "5h" "ITEM"
+    for row in "${rows[@]}"; do
+      local _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age
+      IFS='|' read -r _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age <<< "$row"
+      (( ${#item} > 40 )) && item="${item:0:37}…"
+      printf '  %-18s %s%-6s%s %-9s %-6s %-7s %s\n' \
+        "$name" "$state_color" "$state" "$RS" "$host" "$pulled" "$s5h" "$item"
+    done
+    return
+  fi
 }
 
 # ---- subcommand: sync ----
@@ -760,7 +866,7 @@ do_uninstall_watchdog() {
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
-FETCH=0; WATCH=0; EFFORT=0; DAY=0
+FETCH=0; WATCH=0; EFFORT=0; DAY=0; COMPACT=0; ARTEFACTS=0
 
 cmd="${1:-}"
 case "$cmd" in
@@ -780,6 +886,8 @@ case "$cmd" in
         --watch)  WATCH=1 ;;
         --effort) EFFORT=1 ;;
         --day)    DAY=1 ;;
+        --compact) COMPACT=1 ;;
+        --artefacts) ARTEFACTS=1 ;;
         *) echo "backlog-agents: unknown flag: $arg" >&2; exit 2 ;;
       esac
     done

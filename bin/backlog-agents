@@ -460,8 +460,8 @@ snapshot() {
   if (( ${#_map_keys[@]} > 0 )); then
     local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
     printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
-    printf '  %s%-20s %-10s %-11s %-11s %-9s %-7s%s\n' \
-      "$DIM" "MACHINE" "5h TOKENS" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
+    printf '  %s%-20s %-21s %-11s %-11s %-9s %-7s%s\n' \
+      "$DIM" "MACHINE" "5h TOKENS (rate)" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
 
     local sorted_hosts
     sorted_hosts="$(printf '%s\n' "${_map_keys[@]}" | sort)"
@@ -488,12 +488,21 @@ snapshot() {
         fi
       fi
       # Token burn rate: tokens-per-minute in the 5h window.
-      # For the local machine we can refine using the actual earliest tick; for
-      # remote we use a flat 5h (300 min) divisor so the rate is comparable.
+      # Build a fixed-width combined field (token + rate) so columns align.
+      local tok_field; tok_field="${B}${m5h}${RS}"
+      local tok_visible="${#m5h}"
       local rate_str=""
       if (( t5h_raw > 0 )); then
         local rate; rate=$(( t5h_raw / 300 ))
         rate_str=" $(fmt_tok $rate)/m"
+        tok_field+="${DIM}${rate_str}${RS}"
+        tok_visible=$(( tok_visible + ${#rate_str} ))
+      fi
+      # Pad to target visible width so the WEEK column stays aligned.
+      local tok_pad=$(( 21 - tok_visible ))
+      if (( tok_pad > 0 )); then
+        local spaces; printf -v spaces '%*s' "$tok_pad" ''
+        tok_field+="$spaces"
       fi
       local daemon_str=""
       if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
@@ -504,9 +513,8 @@ snapshot() {
       else
         daemon_str="${_map_proj[$mi]:-0} d"
       fi
-      printf '  %-20s %s%-10s%s%s %-11s %-11s %-9s %s%-7s%s\n' \
-        "$mh_short" "$B" "$m5h" "$RS" "${DIM}${rate_str}${RS}" \
-        "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+      printf '  %-20s %s %-11s %-11s %-9s %s%-7s%s\n' \
+        "$mh_short" "$tok_field" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
     done <<< "$sorted_hosts"
 
     echo
@@ -524,6 +532,7 @@ snapshot() {
   for row in "${rows[@]}"; do
     local name age host item state state_color s5h sR pulled log_mb other_hosts _sort _age
     IFS='|' read -r _sort name age host item state state_color s5h sR pulled log_mb other_hosts _age <<< "$row"
+    (( ${#name} > 18 )) && name="${name:0:15}…"
     (( ${#other_hosts} > 9 )) && other_hosts="${other_hosts:0:6}…"
     if (( EFFORT )); then
       printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s %-8s\n' \

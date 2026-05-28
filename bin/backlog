@@ -434,6 +434,9 @@ do_status() {
   # keep its stdout without duplicating it.
   open_count="$(grep -c -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null || true)"
   open_count="${open_count:-0}"
+  local thinking_count
+  thinking_count="$(sed -n '/^## Thinking/,/^## Open/p' "$BACKLOG_FILE" 2>/dev/null | grep -c -E '^- \[ \] ' || true)"
+  thinking_count="${thinking_count:-0}"
   local progress_count
   progress_count="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
   progress_count="${progress_count:-0}"
@@ -441,7 +444,8 @@ do_status() {
   (( open_count > 0 )) && cc="$YL"
   (( open_count > 5 )) && cc="$RD"
   local extra=""
-  (( progress_count > 0 )) && extra=" (${progress_count} in progress)"
+  (( thinking_count > 0 )) && extra=" (${thinking_count} thinking)"
+  (( progress_count > 0 )) && extra="${extra} (${progress_count} in progress)"
   printf '%s%s%s  %s%d open%s%s\n' "${B}${CY}" "$BACKLOG_FILE" "${RS}" "${cc}" "$open_count" "${RS}" "$extra"
 
   if (( open_count > 0 )); then

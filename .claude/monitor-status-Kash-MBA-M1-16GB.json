@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-28T21:37:38Z",
+  "last_sweep_at": "2026-05-28T21:39:38Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 5,
-  "fixed_total": 2,
-  "flagged_total": 1,
-  "recent_actions": [{"ts":"2026-05-28T21:29:29Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-28T21:31:33Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T21:37:38Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"}]
+  "sweeps_total": 1,
+  "fixed_total": 0,
+  "flagged_total": 0,
+  "recent_actions": []
 }

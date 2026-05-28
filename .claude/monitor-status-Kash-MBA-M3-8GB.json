@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-28T14:19:31Z",
+  "last_sweep_at": "2026-05-28T14:21:37Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M3-8GB",
-  "sweeps_total": 15,
-  "fixed_total": 12,
+  "sweeps_total": 16,
+  "fixed_total": 14,
   "flagged_total": 0,
-  "recent_actions": [{"ts":"2026-05-28T14:15:20Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"backlog-infra","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"class-agentic-ui","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:17:24Z","project":"backlog-infra","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:17:25Z","project":"dark-mode-safari","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:19:30Z","project":"backlog-infra","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:19:31Z","project":"dark-mode-safari","action":"git_push_rejected","result":"fixed"}]
+  "recent_actions": [{"ts":"2026-05-28T14:15:20Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"backlog-infra","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"class-agentic-ui","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:15:20Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-28T14:17:24Z","project":"backlog-infra","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:17:25Z","project":"dark-mode-safari","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:19:30Z","project":"backlog-infra","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:19:31Z","project":"dark-mode-safari","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:21:36Z","project":"backlog-infra","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-28T14:21:37Z","project":"dark-mode-safari","action":"git_push_rejected","result":"fixed"}]
 }

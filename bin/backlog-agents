@@ -591,7 +591,14 @@ snapshot() {
           art_any=1
           while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            art_lines+=("  ${pname}  ${DIM}${hname}${RS}  ${line}")
+            local st_code="${line:0:2}" st_path="${line:3}"
+            local st_color="$DIM"
+            case "$st_code" in
+              "??"|" D"|"D ") st_color="$RD" ;;   # untracked / deleted
+              " M"|"M "|"MM") st_color="$YL" ;;    # modified
+              " A"|"R ")      st_color="$GN" ;;    # added / renamed
+            esac
+            art_lines+=("  ${pname}  ${DIM}${hname}${RS}  ${st_color}${st_code}${RS} ${DIM}${st_path}${RS}")
             art_n=$((art_n + 1))
           done <<< "$uncommitted"
         fi

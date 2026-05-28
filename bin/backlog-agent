@@ -35,7 +35,7 @@
 # — run from a project root.
 #
 # Never run alongside an interactive /watch-backlog session — they race
-# for the same items. A .claude/watch-backlog-agent.ping sentinel (touched by
+# for the same items. A .claude/watch-backlog.ping sentinel (touched by
 # the slash command each iteration) guards against accidental overlap;
 # run/tick/watch refuse to start if the ping is < 3 min old.
 
@@ -224,12 +224,12 @@ release_lock() {
 }
 
 # Check if an interactive /watch-backlog session appears to be active.
-# The slash command touches .claude/watch-backlog-agent.ping on each iteration;
+# The slash command touches .claude/watch-backlog.ping on each iteration;
 # if the file is younger than 3 minutes (2× debounce window + guard
 # band), refuse to start a headless driver — they race for the same
 # items.
 check_interactive_worker() {
-  local ping_file="${STATE_DIR}/watch-backlog-agent.ping"
+  local ping_file="${STATE_DIR}/watch-backlog.ping"
   if [[ ! -f "$ping_file" ]]; then
     return 0
   fi

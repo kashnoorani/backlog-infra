@@ -56,9 +56,10 @@
 #       Boot out and remove the watchdog launchd plist.
 #
 # Daemon plist labels are polyglot during the migration:
-#   com.${USER}.<name>.backlog-agent   (new — written by `backlog install-daemon`)
+#   com.${USER}.<name>.backlog-agent   (new — written by `backlog-agent install-daemon`)
+#   com.${USER}.<name>.backlog         (old — pre-rename daemons)
 #   com.${USER}.<name>.backlog-loop    (legacy — pre-migration daemons)
-# Discovery checks both, preferring the new form.
+# Discovery checks all three, preferring the new form.
 #
 # Manifest format (~/dotfiles/active-projects.txt):
 #   One repo per line: `<relative-path-under-active>\t<git-url>`.
@@ -97,7 +98,7 @@ tsv_drop() {
 # new label form over the legacy one. Returns non-zero if neither exists.
 find_daemon_plist() {
   local name="$1" p
-  for suffix in backlog-agent backlog-loop; do
+  for suffix in backlog-agent backlog backlog-loop; do
     p="$HOME/Library/LaunchAgents/com.${USER}.${name}.${suffix}.plist"
     [[ -f "$p" ]] && { echo "$p"; return 0; }
   done
@@ -363,7 +364,7 @@ cmd_archive() {
   # the legacy one. Both are booted out if both exist (defensive — shouldn't
   # happen, but cheap to handle).
   local stopped=""
-  for suffix in backlog-agent backlog-loop; do
+  for suffix in backlog-agent backlog backlog-loop; do
     local label="com.${USER}.${name}.${suffix}"
     if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       info "stopping daemon $label"
@@ -420,7 +421,7 @@ cmd_sync() {
   while IFS=$'\t' read -r rel url; do
     [[ -z "$rel" ]] && continue
     local name="${rel##*/}"   # daemon name = leaf of relative path
-    for suffix in backlog-agent backlog-loop; do
+    for suffix in backlog-agent backlog backlog-loop; do
       local label="com.${USER}.${name}.${suffix}"
       local plist="$HOME/Library/LaunchAgents/${label}.plist"
       [[ -f "$plist" ]] || continue

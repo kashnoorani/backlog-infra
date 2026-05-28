@@ -563,6 +563,17 @@ do_sync() {
       warn "$label points to $repo which doesn't exist; skipping (run \`dev-projects sync\`)"
       continue
     fi
+    # If a tick is in flight (inflight file younger than 30 min), skip this daemon
+    # to avoid killing a running Claude session mid-work.
+    local inflight="$repo/.claude/backlog-agent-tick.inflight"
+    if [[ -f "$inflight" ]]; then
+      local age="$(perl -e 'print time - (stat(shift))[9]' "$inflight" 2>/dev/null || echo 0)"
+      if (( age < 1800 )); then
+        warn "$name: tick in flight (${age}s ago), skipping restart"
+        restarted=$((restarted + 1))
+        continue
+      fi
+    fi
     info "restarting $label"
     if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
@@ -571,8 +582,9 @@ do_sync() {
         sleep 1
       done
     fi
-    rmdir "$repo/.claude/backlog.lock"      2>/dev/null || true
-    rmdir "$repo/.claude/backlog-loop.lock" 2>/dev/null || true
+    rmdir "$repo/.claude/backlog.lock"           2>/dev/null || true
+    rmdir "$repo/.claude/backlog-loop.lock"      2>/dev/null || true
+    rmdir "$repo/.claude/backlog-agent.lock"     2>/dev/null || true
     if launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1; then
       ok "$label running"
       restarted=$((restarted + 1))

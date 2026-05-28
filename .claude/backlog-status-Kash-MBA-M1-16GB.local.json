@@ -1,13 +1,13 @@
 {
-  "last_tick_at": "2026-05-28T07:50:38.512Z",
+  "last_tick_at": "2026-05-28T07:53:19.390Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 15056,
   "last_work_commit": null,
-  "last_pull_count": 0,
-  "rolling_7d_tokens": 1716511,
+  "last_pull_count": 1,
+  "rolling_7d_tokens": 1731567,
   "backlog": {
     "thinking": 1,
     "open": 0,
@@ -18,11 +18,15 @@
   "artifacts": {
     "uncommitted": [
       {
+        "status": " M",
+        "path": "docs/Backlog.md"
+      },
+      {
         "status": "??",
         "path": ".claude/backlog-agent-tick.inflight"
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T07:50:40.498Z"
+    "computed_at": "2026-05-28T07:53:21.217Z"
   }
 }

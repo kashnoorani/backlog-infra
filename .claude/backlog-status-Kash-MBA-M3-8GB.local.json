@@ -1,5 +1,5 @@
 {
-  "last_tick_at": "2026-05-28T22:14:48.461Z",
+  "last_tick_at": "2026-05-28T22:24:57.673Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
   "last_item": "",
@@ -8,7 +8,7 @@
   "last_work_commit": null,
   "last_pull_count": 2,
   "last_session_id": "e03da41a-3782-4b2a-92d1-4785ce437cd4",
-  "rolling_7d_tokens": 401169,
+  "rolling_7d_tokens": 430233,
   "backlog": {
     "thinking": 0,
     "open": 0,
@@ -19,6 +19,6 @@
   "artifacts": {
     "uncommitted": [],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T22:14:50.797Z"
+    "computed_at": "2026-05-28T22:24:59.586Z"
   }
 }

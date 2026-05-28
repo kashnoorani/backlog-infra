@@ -442,8 +442,8 @@ snapshot() {
   if (( ${#_map_keys[@]} > 0 )); then
     local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
     printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
-    printf '  %s%-20s %-9s %-10s %-11s %-11s %-8s %-7s%s\n' \
-      "$DIM" "MACHINE" "PROJECTS" "5h TOKENS" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
+    printf '  %s%-20s %-10s %-11s %-11s %-9s %-7s%s\n' \
+      "$DIM" "MACHINE" "5h TOKENS" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
 
     local sorted_hosts
     sorted_hosts="$(printf '%s\n' "${_map_keys[@]}" | sort)"
@@ -455,7 +455,6 @@ snapshot() {
       local mh_short="${mh%.local}"
       mh_short="${mh_short#Kash-MBA-}"
       (( ${#mh_short} > 14 )) && mh_short="${mh_short:0:11}…"
-      local mp=${_map_proj[$mi]:-0}
       local m5h; m5h="$(fmt_tok ${_map_5h[$mi]:-0})"
       local mr; mr="$(fmt_tok ${_map_right[$mi]:-0})"
       local mseen=${_map_seen[$mi]:-0}
@@ -469,46 +468,38 @@ snapshot() {
         else                       ms="stale"; msc="$RD"
         fi
       fi
-      # For the local machine, project count = actual installed daemons.
-      # For remote machines, use history-derived count as a proxy.
-      local show_proj="$mp"
-      if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
-        show_proj="$local_daemons"
-      fi
-      # DAEMONS: for this machine, show local plist count + watchdog indicator.
-      # For other machines, show project count (proxy for daemon count).
       local daemon_str=""
       if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
-        daemon_str="${local_daemons} d"
+        daemon_str="${local_daemons}"
         (( have_sync && have_watch )) && daemon_str+=" +2w"
         (( have_sync && ! have_watch )) && daemon_str+=" +sw"
         (( ! have_sync && have_watch )) && daemon_str+=" +pw"
       else
-        daemon_str="${mp} d"
+        daemon_str="${_map_proj[$mi]:-0} d"
       fi
-      printf '  %-20s %-9d %-10s %-11s %-11s %-8s %s%-7s%s\n' \
-        "$mh_short" "$show_proj" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+      printf '  %-20s %-10s %-11s %-11s %-9s %s%-7s%s\n' \
+        "$mh_short" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
     done <<< "$sorted_hosts"
 
     echo
   fi
 
   if (( EFFORT )) ; then
-    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s %-8s%s\n' \
-      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "LOG" "$RS"
+    printf '  %s%-18s %-9s %-11s %-40s %-7s %-9s %-5s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "LAST TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "LOG" "$RS"
   else
-    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s%s\n' \
-      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "$RS"
+    printf '  %s%-18s %-9s %-11s %-40s %-7s %-9s %-5s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "LAST TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
     local name age host item state state_color s5h sR pulled log_mb other_hosts
     IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
-    (( ${#other_hosts} > 12 )) && other_hosts="${other_hosts:0:9}…"
+    (( ${#other_hosts} > 9 )) && other_hosts="${other_hosts:0:6}…"
     if (( EFFORT )); then
-      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s %-8s\n' \
+      printf '  %-18s %-9s %-11s %-40s %s%-7s%s %-9s %-5s %-7s %-7s %-8s\n' \
         "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR" "$log_mb"
     else
-      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s\n' \
+      printf '  %-18s %-9s %-11s %-40s %s%-7s%s %-9s %-5s %-7s %-7s\n' \
         "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
     fi
   done

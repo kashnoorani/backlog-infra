@@ -1279,7 +1279,7 @@ JSON
             if _is_self "$proj_dir"; then
               local stash_hash=""
               git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-              stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
+              stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
               git -C "$proj_dir" fetch origin 2>/dev/null || true
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
               git -C "$proj_dir" clean -fd 2>/dev/null || true
@@ -1309,7 +1309,7 @@ JSON
           if _is_self "$proj_dir"; then
             local stash_hash=""
             git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
+            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
             fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — stash (${stash_hash:-?}) + reset (self-protect)")
             sweep_fixed=$((sweep_fixed + 1))
@@ -1331,7 +1331,7 @@ JSON
           if _is_self "$proj_dir"; then
             local stash_hash=""
             git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
+            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
             fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — stash (${stash_hash:-?}) + reset (self-protect)")
             sweep_fixed=$((sweep_fixed + 1))

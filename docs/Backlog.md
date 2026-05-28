@@ -17,7 +17,6 @@ them to `## Open` when ready for work.
 (see `docs/multi-agent-design.md` for full design)
 
 ## Open
-- [ ] Implement Layer 1: add `--fallback-model claude-haiku-4-5` to the `claude -p` call in `bin/backlog-agent`. (~5 lines, no new infra)
 - [ ] Implement Layer 2: plan-limit detection + cooldown file + short-circuit in `tick_once`. Verify the plan-limit signature first by reading a real `.claude/backlog-agent.log` failure.
 
 (none)
@@ -30,4 +29,5 @@ them to `## Open` when ready for work.
 (none)
 
 ## Done
+- [x] Implement Layer 1: add `--fallback-model claude-haiku-4-5` to the `claude -p` call in `bin/backlog-agent`. (~5 lines, no new infra) — Added `--fallback-model claude-haiku-4-5` to the single `claude -p` invocation in `tick_once` (`bin/backlog-agent:449`), with a comment noting it absorbs transient Anthropic default-model overload but does not cover plan-limit exhaustion (haiku counts against the same plan — that's Layer 2's job). No new infra, no config, zero cost when not triggered. Verified with `bash -n` (no test suite exists in this shell-script project); confirmed there were no other `claude -p` call sites to update.
 - [x] Investigate how to add multi-agent support such that if claude isn't available (due to usage limits), then our infra can switch over to opencode/deepseek or some such combo. — Wrote `docs/multi-agent-design.md`. The agent invocation is a single line (`bin/backlog-agent:370`, `claude -p "$prompt"`), so failover is feasible. Proposes a three-layer design: (1) add `--fallback-model claude-haiku-4-5` to absorb transient Anthropic overload (~5 lines, no infra); (2) detect the plan-limit signature in stderr, write `.claude/agent-cooldown.json`, and short-circuit `tick_once` until the rolling window clears — this alone fixes the fail-loop visible in the recent backlog-status commits where ticks die in 1s with exit=1; (3) opt-in alternative agent via `~/.claude/agent-fallback.json` invoking OpenCode against DeepSeek (via OpenRouter), reusing the existing `$prompt` verbatim and extending `backlog-status.mjs` to log `agent=<name>` instead of token counts. Layers are independent and can ship in order. Doc includes friction list (OpenCode lacks slash commands, different permission model, no Claude transcript) and the items NOT in scope (mid-tick cutover, cross-agent state sharing, quality parity). Three follow-up implementation items are spelled out at the bottom of the design doc — not auto-appended here so the user can pick which (if any) to queue.

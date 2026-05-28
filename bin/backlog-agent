@@ -441,8 +441,12 @@ tick_once() {
   # claude exit, before we ever reach the PIPESTATUS capture. Wrapping in
   # `|| handler` keeps the failure local: PIPESTATUS still reflects the
   # claude pipeline when the handler runs.
+  # --fallback-model absorbs transient Anthropic overload of the default
+  # model (Layer 1 of docs/multi-agent-design.md). It does not help with
+  # plan-limit exhaustion — haiku counts against the same plan — that's
+  # Layer 2's cooldown.
   claude_exit=0
-  { claude -p "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE"; } \
+  { claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE"; } \
     || claude_exit=${PIPESTATUS[0]}
   if [[ $claude_exit -ne 0 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"

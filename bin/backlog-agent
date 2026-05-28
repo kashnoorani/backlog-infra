@@ -808,6 +808,7 @@ tick_once() {
             else
               git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
               echo "  [skipped] claim push failed after rebase for '${item_title}' — reset to origin" | tee -a "$LOG_FILE"
+              sleep $(( (RANDOM % 5) + 1 ))  # backoff to reduce cross-machine race
             fi
           else
             git -C "$PWD" rebase --abort 2>/dev/null || true

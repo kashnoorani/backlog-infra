@@ -40,6 +40,8 @@
 # run/tick/watch refuse to start if the ping is < 3 min old.
 
 set -euo pipefail
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$LIB_DIR/_lib.sh"
 
 # --- file discovery (polyglot during Phase 1 migration) ---
 # Canonical location is docs/Backlog.md. Also accept Backlog.md at the
@@ -359,6 +361,29 @@ tick_once() {
     return 0
   fi
 
+  # Flip the selected item from [ ] → [~] so other machines on the same
+  # project skip it. Commit+push the marker change before claude runs.
+  # If claude fails, flip it back. If the daemon crashes mid-tick the [~]
+  # item stays stuck — recoverable via `backlog unclaim`.
+  local claimed=false
+  if grep -q -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+      sed -i '' -E "0,/^(- )?\[[ !]\]/{s//\1[\~]/}" "$BACKLOG_FILE"
+    else
+      sed -i -E "0,/^(- )?\[[ !]\]/{s//\1[\~]/}" "$BACKLOG_FILE"
+    fi
+    if git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+      true  # sed didn't change anything — shouldn't happen, but guard
+    else
+      git -C "$PWD" add "$BACKLOG_FILE"
+      if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
+        git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+        claimed=true
+        echo "  [claim] ${item_title}" | tee -a "$LOG_FILE"
+      fi
+    fi
+  fi
+
   local prompt
   prompt="Execute exactly one iteration of the /watch-backlog contract (see ~/.claude/commands/watch-backlog.md), then exit. Specifically: re-read $BACKLOG_FILE fresh from disk; pick the first [ ] or [!] item from Open (exit silently if none); work it; typecheck + tests green before declaring done; update $BACKLOG_FILE (move the item to Done with [x] + a one-paragraph summary); commit with scoped \`git add <files>\` by filename; then exit. A [!] item is a retry after a previous [?] block — read the item body for the user's answers (typically prefixed \`[user]\`) and proceed using them. If the item turns out to need a user decision mid-work, flip it to [?] with a brief note on what's blocked, commit just the markup change, and exit."
 
@@ -371,6 +396,17 @@ tick_once() {
     || claude_exit=${PIPESTATUS[0]}
   if [[ $claude_exit -ne 0 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
+    if [[ "$claimed" == "true" ]]; then
+      if [[ "$(uname)" == "Darwin" ]]; then
+        sed -i '' -E "0,/\[\\\~\]/{s//[ ]/}" "$BACKLOG_FILE"
+      else
+        sed -i -E "0,/\[\\\~\]/{s//[ ]/}" "$BACKLOG_FILE"
+      fi
+      git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+      git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
+      git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+      echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
+    fi
   fi
 
   if [[ -n "$HOOK" ]]; then
@@ -398,10 +434,15 @@ do_status() {
   # keep its stdout without duplicating it.
   open_count="$(grep -c -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null || true)"
   open_count="${open_count:-0}"
+  local progress_count
+  progress_count="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
+  progress_count="${progress_count:-0}"
   local cc="$GN"
   (( open_count > 0 )) && cc="$YL"
   (( open_count > 5 )) && cc="$RD"
-  printf '%s%s%s  %s%d open%s\n' "${B}${CY}" "$BACKLOG_FILE" "${RS}" "${cc}" "$open_count" "${RS}"
+  local extra=""
+  (( progress_count > 0 )) && extra=" (${progress_count} in progress)"
+  printf '%s%s%s  %s%d open%s%s\n' "${B}${CY}" "$BACKLOG_FILE" "${RS}" "${cc}" "$open_count" "${RS}" "$extra"
 
   if (( open_count > 0 )); then
     local next
@@ -468,7 +509,7 @@ do_status() {
 do_run() {
   ensure_backlog
   check_interactive_worker
-  maybe_install_daemon
+  ${INSTALL_DAEMON:-true} && maybe_install_daemon
   acquire_lock
   trap 'release_lock' EXIT
   trap 'exit 130' INT TERM
@@ -509,7 +550,7 @@ do_tick() {
 do_watch() {
   ensure_backlog
   check_interactive_worker
-  maybe_install_daemon
+  ${INSTALL_DAEMON:-true} && maybe_install_daemon
   acquire_lock
   trap 'release_lock' EXIT
   trap 'exit 130' INT TERM
@@ -580,6 +621,24 @@ do_unblock() {
   esac
 }
 
+do_unclaim() {
+  # Flip all [~] items back to [ ] (recovery after a daemon crash mid-tick).
+  ensure_backlog
+  local n
+  n="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
+  n="${n:-0}"
+  if (( n == 0 )); then
+    echo "no [~] (in-progress) items found"
+    return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+  else
+    sed -i -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+  fi
+  echo "unclaimed $n item(s) [~] → [ ]"
+}
+
 do_compact() {
   if [[ -f scripts/backlog-compact.mjs ]]; then
     exec node scripts/backlog-compact.mjs "$@"
@@ -596,17 +655,6 @@ do_compact() {
 # --- launchd daemon install ---
 # XML-escape a string for safe interpolation into the plist heredoc.
 # Order matters: ampersand must be replaced first so we don't double-escape
-# the entities we're about to introduce. Covers `&`, `<`, `>` — enough for
-# element content (we're not interpolating into attribute values, which
-# would also need `"` escaped).
-xml_escape() {
-  local s="$1"
-  s="${s//&/&amp;}"
-  s="${s//</&lt;}"
-  s="${s//>/&gt;}"
-  printf '%s' "$s"
-}
-
 # Resolve the canonical paths a generated plist needs to reference.
 # Echos: project_root, project, label, plist_path, bin_path (newline-separated).
 daemon_paths() {
@@ -736,6 +784,13 @@ do_uninstall_daemon() {
 cmd="${1:-status}"
 shift 2>/dev/null || true
 
+if [[ "$1" == "--no-daemon" ]]; then
+  INSTALL_DAEMON=false
+  shift
+else
+  INSTALL_DAEMON=true
+fi
+
 case "$cmd" in
   status|"")  do_status ;;
   run)        do_run ;;
@@ -743,6 +798,7 @@ case "$cmd" in
   watch)      do_watch ;;
   log|tail)   do_log ;;
   unblock)    do_unblock "$@" ;;
+  unclaim)    do_unclaim ;;
   compact)    do_compact "$@" ;;
   install-daemon)   do_install_daemon ;;
   uninstall-daemon) do_uninstall_daemon ;;

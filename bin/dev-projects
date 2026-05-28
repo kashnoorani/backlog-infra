@@ -67,15 +67,8 @@
 #   (e.g., RallyCut.git → active/RallyCut-claude/).
 
 set -euo pipefail
-
-fmt_age() {
-  local d=$1
-  if   (( d < 60 ));    then printf '%ds ago' "$d"
-  elif (( d < 3600 ));  then printf '%dm ago' $((d/60))
-  elif (( d < 86400 )); then printf '%dh ago' $((d/3600))
-  else                       printf '%dd ago' $((d/86400))
-  fi
-}
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$LIB_DIR/_lib.sh"
 
 DOTFILES="$HOME/dotfiles"
 MANIFEST="$DOTFILES/active-projects.txt"
@@ -432,7 +425,7 @@ cmd_sync() {
       [[ -f "$plist" ]] || continue
       local expected="$ACTIVE_ROOT/$rel"
       local current_wd
-      current_wd="$(grep -A1 'WorkingDirectory' "$plist" | tail -1 | sed -E 's|.*<string>(.*)</string>.*|\1|')"
+      current_wd="$(plutil -extract WorkingDirectory raw "$plist" 2>/dev/null || true)"
       if [[ "$current_wd" != "$expected" ]]; then
         info "patching $plist (was: $current_wd → now: $expected)"
         # Replace EVERY occurrence of the old path with the new path (covers
@@ -527,15 +520,6 @@ cmd_status() {
     fi
     printf '%-30s %-22s %-22s %s\n' "$rel" "$on_disk" "$in_man" "$daemon"
   done <<< "$all_names"
-}
-
-# XML-escape a string for safe interpolation into a plist heredoc.
-xml_escape() {
-  local s="$1"
-  s="${s//&/&amp;}"
-  s="${s//</&lt;}"
-  s="${s//>/&gt;}"
-  printf '%s' "$s"
 }
 
 # Health check: for every active project with a daemon, verify the daemon

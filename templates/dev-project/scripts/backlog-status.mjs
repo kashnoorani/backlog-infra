@@ -33,8 +33,10 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const STATUS_FILE = join(REPO_ROOT, ".claude", "backlog-status.json");
-const HISTORY_LOG = join(REPO_ROOT, ".claude", "backlog-history.jsonl");
+const CLAUDE_DIR = join(REPO_ROOT, ".claude");
+const STATUS_FILE = join(CLAUDE_DIR, "backlog-status.json");
+const HOST_STATUS_FILE = join(CLAUDE_DIR, `backlog-status-${hostname()}.json`);
+const HISTORY_LOG = join(CLAUDE_DIR, "backlog-history.jsonl");
 const PLAN_LIMITS = join(homedir(), ".claude", "plan-limits.json");
 const TRANSCRIPTS_ROOT = join(homedir(), ".claude", "projects");
 
@@ -321,6 +323,7 @@ async function main() {
     backlog,
   };
   writeFileSync(STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
+  writeFileSync(HOST_STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
 
   const effort = {
     ts,
@@ -349,7 +352,7 @@ async function main() {
   // into cross-machine visibility later by tuning .gitignore to match
   // the convention used by other projects (ignore logs+locks, track
   // status+history).
-  const ignored = spawnSync("git", ["check-ignore", STATUS_FILE, HISTORY_LOG], {
+  const ignored = spawnSync("git", ["check-ignore", STATUS_FILE, HOST_STATUS_FILE, HISTORY_LOG], {
     cwd: REPO_ROOT,
   });
   if (ignored.status === 0) {
@@ -360,7 +363,7 @@ async function main() {
   }
 
   // Stage explicit paths (per CLAUDE.md — never `git add -A`)
-  git(["add", STATUS_FILE, HISTORY_LOG]);
+  git(["add", STATUS_FILE, HOST_STATUS_FILE, HISTORY_LOG]);
 
   // Skip commit if nothing was staged (defensive — appended JSONL line
   // means the diff is always non-empty in practice).

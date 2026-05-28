@@ -1,5 +1,5 @@
 {
-  "last_tick_at": "2026-05-28T12:21:25.114Z",
+  "last_tick_at": "2026-05-28T12:21:31.404Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
@@ -19,11 +19,15 @@
   "artifacts": {
     "uncommitted": [
       {
+        "status": " M",
+        "path": "bin/backlog-agents"
+      },
+      {
         "status": "??",
         "path": ".claude/agent-cooldown.json"
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T12:21:27.127Z"
+    "computed_at": "2026-05-28T12:21:33.428Z"
   }
 }

@@ -346,6 +346,17 @@ async function main() {
       { cwd: REPO_ROOT },
     ).status === 0;
   if (upstreamExists) {
+    // Stash any dirty files before pull --rebase. Claude may leave unstaged
+    // changes in the working tree if it exits abnormally; without a stash,
+    // `git pull --rebase` fails with "You have unstaged changes."
+    let stashed = false;
+    const stashR = spawnSync(
+      "git",
+      ["stash", "push", "--include-untracked", "-m", "backlog-agent-status pre-rebase autostash"],
+      { cwd: REPO_ROOT, encoding: "utf8" },
+    );
+    stashed = stashR.status === 0 && !stashR.stdout.includes("No local changes");
+
     const r = git(["pull", "--rebase", "origin", branch], { allowFail: true });
     if (r.status !== 0) {
       console.error(
@@ -356,6 +367,15 @@ async function main() {
       // abort it so the next tick doesn't walk into a broken repo.
       // `git rebase --abort` is a no-op when no rebase is in progress.
       git(["rebase", "--abort"], { allowFail: true });
+    }
+
+    if (stashed) {
+      const popR = spawnSync("git", ["stash", "pop"], { cwd: REPO_ROOT, encoding: "utf8" });
+      if (popR.status !== 0) {
+        console.error(
+          `[backlog-agent-status] stash pop after rebase failed (changes left in stash):\n${popR.stderr}`,
+        );
+      }
     }
   }
 

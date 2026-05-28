@@ -188,6 +188,20 @@ maybe_install_daemon() {
   exit 0
 }
 
+# GNU awk (gawk) supports `-i inplace`; BSD awk does not. Detect and
+# fall back to a tempfile + mv so the claim/unclaim blocks don't
+# silently no-op on macOS that ships with BSD awk.
+_local_awk_inplace() {
+  local file="$1" script="$2"
+  if command -v gawk >/dev/null 2>&1; then
+    gawk -i inplace "$script" "$file"
+  else
+    local tmpfile
+    tmpfile="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.awk-tmp.$$")"
+    awk "$script" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
+  fi
+}
+
 # --- helpers ---
 acquire_lock() {
   mkdir -p "$STATE_DIR"
@@ -307,6 +321,41 @@ auto_flip_blocked() {
       sed -i '' "${line_num}s/\[?\]/[!]/" "$BACKLOG_FILE"
     fi
   done < <(grep -nE '^(- )?\[\?\] ' "$BACKLOG_FILE" 2>/dev/null || true)
+}
+
+# Reclaim stale [~] items that were claimed but never completed.
+# After pulling origin, checks whether any daemon has pushed a status
+# commit recently. If the most recent status commit is older than
+# STALE_CLAIM_MINUTES (90 min = 1.5× the max plausible tick duration),
+# all [~] items are considered abandoned and flipped back to [ ] so
+# another tick (possibly on another machine) can pick them up.
+# Sets RECLAIMED_COUNT to the number of items flipped back.
+reclaim_stale_claims() {
+  RECLAIMED_COUNT=0
+  local branch stale_secs=5400 now last_status_ts line line_num item_title
+
+  now="$(date +%s)"
+  branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  [[ -z "$branch" ]] && return
+
+  # The liveness signal is the most recent status-commit timestamp. A
+  # daemon pushes a status commit every tick (≤30 min); if none has
+  # appeared in 90 min, no daemon is running anywhere and all [~]
+  # items are stale regardless of which machine claimed them.
+  last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" --grep="backlog-agent-status" -1 2>/dev/null || echo "")"
+  if [[ -z "$last_status_ts" ]]; then
+    last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" -1 2>/dev/null || echo "")"
+  fi
+  [[ -z "$last_status_ts" ]] && return
+  (( now - last_status_ts <= stale_secs )) && return
+
+  while IFS= read -r line; do
+    line_num="$(echo "$line" | cut -d: -f1)"
+    item_title="$(echo "$line" | cut -d: -f2- | sed -E 's/^(- )?\[~\] //')"
+    sed -i '' "${line_num}s/\[~\]/[ ]/" "$BACKLOG_FILE"
+    echo "  [reclaim] stale [~] item '${item_title}' (no status commit in $(( (now - last_status_ts) / 60 ))m)" | tee -a "$LOG_FILE"
+    RECLAIMED_COUNT=$((RECLAIMED_COUNT + 1))
+  done < <(grep -nE '^(- )?\[~\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }
 
 # Post-tick maintenance: log rotation and auto-compact, so the daemon
@@ -439,6 +488,11 @@ tick_once() {
   # is only needed when the user explicitly wants to block (no answer yet).
   auto_flip_blocked
 
+  # Reclaim stale [~] items from dead daemons before selecting the next
+  # item. This runs after the pull (origin is current) and before item
+  # selection, so reclaimed items become eligible on this tick.
+  reclaim_stale_claims
+
   pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
   # Only match items within the Open section (daemon never touches Thinking).
   # sed extracts from ## Open to next ## header or EOF; grep matches within.
@@ -451,6 +505,19 @@ tick_once() {
   # reconciles by checking that the recorded PID is still alive.
   if [[ -n "$INFLIGHT_FILE" ]]; then
     printf '%s\t%s\t%s\n' "$$" "$(date +%s)" "$item_title" > "$INFLIGHT_FILE"
+  fi
+
+  # If we reclaimed stale claims but have no new item to work, push the
+  # reclaim so other machines see it on origin. When there IS a new item
+  # below, the claim commit picks up the reclaim edits automatically
+  # (both touch $BACKLOG_FILE and get staged together).
+  if [[ $RECLAIMED_COUNT -gt 0 && -z "$item_title" ]]; then
+    if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+      git -C "$PWD" add "$BACKLOG_FILE"
+      git -C "$PWD" commit -m "reclaim: ${RECLAIMED_COUNT} stale claim(s)" >/dev/null 2>&1 || true
+      git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+      echo "  [reclaim] pushed ${RECLAIMED_COUNT} stale claim recovery" | tee -a "$LOG_FILE"
+    fi
   fi
 
   # If no open [-] or [!] items, skip the claude invocation entirely.
@@ -479,7 +546,7 @@ tick_once() {
   # item stays stuck — recoverable via `backlog-agent unclaim`.
   local claimed=false
   if [[ -n "$item_title" ]]; then
-    (cd "$PWD" && awk -i inplace '
+    _local_awk_inplace "$BACKLOG_FILE" '
       BEGIN { in_open=0; done=0 }
       /^## Open/       { in_open=1; print; next }
       /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
@@ -487,7 +554,7 @@ tick_once() {
         sub(/\[[ !]\]/, "[~]"); done=1
       }
       { print }
-    ' "$BACKLOG_FILE") 2>/dev/null || true
+    ' 2>/dev/null || true
     if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
       git -C "$PWD" add "$BACKLOG_FILE"
       if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
@@ -549,7 +616,7 @@ tick_once() {
       start_cooldown
     fi
     if [[ "$claimed" == "true" ]]; then
-      (cd "$PWD" && awk -i inplace '
+      _local_awk_inplace "$BACKLOG_FILE" '
         BEGIN { in_open=0; done=0 }
         /^## Open/       { in_open=1; print; next }
         /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
@@ -557,7 +624,7 @@ tick_once() {
           sub(/\[~\]/, "[ ]"); done=1
         }
         { print }
-      ' "$BACKLOG_FILE") 2>/dev/null || true
+      ' 2>/dev/null || true
       git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
       git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
       git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true

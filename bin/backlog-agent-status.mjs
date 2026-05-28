@@ -413,7 +413,13 @@ async function main() {
     artifacts,
   };
   writeFileSync(STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
-  writeFileSync(HOST_STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
+  // Per-host file always records the local machine's hostname — never
+  // inherit the shared file's preserved last_host (that's for the fleet
+  // "LAST BY" column, not for per-machine attribution).
+  writeFileSync(
+    HOST_STATUS_FILE,
+    `${JSON.stringify({ ...statusObj, last_host: host }, null, 2)}\n`,
+  );
 
   const effort = {
     ts,

@@ -4,8 +4,7 @@ A running list of work to do. Mark items `- [x]` when done and move
 them to the Done section, `- [ ]` when open, `- [~]` when in progress,
 `- [?]` when blocked on a design decision the user needs to weigh in
 on, and `- [!]` once you've written answers inline and want the worker
-to retry. The autonomous worker (see `/watch-backlog` or `backlog-agent
-run`) picks `- [ ]` and `- [!]` items and skips `- [?]`; surface those
+to retry. The autonomous worker (`backlog run`) picks `- [ ]` and `- [!]` items and skips `- [?]`; surface those
 to the user when waking them.
 
 Items parked in `## Thinking` are never picked by the daemon — move

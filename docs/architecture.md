@@ -429,6 +429,14 @@ Design details that matter:
   `wait`s on it, so a `SIGTERM` from `launchctl bootout` fires the EXIT trap
   immediately instead of being blocked until the sleep returns (which would
   force launchd to escalate to `SIGKILL` and orphan the lock).
+- **Per-tick mutex (`tick_once`)** — `do_run` drives `tick_once` from *two*
+  contexts (the fswatch subshell and the poll loop, both shown above). They
+  share the daemon-lifetime process lock, but that does not serialize ticks
+  within one daemon. A `mkdir`-based per-tick lock at the top of `tick_once`
+  ensures only one tick runs at a time; a concurrent trigger skips. Without it,
+  a backlog write (e.g. a `claim:` commit) trips fswatch mid-tick and a second
+  `claude` spawns on the same item — the runaway that surfaces when recovering
+  a long-stale item (reclaim re-fires every tick until a fresh status commit).
 - **Old-label retirement**: pre-rename daemons used `.backlog` / `.backlog-loop`
   labels. Install boots them out *and* removes their plists (a stray `RunAtLoad`
   plist would resurrect a second daemon at next login → double-daemon).
@@ -546,12 +554,13 @@ fallback. Full investigation and rationale in
 
 | Path | Written by | Tracked in git? | Purpose |
 |---|---|---|---|
-| `backlog-agent.lock/` (+ `pid`) | `acquire_lock` | no (gitignored) | process lock |
+| `backlog-agent.lock/` (+ `pid`) | `acquire_lock` | no (gitignored) | process lock (daemon-lifetime, one per checkout) |
+| `backlog-agent.tick.lock/` | `tick_once` | no (gitignored) | per-tick mutex — serializes the fswatch + poll drivers within one daemon |
 | `backlog-agent.log` | `tick_once` (tee) | no | live worker log (rotated at 10 MB) |
 | `backlog-agent-tick.inflight` | `tick_once` | no | `<pid>\t<epoch>\t<title>` of in-flight tick |
 | `agent-cooldown.json` | `start_cooldown` | no | plan-limit cooldown `until_epoch` |
 | `launchd-{stdout,stderr}.log` | launchd | no | daemon stdio |
-| `backlog-status.json` | status hook | **yes** | headline state (fleet dashboard) |
+| `backlog-status.json` | status hook | no (gitignored) | headline state; **local-only** — the hook writes it every tick but never commits it (per-host + history carry the cross-machine record), so tracking it only churned the tree and piled up auto-stashes |
 | `backlog-status-<host>.json` | status hook | **yes** | per-host canonical record |
 | `backlog-history.jsonl` | status hook | **yes** | append-only per-tick ledger |
 | `../docs/Backlog.md` | daemon + claude | **yes** | the queue |

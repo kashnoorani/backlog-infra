@@ -85,6 +85,24 @@ is the root cause of the "why can't the lock work cross-machine" confusion.
 - **Cross-machine by construction**: origin (GitHub) is the single shared
   medium. The push is the compare-and-swap — first to push wins.
 
+### Per-tick lock (`tick_once`) — a finer-grained sibling of the process lock
+
+The process lock guards two *daemons* on one checkout, but a single daemon
+drives `tick_once` from **two contexts** — the fswatch subshell and the poll
+loop (see `do_run`). The process lock is held for the daemon's whole lifetime
+and does not serialize those two drivers. A `mkdir`-based per-tick lock
+(`.claude/backlog-agent.tick.lock`) at the top of `tick_once` lets only one
+tick run at a time; a concurrent trigger skips. Released on tick return (a
+`RETURN` trap), and cleared across restarts in `release_lock` and
+`acquire_lock`'s stale-reclaim path.
+
+**Why it's needed:** a tick's own backlog write (a `claim:`/`reclaim:` commit)
+trips fswatch, which would otherwise start a *second* concurrent tick. In
+steady state that second tick finds the item already `[~]` and idles — but
+while recovering a long-stale item it turns into a runaway: `reclaim_stale_claims`
+re-fires every tick until a fresh status commit lands, so each concurrent tick
+re-opens and re-claims the same item and spawns its own `claude`.
+
 ## Full tick lifecycle
 
 ```

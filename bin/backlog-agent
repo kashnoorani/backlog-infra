@@ -805,7 +805,7 @@ do_uninstall_daemon() {
 cmd="${1:-status}"
 shift 2>/dev/null || true
 
-if [[ "$1" == "--no-daemon" ]]; then
+if [[ "${1:-}" == "--no-daemon" ]]; then
   INSTALL_DAEMON=false
   shift
 else

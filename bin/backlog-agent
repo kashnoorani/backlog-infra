@@ -743,11 +743,13 @@ tick_once() {
     printf '%s\t%s\t%s\n' "$$" "$(date +%s)" "$item_title" > "$INFLIGHT_FILE"
   fi
 
-  # If we reclaimed stale claims but have no new item to work, push the
-  # reclaim so other machines see it on origin. When there IS a new item
-  # below, the claim commit picks up the reclaim edits automatically
-  # (both touch $BACKLOG_FILE and get staged together).
-  if [[ $RECLAIMED_COUNT -gt 0 && -z "$item_title" ]]; then
+  # If we reclaimed stale claims, commit + push the reclaim now (before the
+  # claim below). Bundling the reclaim into the later claim commit fails when
+  # the reclaimed item is also the one selected: reclaim flips [~]→[ ] and the
+  # claim flips [ ]→[~], cancelling to a zero net diff, so the claim commit is
+  # skipped and the tick aborts as "claim push failed". Committing the reclaim
+  # separately keeps the claim's [ ]→[~] a real diff so the CAS push still works.
+  if [[ $RECLAIMED_COUNT -gt 0 ]]; then
     if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
       git -C "$PWD" add "$BACKLOG_FILE"
       git -C "$PWD" commit -m "reclaim: ${RECLAIMED_COUNT} stale claim(s)" >/dev/null 2>&1 || true

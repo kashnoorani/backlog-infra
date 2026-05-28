@@ -103,7 +103,13 @@ is the root cause of the "why can't the lock work cross-machine" confusion.
     │      ▼
     ├─ 5. select next item ──── first [ ] or [!] from ## Open
     │      │
-    │      ├─ no item ──▶ push reclaim (if any) ──▶ heartbeat ──▶ return
+    │      ▼
+    ├─ 5b. push reclaim ─────── if any [~]→[ ] this tick: commit + push
+    │      │                     "reclaim: N" BEFORE the claim, so the claim's
+    │      │                     [ ]→[~] stays a real diff even when the
+    │      │                     reclaimed item is the one being claimed
+    │      │
+    │      ├─ no item ──▶ heartbeat ──▶ return
     │      │
     │      ▼
     ├─ 6. claim item ────────── [ ] / [!] → [~]
@@ -269,9 +275,14 @@ all `[~]` items are considered abandoned and flipped back to `[ ]`.
 A daemon pushes a status commit every ≤30 min; 90 min of silence
 means no daemon is running.
 
-If reclaimed items leave the daemon idle (no new item to work), a
-standalone `"reclaim: N stale claim(s)"` commit is pushed so other
-machines see the freed items.
+When any items are reclaimed, a standalone `"reclaim: N stale claim(s)"`
+commit is pushed *before* the claim below, so other machines see the
+freed items. This must happen even when a new item is then claimed: if
+the reclaimed item is also the one selected, reclaim (`[~]`→`[ ]`) and
+claim (`[ ]`→`[~]`) cancel to a zero net diff, so bundling them into a
+single claim commit would commit nothing — the claim is silently skipped
+and the tick aborts as "claim push failed". Pushing the reclaim first
+keeps the claim's `[ ]`→`[~]` a real diff so the CAS push still works.
 
 ### 2. Hardened pull pathway
 

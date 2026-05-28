@@ -476,7 +476,22 @@ tick_once() {
   check_github_ssh && ssh_ok=1
   if git -C "$PWD" rev-parse --abbrev-ref @{u} >/dev/null 2>&1; then
     head_before="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
-    git -C "$PWD" pull --ff-only 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE" || true
+    # Fetch first (always safe, no-op on failure), then fast-forward
+    # if possible. If HEAD has diverged from origin (local commits
+    # that were never pushed, e.g. a claude push that failed), reset
+    # to origin to recover the sync channel. The daemon's work is
+    # idempotent — a discarded commit will be redone on the next tick
+    # if the item is still open.
+    branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    git -C "$PWD" fetch origin "$branch" 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE" || true
+    if git -C "$PWD" merge-base --is-ancestor HEAD "origin/$branch" 2>/dev/null; then
+      if ! git -C "$PWD" merge --ff-only "origin/$branch" 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE"; then
+        echo "  [git] fast-forward merge failed (continuing)" | tee -a "$LOG_FILE"
+      fi
+    else
+      echo "  [git] local diverged from origin/${branch}; resetting to sync" | tee -a "$LOG_FILE"
+      git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+    fi
     head_after="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
       pulled="$(git -C "$PWD" rev-list --count "${head_before}..${head_after}" 2>/dev/null || echo 0)"

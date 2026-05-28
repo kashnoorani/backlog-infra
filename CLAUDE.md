@@ -27,3 +27,8 @@ workflow, fleet management, project templates, and release pipeline.
 - **Templates**: `__PROJECT_NAME__` is the placeholder for new projects.
   `backlog-agent-status.mjs` and `release.mjs` wrappers in the template delegate
   to the shared copies in `bin/`.
+- **Locking & coordination**: `docs/cross-machine-locking.md` explains the two
+  separate lock layers (local process exclusion vs. git-push work-item claim),
+  the full tick lifecycle, cross-machine race handling, and all failure-mode
+  recovery paths. Read before touching `acquire_lock`, the claim block, or any
+  tick_once sync logic.

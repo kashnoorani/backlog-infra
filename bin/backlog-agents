@@ -1277,19 +1277,23 @@ JSON
           if (( safe_to_fix && fix )); then
             git -C "$proj_dir" rebase --abort 2>/dev/null || true
             if _is_self "$proj_dir"; then
+              local stash_hash=""
               git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
+              stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
               git -C "$proj_dir" fetch origin 2>/dev/null || true
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
               git -C "$proj_dir" clean -fd 2>/dev/null || true
-              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash + reset (self-protect)")
+              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash (${stash_hash:-?}) + reset (self-protect)")
+              sweep_fixed=$((sweep_fixed + 1))
+              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
             else
               git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
                 git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
               git -C "$proj_dir" clean -fd 2>/dev/null || true
               fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+              sweep_fixed=$((sweep_fixed + 1))
+              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
             fi
-            sweep_fixed=$((sweep_fixed + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
           else
             fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
             sweep_flagged=$((sweep_flagged + 1))
@@ -1303,16 +1307,20 @@ JSON
         if (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
           if _is_self "$proj_dir"; then
+            local stash_hash=""
             git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
+            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — stash + reset (self-protect)")
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — stash (${stash_hash:-?}) + reset (self-protect)")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
           else
             git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
             fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
           fi
-          sweep_fixed=$((sweep_fixed + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
         fi
       fi
 
@@ -1321,16 +1329,20 @@ JSON
         if (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
           if _is_self "$proj_dir"; then
+            local stash_hash=""
             git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
+            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1)"
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — stash + reset (self-protect)")
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — stash (${stash_hash:-?}) + reset (self-protect)")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
           else
             git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
             fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
           fi
-          sweep_fixed=$((sweep_fixed + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
         fi
       fi
 

@@ -1,12 +1,12 @@
 {
-  "last_tick_at": "2026-05-28T06:16:19.099Z",
+  "last_tick_at": "2026-05-28T06:16:42.929Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 14076,
   "last_work_commit": null,
-  "last_pull_count": 0,
+  "last_pull_count": 4,
   "rolling_7d_tokens": 1259737,
   "backlog": {
     "thinking": 0,
@@ -23,6 +23,6 @@
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T06:16:20.807Z"
+    "computed_at": "2026-05-28T06:16:44.678Z"
   }
 }

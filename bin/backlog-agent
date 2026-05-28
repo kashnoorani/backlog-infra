@@ -662,7 +662,7 @@ tick_once() {
         git -C "$PWD" stash pop 2>/dev/null || git -C "$PWD" stash drop 2>/dev/null || true
       fi
     else
-      # Stash dirty per-host files before resetting to avoid losing
+      # Stash dirty per-host files before rebase/reset to avoid losing
       # status data written by this machine's status hook.
       local stashed=false
       if ! git -C "$PWD" diff --quiet -- ".claude/backlog-status-"*".json" 2>/dev/null; then
@@ -670,8 +670,14 @@ tick_once() {
           stashed=true
         fi
       fi
-      echo "  [git] local diverged from origin/${branch}; resetting to sync" | tee -a "$LOG_FILE"
-      git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+      echo "  [git] local diverged from origin/${branch}; attempting rebase" | tee -a "$LOG_FILE"
+      if git -C "$PWD" pull --rebase origin "$branch" 2>/dev/null; then
+        echo "  [git] rebase succeeded (local commits preserved on top of origin)" | tee -a "$LOG_FILE"
+      else
+        git -C "$PWD" rebase --abort 2>/dev/null || true
+        git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+        echo "  [git] rebase conflict — reset to origin, local commits discarded" | tee -a "$LOG_FILE"
+      fi
       if [[ "$stashed" == "true" ]]; then
         git -C "$PWD" stash pop 2>/dev/null || git -C "$PWD" stash drop 2>/dev/null || true
       fi
@@ -756,15 +762,27 @@ tick_once() {
           claimed=true
           echo "  [claim] ${item_title}" | tee -a "$LOG_FILE"
         else
-          # Push failed (e.g. another machine claimed first). Discard the
-          # local claim commit and reset to the remote tip so the daemon
-          # can pull cleanly on the next tick. The item stays [ ] on the
-          # remote — another machine or the next tick will pick it up.
+          # Push failed — another machine may have pushed first. Try to
+          # rebase the claim on top of origin. If the item is still open
+          # on the remote the rebase succeeds and we retry the push. If a
+          # merge conflict occurs (someone else claimed the same item),
+          # abort the rebase and reset so the next tick proceeds cleanly.
           local branch
           branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)"
           git -C "$PWD" fetch origin "$branch" 2>/dev/null || true
-          git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
-          echo "  [skipped] claim push failed for '${item_title}' — reset to origin, retry next tick" | tee -a "$LOG_FILE"
+          if git -C "$PWD" pull --rebase origin "$branch" 2>/dev/null; then
+            if git -C "$PWD" push origin "$branch" 2>/dev/null; then
+              claimed=true
+              echo "  [claim] ${item_title} (rebase + retry)" | tee -a "$LOG_FILE"
+            else
+              git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+              echo "  [skipped] claim push failed after rebase for '${item_title}' — reset to origin" | tee -a "$LOG_FILE"
+            fi
+          else
+            git -C "$PWD" rebase --abort 2>/dev/null || true
+            git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+            echo "  [skipped] claim push failed for '${item_title}' — rebase conflict, reset to origin" | tee -a "$LOG_FILE"
+          fi
         fi
       fi
     fi

@@ -5,7 +5,7 @@
 // .claude/backlog-status.json (overwrite, headline state) and appends one
 // line to .claude/backlog-history.jsonl (full history), then commits both
 // with a `Claude-Effort:` trailer and pushes. Cross-machine status: every
-// machine commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlogs`
+// machine commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlog-agents`
 // aggregates by fetching.
 //
 // Usage:
@@ -374,7 +374,7 @@ async function main() {
   appendFileSync(HISTORY_LOG, `${JSON.stringify(effort)}\n`);
 
   // Gracefully no-op the commit/push when `.claude/` (or these specific
-  // files) is wholesale-gitignored — the local fleet view (`backlogs`
+  // files) is wholesale-gitignored — the local fleet view (`backlog-agents`
   // reads .claude/*.json directly) still works, and the user can opt
   // into cross-machine visibility later by tuning .gitignore to match
   // the convention used by other projects (ignore logs+locks, track

@@ -267,12 +267,12 @@ cmd_new() {
 
   # Optional daemon install (best-effort; never fail the whole command on this).
   if (( no_daemon == 0 )); then
-    if command -v backlog >/dev/null 2>&1; then
+    if command -v backlog-agent >/dev/null 2>&1; then
       info "installing agent"
-      ( cd "$dest" && backlog install-daemon ) \
-        || err "agent install failed — run manually with: cd $dest && backlog install-daemon"
+      ( cd "$dest" && backlog-agent install-daemon ) \
+        || err "agent install failed — run manually with: cd $dest && backlog-agent install-daemon"
     else
-      info "backlog driver not on PATH; skipping daemon install"
+      info "backlog-agent driver not on PATH; skipping daemon install"
     fi
   fi
 
@@ -337,12 +337,12 @@ cmd_activate() {
   # backlog file just means this isn't a workflow-stack project (skip silently).
   if (( no_daemon == 0 )); then
     if [[ -f "$dest/docs/Backlog.md" || -f "$dest/Backlog.md" || -f "$dest/backlog.txt" ]]; then
-      if command -v backlog >/dev/null 2>&1; then
+      if command -v backlog-agent >/dev/null 2>&1; then
         info "installing agent"
-        ( cd "$dest" && backlog install-daemon ) \
-          || err "agent install failed — run manually with: cd $dest && backlog install-daemon"
+        ( cd "$dest" && backlog-agent install-daemon ) \
+          || err "agent install failed — run manually with: cd $dest && backlog-agent install-daemon"
       else
-        info "backlog driver not on PATH; skipping daemon install"
+        info "backlog-agent driver not on PATH; skipping daemon install"
       fi
     else
       info "no backlog file in $dest; skipping daemon install (pass --no-daemon to silence)"
@@ -446,9 +446,9 @@ cmd_sync() {
 }
 
 cmd_install_daemons() {
-  local BACKLOG_BIN="$HOME/dev/projects/active/backlog-infra/bin/backlog"
+  local AGENT_BIN="$HOME/dev/projects/active/backlog-infra/bin/backlog-agent"
   if [[ ! -x "$BACKLOG_BIN" ]]; then
-    fail "backlog driver not found at $BACKLOG_BIN"
+    fail "backlog-agent driver not found at $AGENT_BIN"
   fi
   info "scanning $ACTIVE_ROOT for projects without an agent"
   local installed=0 skipped_existing=0 skipped_no_backlog=0 failed=0
@@ -469,7 +469,7 @@ cmd_install_daemons() {
       continue
     fi
     info "installing daemon for $name"
-    if ( cd "$dest" && "$BACKLOG_BIN" install-daemon ); then
+    if ( cd "$dest" && "$AGENT_BIN" install-daemon ); then
       ok "$name daemon installed"
       installed=$((installed + 1))
     else
@@ -560,7 +560,7 @@ cmd_health_check() {
 }
 
 cmd_watch_daemons() {
-  [[ -x "$HOME/dev/projects/active/backlog-infra/bin/backlog" ]] || fail "backlog driver not found at $HOME/dev/projects/active/backlog-infra/bin/backlog"
+  [[ -x "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent" ]] || fail "backlog-agent driver not found at $HOME/dev/projects/active/backlog-infra/bin/backlog-agent"
   local interval=1800 once=0
   while [[ $# -gt 0 ]]; do
     case "$1" in

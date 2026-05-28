@@ -6,7 +6,7 @@
 // .claude/backlog-status.json (overwrite, headline state) and appends
 // one line to .claude/backlog-history.jsonl (full history), then commits
 // both with a `Claude-Effort:` trailer and pushes. Cross-machine status:
-// every machine commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlogs`
+// every machine commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlog-agents`
 // aggregates by fetching.
 //
 // REPO_ROOT note: this is the SHARED copy in ~/dev/projects/active/backlog-infra/bin/. It derives
@@ -228,6 +228,53 @@ function countBacklogMarkers() {
   return counts;
 }
 
+// ---------- local artefacts (files not pushed to origin) ----------
+// Captures what exists in the working tree but not on origin so the web
+// dashboard can surface it: uncommitted changes (untracked / modified /
+// staged, from `git status --porcelain`, which already excludes gitignored
+// paths) plus the count of local commits not yet on origin/<branch>.
+// Defensive throughout — any git failure yields an empty/partial result so a
+// tick is never broken by this.
+function computeArtifacts(branch) {
+  const out = {
+    uncommitted: [],
+    unpushed_commits: 0,
+    computed_at: new Date().toISOString(),
+  };
+  try {
+    const st = spawnSync("git", ["status", "--porcelain"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+    });
+    if (st.status === 0 && st.stdout) {
+      for (const line of st.stdout.split("\n")) {
+        if (!line) continue;
+        const code = line.slice(0, 2); // raw XY status, e.g. "??", " M", "M "
+        let path = line.slice(3);
+        const arrow = path.indexOf(" -> "); // rename: "old -> new"
+        if (arrow !== -1) path = path.slice(arrow + 4);
+        out.uncommitted.push({ status: code, path });
+      }
+    }
+  } catch {}
+  // Cap the list so the status JSON stays small even on a messy tree.
+  if (out.uncommitted.length > 100) {
+    out.truncated = out.uncommitted.length - 100;
+    out.uncommitted = out.uncommitted.slice(0, 100);
+  }
+  try {
+    const ahead = spawnSync(
+      "git",
+      ["rev-list", "--count", `origin/${branch}..HEAD`],
+      { cwd: REPO_ROOT, encoding: "utf8" },
+    );
+    if (ahead.status === 0) {
+      out.unpushed_commits = Number.parseInt((ahead.stdout || "0").trim(), 10) || 0;
+    }
+  } catch {}
+  return out;
+}
+
 // ---------- plan limits ----------
 function loadPlanLimits() {
   if (!existsSync(PLAN_LIMITS)) return null;
@@ -329,6 +376,10 @@ async function main() {
     }
   }
 
+  // Local artefacts (files present in the working tree but not on origin).
+  // Computed after the pull --rebase above so origin/<branch> is current.
+  const artifacts = computeArtifacts(branch);
+
   // Write artefacts
   mkdirSync(CLAUDE_DIR, { recursive: true });
 
@@ -359,6 +410,7 @@ async function main() {
     last_pull_count: opts.pulled,
     rolling_7d_tokens: rolling7d + headline,
     backlog,
+    artifacts,
   };
   writeFileSync(STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
   writeFileSync(HOST_STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
@@ -385,7 +437,7 @@ async function main() {
   appendFileSync(HISTORY_LOG, `${JSON.stringify(effort)}\n`);
 
   // Gracefully no-op the commit/push when `.claude/` (or these specific
-  // files) is wholesale-gitignored — the local fleet view (`backlogs`
+  // files) is wholesale-gitignored — the local fleet view (`backlog-agents`
   // reads .claude/*.json directly) still works, and the user can opt
   // into cross-machine visibility later by tuning .gitignore to match
   // the convention used by other projects (ignore logs+locks, track

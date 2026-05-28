@@ -330,7 +330,9 @@ tick_once() {
   auto_flip_blocked
 
   pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
-  item_title="$(grep -m1 -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null | strip_marker || true)"
+  # Only match items within the Open section (daemon never touches Thinking).
+  # sed extracts from ## Open to next ## header or EOF; grep matches within.
+  item_title="$(sed -n '/^## Open/,/^## [A-Z]/p' "$BACKLOG_FILE" 2>/dev/null | grep -m1 -E "$ITEM_REGEX" | strip_marker || true)"
 
   # Write the in-flight sentinel so `backlog` (status) can show that a tick
   # is actively running rather than just "last tick 44m ago". Format:
@@ -366,15 +368,17 @@ tick_once() {
   # If claude fails, flip it back. If the daemon crashes mid-tick the [~]
   # item stays stuck — recoverable via `backlog unclaim`.
   local claimed=false
-  if grep -q -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-      sed -i '' -E "0,/^(- )?\[[ !]\]/{s//\1[\~]/}" "$BACKLOG_FILE"
-    else
-      sed -i -E "0,/^(- )?\[[ !]\]/{s//\1[\~]/}" "$BACKLOG_FILE"
-    fi
-    if git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
-      true  # sed didn't change anything — shouldn't happen, but guard
-    else
+  if [[ -n "$item_title" ]]; then
+    (cd "$PWD" && awk -i inplace '
+      BEGIN { in_open=0; done=0 }
+      /^## Open/       { in_open=1; print; next }
+      /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+      in_open && !done && /^(- )?\[[ !]\] / {
+        sub(/\[[ !]\]/, "[~]"); done=1
+      }
+      { print }
+    ' "$BACKLOG_FILE") 2>/dev/null || true
+    if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
       git -C "$PWD" add "$BACKLOG_FILE"
       if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
         git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
@@ -397,11 +401,15 @@ tick_once() {
   if [[ $claude_exit -ne 0 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
     if [[ "$claimed" == "true" ]]; then
-      if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' -E "0,/\[\\\~\]/{s//[ ]/}" "$BACKLOG_FILE"
-      else
-        sed -i -E "0,/\[\\\~\]/{s//[ ]/}" "$BACKLOG_FILE"
-      fi
+      (cd "$PWD" && awk -i inplace '
+        BEGIN { in_open=0; done=0 }
+        /^## Open/       { in_open=1; print; next }
+        /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+        in_open && !done && /^(- )?\[~\] / {
+          sub(/\[~\]/, "[ ]"); done=1
+        }
+        { print }
+      ' "$BACKLOG_FILE") 2>/dev/null || true
       git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
       git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
       git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true

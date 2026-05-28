@@ -1,29 +1,33 @@
 {
-  "last_tick_at": "2026-05-28T11:55:23.561Z",
-  "last_host": "Kash-MBA-M3-8GB",
+  "last_tick_at": "2026-05-28T12:16:46.186Z",
+  "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 20053,
   "last_work_commit": null,
   "last_pull_count": 0,
-  "last_session_id": "efacd139-b681-4a99-a9f4-04e3039b2995",
+  "last_session_id": "c243194b-788f-4f74-bdca-07ba9c913293",
   "rolling_7d_tokens": 220602,
   "backlog": {
     "thinking": 0,
-    "open": 3,
+    "open": 2,
     "in_progress": 2,
     "blocked": 1,
-    "done": 0
+    "done": 1
   },
   "artifacts": {
     "uncommitted": [
+      {
+        "status": " M",
+        "path": "docs/Backlog.md"
+      },
       {
         "status": "??",
         "path": ".claude/agent-cooldown.json"
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T11:55:25.396Z"
+    "computed_at": "2026-05-28T12:16:48.380Z"
   }
 }

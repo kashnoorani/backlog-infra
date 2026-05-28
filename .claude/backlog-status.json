@@ -1,5 +1,5 @@
 {
-  "last_tick_at": "2026-05-28T07:40:22.842Z",
+  "last_tick_at": "2026-05-28T07:40:45.933Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
@@ -18,23 +18,11 @@
   "artifacts": {
     "uncommitted": [
       {
-        "status": " M",
-        "path": "CLAUDE.md"
-      },
-      {
-        "status": " M",
-        "path": "bin/backlog-agent"
-      },
-      {
         "status": "??",
         "path": ".claude/backlog-agent-tick.inflight"
-      },
-      {
-        "status": "??",
-        "path": "docs/cross-machine-locking.md"
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T07:40:24.703Z"
+    "computed_at": "2026-05-28T07:40:47.698Z"
   }
 }

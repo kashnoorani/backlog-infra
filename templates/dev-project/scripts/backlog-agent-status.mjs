@@ -257,7 +257,22 @@ async function main() {
 
   const transcript = findNewestTranscript();
   const usage = extractUsage(transcript);
-  const headline = usage.input + usage.output + usage.cache_creation;
+
+  // Detect re-reads of the same transcript: if no new claude session was
+  // created since the last tick, the transcript file hasn't changed and
+  // extractUsage would re-count tokens already logged in a prior tick.
+  // Without this guard, idle heartbeat ticks inflate 5h/week burn totals.
+  let prevSessionId = null;
+  if (existsSync(STATUS_FILE)) {
+    try {
+      const prev = JSON.parse(readFileSync(STATUS_FILE, "utf8"));
+      prevSessionId = prev.last_session_id || null;
+    } catch {}
+  }
+  const sessionKey = usage.session_id || transcript || null;
+  const isSameSession = sessionKey && prevSessionId && sessionKey === prevSessionId;
+
+  const headline = isSameSession ? 0 : (usage.input + usage.output + usage.cache_creation);
   const backlog = countBacklogMarkers();
   const limits = loadPlanLimits();
 
@@ -346,6 +361,7 @@ async function main() {
     last_tokens: statusTokens,
     last_work_commit: statusWorkCommit,
     last_pull_count: opts.pulled,
+    last_session_id: sessionKey,
     rolling_7d_tokens: rolling7d + headline,
     backlog,
   };

@@ -322,7 +322,7 @@ auto_flip_blocked() {
       NR == start { next }
       /^## /      { exit }
       /^(- )?\[/  { exit }
-      /\[user\]/  { found=1; exit }
+      /^[[:space:]]*\[user\]/  { found=1; exit }
       END { exit found ? 0 : 1 }
     ' "$BACKLOG_FILE" 2>/dev/null || has_user=0
     if (( has_user )); then

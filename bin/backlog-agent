@@ -395,7 +395,7 @@ _post_tick_cleanup() {
   # Auto-compact — archive Done items when they pile up.
   local done_count
   done_count="$(grep -cE '^(- )?\[x\] ' "$BACKLOG_FILE" 2>/dev/null || echo 0)"
-  if [[ "$done_count" -gt 20 ]] && [[ -x "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" ]]; then
+  if [[ "$done_count" -gt 20 ]] && [[ -f "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done section has ${done_count} items; auto-compacting..." | tee -a "$LOG_FILE"
     node "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" >> "$LOG_FILE" 2>&1 || true
   fi

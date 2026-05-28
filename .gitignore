@@ -12,3 +12,5 @@ dist/
 .claude/launchd-stderr.log
 opencode.json
 .wrangler/
+.claude/backlog-status.json
+.claude/backlog-agent.tick.lock/

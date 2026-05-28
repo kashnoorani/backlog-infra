@@ -8,9 +8,14 @@ coverage/
 .claude/scheduled_tasks.lock
 .claude/backlog-agent.log
 .claude/backlog-agent.lock/
+.claude/backlog-agent.tick.lock/
 .claude/watch-backlog.ping
 .claude/launchd-stdout.log
 .claude/launchd-stderr.log
+# Shared headline status — written every tick but never committed (the hook
+# commits only the per-host + history files), so tracking it just churns the
+# working tree and piles up auto-stashes. The fleet dashboard reads it locally.
+.claude/backlog-status.json
 
 # OpenCode workspace config
 opencode.json

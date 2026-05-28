@@ -12,7 +12,11 @@ Items parked in `## Thinking` are never picked by the daemon — move
 them to `## Open` when ready for work.
 
 ## Thinking
-(none)
+- [ ] Implement Layer 1: add `--fallback-model claude-haiku-4-5` to the `claude -p` call in `bin/backlog-agent`. (~5 lines, no new infra)
+- [ ] Implement Layer 2: plan-limit detection + cooldown file + short-circuit in `tick_once`. Verify the plan-limit signature first by reading a real `.claude/backlog-agent.log` failure.
+- [ ] Implement Layer 3: opt-in `~/.claude/agent-fallback.json`, OpenCode invocation, status-hook extension to log `agent=` in the trailer.
+
+(see `docs/multi-agent-design.md` for full design)
 
 ## Open
 (none)

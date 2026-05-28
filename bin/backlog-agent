@@ -829,7 +829,7 @@ tick_once() {
   fi
 
   local prompt
-  prompt="Execute exactly one iteration of the /watch-backlog contract (see ~/.claude/commands/watch-backlog.md), then exit. Specifically: re-read $BACKLOG_FILE fresh from disk; pick the first [ ] or [!] item from Open (exit silently if none); work it; typecheck + tests green before declaring done; update $BACKLOG_FILE (move the item to Done with [x] + a one-paragraph summary); commit with scoped \`git add <files>\` by filename; then exit. A [!] item is a retry after a previous [?] block — read the item body for the user's answers (typically prefixed \`[user]\`) and proceed using them. If the item turns out to need a user decision mid-work, flip it to [?] with a brief note on what's blocked, commit just the markup change, and exit."
+  prompt="The daemon has already claimed \`${item_title}\` (marked it [~]). Work it now. Re-read $BACKLOG_FILE fresh from disk for context, then complete exactly that item: implement the fix or feature described in the item body; typecheck + tests green before declaring done; update $BACKLOG_FILE (move the item to Done with [x] + a one-paragraph summary); commit with scoped \`git add <files>\` by filename; then exit. If the item turns out to need a user decision mid-work, flip it to [?] with a brief note on what's blocked, commit just the markup change, and exit."
 
   # `set -e + pipefail` would otherwise abort the daemon on any non-zero
   # claude exit, before we ever reach the PIPESTATUS capture. Wrapping in

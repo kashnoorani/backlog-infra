@@ -18,6 +18,9 @@ them to `## Open` when ready for work.
 - [ ] Web dashboard UX: auto-refresh toggle, mobile-responsive layout, keyboard shortcuts (`?` help overlay)
 - [ ] Item aging: surface items stuck `[~]` (in progress) too long in fleet view — compute how long each `[~]` item has been claimed without completion
 - [ ] Notifications: send Slack or email alert when a daemon enters cooldown (plan-limit) so the user knows which project paused and for how long
+- [ ] Dashboard: label cooldowns as "precise" vs "estimated" using the new `parsed_from_reset` field in `agent-cooldown.json`
+- [ ] CLI `backlog-agents`: parse `agent-cooldown.json` per project, show remaining time + reason in cooldown summary
+- [ ] Dashboard: add a manual refresh button (poll API immediately instead of waiting for 5-min interval)
 
 (see `docs/multi-agent-design.md` for full design)
 

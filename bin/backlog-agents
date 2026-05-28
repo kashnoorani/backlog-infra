@@ -1194,26 +1194,30 @@ JSON
 
       # Pattern 1: git dirty tree
       if echo "$recent" | grep -qiE 'cannot pull with rebase: You have unstaged changes|error: Your local changes.*would be overwritten|cannot rebase: You have unstaged changes'; then
-        if (( safe_to_fix && fix )); then
-          git -C "$proj_dir" rebase --abort 2>/dev/null || true
-          if _is_self "$proj_dir"; then
-            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-            git -C "$proj_dir" fetch origin 2>/dev/null || true
-            git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            git -C "$proj_dir" clean -fd 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash + reset (self-protect)")
-          else
-            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+        local tree_actually_dirty=0
+        [[ -n $(git -C "$proj_dir" status --porcelain 2>/dev/null) ]] && tree_actually_dirty=1
+        if (( tree_actually_dirty )); then
+          if (( safe_to_fix && fix )); then
+            git -C "$proj_dir" rebase --abort 2>/dev/null || true
+            if _is_self "$proj_dir"; then
+              git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
+              git -C "$proj_dir" fetch origin 2>/dev/null || true
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            git -C "$proj_dir" clean -fd 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+              git -C "$proj_dir" clean -fd 2>/dev/null || true
+              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash + reset (self-protect)")
+            else
+              git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+                git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+              git -C "$proj_dir" clean -fd 2>/dev/null || true
+              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+            fi
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
+          else
+            fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
+            sweep_flagged=$((sweep_flagged + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"$([[ $safe_to_fix -eq 0 ]] && echo 'blocked_inflight' || echo 'flagged')\"}")
           fi
-          sweep_fixed=$((sweep_fixed + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
-        else
-          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
-          sweep_flagged=$((sweep_flagged + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"$([[ $safe_to_fix -eq 0 ]] && echo 'blocked_inflight' || echo 'flagged')\"}")
         fi
       fi
 

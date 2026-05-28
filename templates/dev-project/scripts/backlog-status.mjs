@@ -319,14 +319,31 @@ async function main() {
 
   // Write artefacts
   mkdirSync(dirname(STATUS_FILE), { recursive: true });
+
+  // On idle ticks (no tokens spent), preserve previous host/item/tokens so the
+  // fleet dashboard and machines tab reflect the last machine that did real work.
+  let statusHost = host;
+  let statusItem = opts.item;
+  let statusTokens = headline;
+  let statusWorkCommit = workCommit;
+  if (headline === 0 && existsSync(STATUS_FILE)) {
+    try {
+      const prev = JSON.parse(readFileSync(STATUS_FILE, "utf8"));
+      statusHost = prev.last_host || host;
+      statusItem = prev.last_item || opts.item;
+      statusTokens = prev.last_tokens ?? headline;
+      statusWorkCommit = prev.last_work_commit || workCommit;
+    } catch {}
+  }
+
   const statusObj = {
     last_tick_at: ts,
-    last_host: host,
+    last_host: statusHost,
     last_mode: opts.mode,
-    last_item: opts.item,
+    last_item: statusItem,
     last_exit_code: opts.exitCode,
-    last_tokens: headline,
-    last_work_commit: workCommit,
+    last_tokens: statusTokens,
+    last_work_commit: statusWorkCommit,
     last_pull_count: opts.pulled,
     rolling_7d_tokens: rolling7d + headline,
     backlog,

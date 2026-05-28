@@ -227,6 +227,7 @@ snapshot() {
     fi
 
     local active_host_short="${active_host%.local}"
+    active_host_short="${active_host_short#Kash-MBA-}"
     (( ${#active_host_short} > 14 )) && active_host_short="${active_host_short:0:11}…"
 
     # Fleet-wide host tracking

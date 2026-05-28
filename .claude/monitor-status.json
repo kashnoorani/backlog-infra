@@ -3,7 +3,7 @@
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 1,
+  "sweeps_total": 4,
   "fixed_total": 0,
   "flagged_total": 0,
   "recent_actions": []

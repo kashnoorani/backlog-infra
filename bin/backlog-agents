@@ -236,7 +236,7 @@ snapshot() {
     last_item="$(jq -r '.last_item // ""' "$status")"
     last_exit="$(jq -r '.last_exit_code // 0' "$status")"
     last_pull="$(jq -r '(.last_pull_count // 0 | tostring)' "$status")"
-    [[ "$last_pull" == "0" || "$last_pull" == "null" ]] && last_pull="—"
+    [[ "$last_pull" == "0" || "$last_pull" == "null" ]] && last_pull=""
 
     # Prefer the live "top of Open" from docs/Backlog.md over the
     # status JSON's last_item — last_item is set by the status hook
@@ -263,7 +263,7 @@ snapshot() {
     fi
     [[ "$last_exit" != "0" ]] && state_color="$RD"
 
-    local sum_5h=0 sum_right=0 active_host="—" hosts_csv="" has_this_work="false"
+    local sum_5h=0 sum_right=0 active_host="" hosts_csv="" has_this_work="false"
     if [[ -n "$log" ]]; then
       local out
       out="$(jq -s -r \
@@ -302,7 +302,7 @@ snapshot() {
     (( ${#active_host_short} > 14 )) && active_host_short="${active_host_short:0:11}…"
 
     # Compute other-hosts column (all hosts that worked on this project, minus the active one).
-    local other_hosts="—"
+    local other_hosts=""
     if [[ -n "$hosts_csv" ]]; then
       local oh_arr=()
       IFS=',' read -ra host_arr_oh <<< "$hosts_csv"
@@ -337,17 +337,17 @@ snapshot() {
     fi
     [[ "$has_this_work" == "true" ]] && this_machine_projects=$((this_machine_projects + 1))
 
-    local age_str="—"
+    local age_str=""
     [[ -n "$tick_epoch" ]] && age_str="$(fmt_age $age)"
-    local item_short="${current_item:-—}"
-    (( ${#item_short} > 40 )) && item_short="${item_short:0:37}…"
+    local item_short="${current_item:-}"
+    (( ${#item_short} > 36 )) && item_short="${item_short:0:33}…"
 
-    local log_mb="—"
+    local log_mb=""
     if [[ -n "$log" ]]; then
       log_mb="$(awk -v b="$(wc -c < "$log")" 'BEGIN{printf "%.2fM", b/1048576}')"
     fi
 
-    rows+=("$name"$'\t'"$age_str"$'\t'"$active_host_short"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb"$'\t'"$other_hosts")
+    rows+=("$name|$age_str|$active_host_short|$item_short|$state|$state_color|$(fmt_tok $sum_5h)|$(fmt_tok $sum_right)|$last_pull|$log_mb|$other_hosts")
   done
 
   # ---- header ----
@@ -371,8 +371,8 @@ snapshot() {
   # Health summary: count daemon states and watchdog status.
   local fresh=0 idle=0 stale=0
   for row in "${rows[@]}"; do
-    local st; st="${row#*$'\t'*$'\t'*$'\t'*$'\t'}"
-    st="${st%%$'\t'*}"
+    local st; st="${row#*|*|*|*|}"
+    st="${st%%|*}"
     case "$st" in
       fresh) fresh=$((fresh + 1)) ;;
       idle)  idle=$((idle + 1)) ;;
@@ -485,21 +485,21 @@ snapshot() {
   fi
 
   if (( EFFORT )) ; then
-    printf '  %s%-18s %-9s %-11s %-40s %-7s %-9s %-5s %-7s %-7s %-8s%s\n' \
-      "$DIM" "PROJECT" "LAST BY" "LAST TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "LOG" "$RS"
+    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "LOG" "$RS"
   else
-    printf '  %s%-18s %-9s %-11s %-40s %-7s %-9s %-5s %-7s %-7s%s\n' \
-      "$DIM" "PROJECT" "LAST BY" "LAST TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "$RS"
+    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
     local name age host item state state_color s5h sR pulled log_mb other_hosts
-    IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
+    IFS='|' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
     (( ${#other_hosts} > 9 )) && other_hosts="${other_hosts:0:6}…"
     if (( EFFORT )); then
-      printf '  %-18s %-9s %-11s %-40s %s%-7s%s %-9s %-5s %-7s %-7s %-8s\n' \
+      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s %-8s\n' \
         "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR" "$log_mb"
     else
-      printf '  %-18s %-9s %-11s %-40s %s%-7s%s %-9s %-5s %-7s %-7s\n' \
+      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s\n' \
         "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
     fi
   done

@@ -14,6 +14,10 @@ them to `## Open` when ready for work.
 ## Thinking
 - [ ] Implement Layer 3: opt-in `~/.claude/agent-fallback.json`, OpenCode invocation, status-hook extension to log `agent=` in the trailer.
 - [ ] Fully doc the architecture and design of our backlog-infra including nice diagrams. Explain the thought process behind key decisions and factors considered and why we decided the way we did.
+- [ ] Migrate M3 daemon plists from symlink `backlog` paths to canonical `backlog-agent` paths. `do_install_daemon` should also boot out old `*.backlog.plist` and `*.backlog-loop.plist` label variants on install to avoid double-daemon, then run `backlog-agent install-daemon` in all 7 projects on M3.
+- [ ] Web dashboard UX: auto-refresh toggle, mobile-responsive layout, keyboard shortcuts (`?` help overlay)
+- [ ] Item aging: surface items stuck `[~]` (in progress) too long in fleet view — compute how long each `[~]` item has been claimed without completion
+- [ ] Notifications: send Slack or email alert when a daemon enters cooldown (plan-limit) so the user knows which project paused and for how long
 
 (see `docs/multi-agent-design.md` for full design)
 

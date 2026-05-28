@@ -1078,7 +1078,7 @@ do_uninstall_monitor() {
 # ---- subcommand: monitor ----
 
 do_monitor() {
-  local fix=0 interval=60 once=0
+  local fix=0 interval=120 once=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --fix)     fix=1; shift ;;
@@ -1101,9 +1101,19 @@ do_monitor() {
   local status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status.json"
   local sweeps_total=0 fixed_total=0 flagged_total=0
   local log_tail_lines=150
+  local _last_status_commit=0
+  local _status_heartbeat=300
+  local _self_root; _self_root="$(cd "$ACTIVE_ROOT/backlog-infra" 2>/dev/null && pwd -P || echo '')"
+
+  _is_self() {
+    local p; p="$(cd "${1:-}" 2>/dev/null && pwd -P)" || return 1
+    [[ "$p" == "$_self_root" ]]
+  }
 
   _write_status() {
+    local had_action="${1:-0}"
     local now_iso; now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    local now_epoch; now_epoch="$(date +%s)"
     local actions_json="["
     local first=1
     if (( ${#recent_actions[@]:-0} > 0 )); then
@@ -1125,9 +1135,19 @@ do_monitor() {
   "recent_actions": ${actions_json}
 }
 JSON
-    git -C "$ACTIVE_ROOT/backlog-infra" add "$status_file" 2>/dev/null || true
-    git -C "$ACTIVE_ROOT/backlog-infra" commit -m "monitor: sweep ${sweeps_total} (${fixed_total} fixed, ${flagged_total} flagged)" >/dev/null 2>&1 || true
-    git -C "$ACTIVE_ROOT/backlog-infra" push origin main 2>/dev/null || true
+    local should_commit=0
+    if (( had_action )); then
+      should_commit=1
+    elif (( now_epoch - _last_status_commit >= _status_heartbeat )); then
+      should_commit=1
+    fi
+    if (( should_commit )); then
+      git -C "$ACTIVE_ROOT/backlog-infra" add "$status_file" 2>/dev/null || true
+      git -C "$ACTIVE_ROOT/backlog-infra" pull --rebase origin main >/dev/null 2>&1 || true
+      git -C "$ACTIVE_ROOT/backlog-infra" commit -m "monitor: sweep ${sweeps_total} (${fixed_total} fixed, ${flagged_total} flagged)" >/dev/null 2>&1 || true
+      git -C "$ACTIVE_ROOT/backlog-infra" push origin main 2>/dev/null || true
+      _last_status_commit="$now_epoch"
+    fi
   }
 
   local -a recent_actions=()
@@ -1176,10 +1196,18 @@ JSON
       if echo "$recent" | grep -qiE 'cannot pull with rebase: You have unstaged changes|error: Your local changes.*would be overwritten|cannot rebase: You have unstaged changes'; then
         if (( safe_to_fix && fix )); then
           git -C "$proj_dir" rebase --abort 2>/dev/null || true
-          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+          if _is_self "$proj_dir"; then
+            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
+            git -C "$proj_dir" fetch origin 2>/dev/null || true
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-          git -C "$proj_dir" clean -fd 2>/dev/null || true
-          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+            git -C "$proj_dir" clean -fd 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash + reset (self-protect)")
+          else
+            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+              git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+            git -C "$proj_dir" clean -fd 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+          fi
           sweep_fixed=$((sweep_fixed + 1))
           recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
         else
@@ -1193,9 +1221,15 @@ JSON
       if echo "$recent" | grep -qiE 'fatal: Cannot fast-forward'; then
         if (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
-          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+          if _is_self "$proj_dir"; then
+            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — stash + reset (self-protect)")
+          else
+            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+              git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
+          fi
           sweep_fixed=$((sweep_fixed + 1))
           recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
         fi
@@ -1205,9 +1239,15 @@ JSON
       if echo "$recent" | grep -qiE 'failed to push some refs'; then
         if (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
-          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+          if _is_self "$proj_dir"; then
+            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — stash + reset (self-protect)")
+          else
+            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+              git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
+          fi
           sweep_fixed=$((sweep_fixed + 1))
           recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
         fi
@@ -1295,13 +1335,37 @@ JSON
       echo "  ${summary}"
     fi
 
-    _write_status
+    _write_status $(( sweep_fixed > 0 || sweep_flagged > 0 ? 1 : 0 ))
   }
 
   if (( once )); then
     _monitor_run
   else
-    trap 'exit 0' INT TERM
+    _on_monitor_exit() {
+      local exit_code=$?
+      local now_iso; now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      local state; state="$([[ $exit_code -eq 0 ]] && echo 'stopped' || echo 'crashed')"
+      cat > "$status_file" <<JSON
+{
+  "last_sweep_at": "${now_iso}",
+  "running": false,
+  "exit_code": ${exit_code},
+  "exit_state": "${state}",
+  "fix_mode": ${fix},
+  "host": "${this_host}",
+  "sweeps_total": ${sweeps_total},
+  "fixed_total": ${fixed_total},
+  "flagged_total": ${flagged_total},
+  "recent_actions": []
+}
+JSON
+      git -C "$ACTIVE_ROOT/backlog-infra" add "$status_file" 2>/dev/null || true
+      git -C "$ACTIVE_ROOT/backlog-infra" pull --rebase origin main >/dev/null 2>&1 || true
+      git -C "$ACTIVE_ROOT/backlog-infra" commit -m "monitor: ${state} (sweep ${sweeps_total}, ${fixed_total} fixed, ${flagged_total} flagged)" >/dev/null 2>&1 || true
+      git -C "$ACTIVE_ROOT/backlog-infra" push origin main 2>/dev/null || true
+      exit "$exit_code"
+    }
+    trap '_on_monitor_exit' INT TERM EXIT
     info "monitoring fleet (interval=${interval}s, fix=${fix})..."
     while true; do
       _monitor_run

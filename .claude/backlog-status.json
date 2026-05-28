@@ -1,32 +1,28 @@
 {
-  "last_tick_at": "2026-05-28T06:30:55.997Z",
+  "last_tick_at": "2026-05-28T06:45:54.536Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
-  "last_item": "Implement Layer 1: add `--fallback-model claude-haiku-4-5` to the `claude -p` call in `bin/backlog-agent`. (~5 lines, no new infra)",
+  "last_item": "Implement Layer 2: plan-limit detection + cooldown file + short-circuit in `tick_once`. Verify the plan-limit signature first by reading a real `.claude/backlog-agent.log` failure.",
   "last_exit_code": 0,
-  "last_tokens": 40395,
-  "last_work_commit": "3095c78",
-  "last_pull_count": 3,
-  "rolling_7d_tokens": 1314208,
+  "last_tokens": 88933,
+  "last_work_commit": "a8ad273",
+  "last_pull_count": 0,
+  "rolling_7d_tokens": 1403141,
   "backlog": {
     "thinking": 1,
-    "open": 1,
+    "open": 0,
     "in_progress": 0,
     "blocked": 0,
-    "done": 2
+    "done": 3
   },
   "artifacts": {
     "uncommitted": [
       {
         "status": "??",
         "path": ".claude/backlog-agent-tick.inflight"
-      },
-      {
-        "status": "??",
-        "path": ".claude/backlog-tick.inflight"
       }
     ],
     "unpushed_commits": 1,
-    "computed_at": "2026-05-28T06:30:57.981Z"
+    "computed_at": "2026-05-28T06:45:56.678Z"
   }
 }

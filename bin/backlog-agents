@@ -27,6 +27,21 @@
 #   backlog-agents uninstall-watchdog
 #                       Boot out and remove the sync-watchdog launchd plist.
 #
+#   backlog-agents monitor [--fix] [--interval <seconds>] [--once]
+#                       Fleet-wide agent log monitor. Scans .claude/backlog-agent.log
+#                       across all projects for failure patterns (git conflicts,
+#                       dirty trees, push failures, stale locks, bad cooldowns,
+#                       stuck agents) and auto-fixes where safe. --fix applies
+#                       corrections; without it, runs dry-run (report only).
+#                       Default interval is 60s. --once runs a single scan.
+#
+#   backlog-agents install-monitor
+#                       Install a launchd plist that runs the monitor continuously
+#                       in auto-fix mode. See also: monitor, uninstall-monitor.
+#
+#   backlog-agents uninstall-monitor
+#                       Boot out and remove the monitor launchd plist.
+#
 # Dashboard flags:
 #   --fetch    git fetch -q each project before reading state
 #   --watch    refresh every 10s (Ctrl-C to exit)
@@ -451,6 +466,23 @@ snapshot() {
       "$RS"
   else
     printf ', watchdog %s✗%s\n' "$RD" "$RS"
+  fi
+
+  # Monitor daemon status
+  local mon_status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status.json"
+  if launchctl print "gui/$(id -u)/com.${USER}.backlog-agents-monitor" >/dev/null 2>&1; then
+    if [[ -f "$mon_status_file" ]]; then
+      local mon_sweeps mon_fixed mon_flagged mon_last
+      mon_sweeps="$(jq -r '.sweeps_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
+      mon_fixed="$(jq -r '.fixed_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
+      mon_flagged="$(jq -r '.flagged_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
+      printf '  monitor: %sactive%s  sweeps: %s%d%s  fixed: %s%d%s  flagged: %s%d%s\n' \
+        "$GN" "$RS" "$B" "$mon_sweeps" "$RS" "$GN" "$mon_fixed" "$RS" "$YL" "$mon_flagged" "$RS"
+    else
+      printf '  monitor: %sactive%s (no status file yet)\n' "$GN" "$RS"
+    fi
+  else
+    printf '  monitor: %snot installed%s\n' "$DIM" "$RS"
   fi
 
   echo
@@ -898,6 +930,334 @@ do_uninstall_watchdog() {
   fi
 }
 
+# ---- subcommand: install-monitor / uninstall-monitor ----
+
+do_install_monitor() {
+  local label="com.${USER}.backlog-agents-monitor"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local bin_path
+  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+
+  if [[ -f "$plist" ]]; then
+    info "replacing existing backlog-agents-monitor plist"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    local i=0
+    while launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 && (( i < 10 )); do
+      sleep 1; i=$((i + 1))
+    done
+  fi
+
+  local label_x bin_path_x home_x bin_dir_x
+  label_x="$(xml_escape "$label")"
+  bin_path_x="$(xml_escape "$bin_path")"
+  local bin_dir; bin_dir="$(dirname "$bin_path")"
+  bin_dir_x="$(xml_escape "$bin_dir")"
+  home_x="$(xml_escape "$HOME")"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label_x}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${bin_path_x}</string>
+        <string>monitor</string>
+        <string>--fix</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${home_x}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-monitor.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-monitor.stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  mkdir -p "$HOME/Library/Logs"
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    echo "backlog-agents: bootstrap failed for ${label}. plist is at $plist." >&2
+    exit 1
+  fi
+  ok "backlog-agents-monitor installed: ${label}"
+  info "  plist: ${plist}"
+  info "  logs:  ~/Library/Logs/backlog-agents-monitor.{stdout,stderr}.log"
+  info "  status: launchctl print gui/\$(id -u)/${label}"
+}
+
+do_uninstall_monitor() {
+  local label="com.${USER}.backlog-agents-monitor"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+
+  if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/${label}" || true
+    ok "booted out ${label}"
+  fi
+  if [[ -f "$plist" ]]; then
+    rm "$plist"
+    ok "removed ${plist}"
+  else
+    info "no backlog-agents-monitor plist at ${plist}; nothing to remove."
+  fi
+}
+
+# ---- subcommand: monitor ----
+
+do_monitor() {
+  local fix=0 interval=60 once=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fix)     fix=1; shift ;;
+      --interval) interval="$2"; shift 2 ;;
+      --once)    once=1; shift ;;
+      -h|--help)
+        echo "Usage: backlog-agents monitor [--fix] [--interval <seconds>] [--once]"
+        echo "  Scan agent logs for failure patterns and auto-fix where safe."
+        echo "  --fix       Actually apply fixes (default: dry-run / report only)"
+        echo "  --interval  Seconds between scans (default: 60)"
+        echo "  --once      Run a single scan and exit"
+        return 0 2>/dev/null || exit 0
+        ;;
+      *) echo "backlog-agents monitor: unknown flag: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  local this_host; this_host="$(hostname)"
+  this_host="${this_host%.local}"
+  local status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status.json"
+  local sweeps_total=0 fixed_total=0 flagged_total=0
+  local log_tail_lines=150
+
+  _write_status() {
+    local now_iso; now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    local actions_json="["
+    local first=1
+    for entry in "${recent_actions[@]}"; do
+      [[ $first -eq 1 ]] && first=0 || actions_json+=","
+      actions_json+="$entry"
+    done
+    actions_json+="]"
+    cat > "$status_file" <<JSON
+{
+  "last_sweep_at": "${now_iso}",
+  "running": true,
+  "fix_mode": ${fix},
+  "host": "${this_host}",
+  "sweeps_total": ${sweeps_total},
+  "fixed_total": ${fixed_total},
+  "flagged_total": ${flagged_total},
+  "recent_actions": ${actions_json}
+}
+JSON
+    git -C "$ACTIVE_ROOT/backlog-infra" add "$status_file" 2>/dev/null || true
+    git -C "$ACTIVE_ROOT/backlog-infra" commit -m "monitor: sweep ${sweeps_total} (${fixed_total} fixed, ${flagged_total} flagged)" >/dev/null 2>&1 || true
+    git -C "$ACTIVE_ROOT/backlog-infra" push origin main 2>/dev/null || true
+  }
+
+  local -a recent_actions=()
+
+  _monitor_run() {
+    local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    local -a fix_descriptions=()
+    local sweep_fixed=0 sweep_flagged=0
+
+    local -a candidates=()
+    local root proj_dir
+    for root in "${PROJECTS_ROOTS[@]}"; do
+      [[ -d "$root" ]] || continue
+      for proj_dir in "$root"/*/; do
+        [[ -d "$proj_dir" ]] || continue
+        candidates+=("${proj_dir%/}")
+      done
+    done
+
+    local seen='|'
+    local -a unique=()
+    for proj_dir in "${candidates[@]}"; do
+      local real
+      real="$(cd "$proj_dir" 2>/dev/null && pwd -P)" || continue
+      case "$seen" in *"|$real|"*) continue ;; esac
+      seen="${seen}${real}|"
+      unique+=("$real")
+    done
+
+    for proj_dir in "${unique[@]}"; do
+      local log_file="$proj_dir/.claude/backlog-agent.log"
+      local cd_file="$proj_dir/.claude/agent-cooldown.json"
+      local inflight="$proj_dir/.claude/backlog-agent-tick.inflight"
+      local lock_dir="$proj_dir/.claude/backlog-agent.lock"
+      local name; name="$(basename "$proj_dir")"
+      [[ -f "$log_file" ]] || continue
+
+      local recent; recent="$(tail -n "$log_tail_lines" "$log_file" 2>/dev/null || true)"
+      [[ -n "$recent" ]] || continue
+
+      local safe_to_fix=1
+      [[ -f "$inflight" ]] && safe_to_fix=0
+      [[ -d "$lock_dir" ]] && safe_to_fix=0
+
+      # Pattern 1: git dirty tree
+      if echo "$recent" | grep -qiE 'cannot pull with rebase: You have unstaged changes|error: Your local changes.*would be overwritten|cannot rebase: You have unstaged changes'; then
+        if (( safe_to_fix && fix )); then
+          git -C "$proj_dir" rebase --abort 2>/dev/null || true
+          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+            git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+          git -C "$proj_dir" clean -fd 2>/dev/null || true
+          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+          sweep_fixed=$((sweep_fixed + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
+        else
+          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
+          sweep_flagged=$((sweep_flagged + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"$([[ $safe_to_fix -eq 0 ]] && echo 'blocked_inflight' || echo 'flagged')\"}")
+        fi
+      fi
+
+      # Pattern 2: git fast-forward failure
+      if echo "$recent" | grep -qiE 'fatal: Cannot fast-forward'; then
+        if (( safe_to_fix && fix )); then
+          git -C "$proj_dir" fetch origin 2>/dev/null || true
+          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+            git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
+          sweep_fixed=$((sweep_fixed + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
+        fi
+      fi
+
+      # Pattern 3: git push failure
+      if echo "$recent" | grep -qiE 'failed to push some refs'; then
+        if (( safe_to_fix && fix )); then
+          git -C "$proj_dir" fetch origin 2>/dev/null || true
+          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
+            git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
+          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
+          sweep_fixed=$((sweep_fixed + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
+        fi
+      fi
+
+      # Pattern 4: stale lock
+      if [[ -d "$lock_dir" ]]; then
+        local lock_age
+        lock_age="$(( $(date +%s) - $(stat -f %m "$lock_dir" 2>/dev/null || stat -c %Y "$lock_dir" 2>/dev/null || echo 0) ))"
+        if (( lock_age > 1800 )); then
+          if (( fix )); then
+            rm -rf "$lock_dir" 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: stale lock (${lock_age}s old) — removed")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"stale_lock\",\"result\":\"fixed\"}")
+          fi
+        fi
+      fi
+
+      # Pattern 5: cooldown issues
+      if [[ -f "$cd_file" ]]; then
+        local cd_parsed cd_until_epoch cd_duration
+        cd_parsed="$(jq -r 'if .parsed_from_reset == false then "false" else "true" end' "$cd_file" 2>/dev/null)"
+        cd_until_epoch="$(jq -r '.until_epoch // 0' "$cd_file" 2>/dev/null)"
+        cd_duration=$(( cd_until_epoch - $(date +%s) ))
+
+        if [[ "$cd_parsed" == "false" ]] && (( cd_duration <= 0 )); then
+          if (( fix )); then
+            rm -f "$cd_file" 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: stale fallback cooldown — cleared")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"stale_cooldown\",\"result\":\"fixed\"}")
+          fi
+        elif [[ "$cd_parsed" == "false" ]]; then
+          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: cooldown fallback — couldn't parse reset time")
+          sweep_flagged=$((sweep_flagged + 1))
+        elif (( cd_duration <= 0 )); then
+          if (( fix )); then
+            rm -f "$cd_file" 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: expired cooldown — cleared")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"expired_cooldown\",\"result\":\"fixed\"}")
+          fi
+        fi
+      fi
+
+      # Pattern 6: _run_status_hook bug
+      if echo "$recent" | grep -q '_run_status_hook: command not found'; then
+        fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: _run_status_hook not defined (known code bug)")
+        sweep_flagged=$((sweep_flagged + 1))
+      fi
+
+      # Pattern 7: repeated tick failures without cooldown
+      local fail_count
+      fail_count="$(echo "$recent" | grep -c 'tick failed' || true)"
+      local cooldown_fail
+      cooldown_fail="$(echo "$recent" | grep -c 'plan-limit cooldown active' || true)"
+      if (( fail_count >= 3 && cooldown_fail == 0 )) && ! [[ -f "$cd_file" ]]; then
+        fix_descriptions+=("  ${RD}ALERT${RS} ${name}: ${fail_count} tick failures, no cooldown — agent may be stuck")
+        sweep_flagged=$((sweep_flagged + 1))
+      fi
+    done
+
+    sweeps_total=$((sweeps_total + 1))
+    fixed_total=$((fixed_total + sweep_fixed))
+    flagged_total=$((flagged_total + sweep_flagged))
+
+    # Trim recent_actions to last 20
+    while (( ${#recent_actions[@]} > 20 )); do
+      recent_actions=("${recent_actions[@]:1}")
+    done
+
+    # Print sweep report
+    if (( sweep_fixed > 0 || sweep_flagged > 0 )); then
+      echo
+      printf '  %s━━ monitor sweep %s━━%s\n' "$DIM" "$ts" "$RS"
+      for desc in "${fix_descriptions[@]}"; do
+        printf '%s\n' "$desc"
+      done
+      local summary=""
+      (( sweep_fixed > 0 )) && summary="${summary}${GN}${sweep_fixed} fixed${RS}"
+      (( sweep_fixed > 0 && sweep_flagged > 0 )) && summary="${summary}, "
+      (( sweep_flagged > 0 )) && summary="${summary}${YL}${sweep_flagged} flagged${RS}"
+      echo "  ${DIM}══════════════════════════════════════${RS}"
+      echo "  ${summary}"
+    fi
+
+    _write_status
+  }
+
+  if (( once )); then
+    _monitor_run
+  else
+    trap 'exit 0' INT TERM
+    info "monitoring fleet (interval=${interval}s, fix=${fix})..."
+    while true; do
+      _monitor_run
+      sleep "$interval"
+    done
+  fi
+}
+
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
@@ -910,6 +1270,9 @@ case "$cmd" in
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
   uninstall-watchdog) do_uninstall_watchdog ;;
+  install-monitor) do_install_monitor ;;
+  uninstall-monitor) do_uninstall_monitor ;;
+  monitor) shift; do_monitor "$@" ;;
   -h|--help)
     sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;

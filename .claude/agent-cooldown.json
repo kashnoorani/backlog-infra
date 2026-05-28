@@ -1,7 +1,0 @@
-{
-  "until": "2026-05-28T15:40:00Z",
-  "until_epoch": 1779982800,
-  "reason": "anthropic-plan-limit",
-  "detected_at": "2026-05-28T11:41:03Z",
-  "parsed_from_reset": true
-}

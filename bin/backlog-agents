@@ -1056,10 +1056,12 @@ do_monitor() {
     local now_iso; now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     local actions_json="["
     local first=1
-    for entry in "${recent_actions[@]}"; do
-      [[ $first -eq 1 ]] && first=0 || actions_json+=","
-      actions_json+="$entry"
-    done
+    if (( ${#recent_actions[@]:-0} > 0 )); then
+      for entry in "${recent_actions[@]}"; do
+        [[ $first -eq 1 ]] && first=0 || actions_json+=","
+        actions_json+="$entry"
+      done
+    fi
     actions_json+="]"
     cat > "$status_file" <<JSON
 {
@@ -1224,7 +1226,7 @@ JSON
     flagged_total=$((flagged_total + sweep_flagged))
 
     # Trim recent_actions to last 20
-    while (( ${#recent_actions[@]} > 20 )); do
+    while (( ${#recent_actions[@]:-0} > 20 )); do
       recent_actions=("${recent_actions[@]:1}")
     done
 

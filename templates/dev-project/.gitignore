@@ -7,7 +7,8 @@ coverage/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/backlog-agent.log
-.claude/backlog-agent.lock
+.claude/backlog-agent.lock/
+.claude/watch-backlog.ping
 .claude/launchd-stdout.log
 .claude/launchd-stderr.log
 

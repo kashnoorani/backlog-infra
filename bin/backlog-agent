@@ -387,6 +387,16 @@ _post_tick_cleanup() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done section has ${done_count} items; auto-compacting..." | tee -a "$LOG_FILE"
     node "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" >> "$LOG_FILE" 2>&1 || true
   fi
+
+  # Orphaned changes — after every tick, any uncommitted modifications left
+  # behind by claude (e.g. it crashed before committing) would block the next
+  # pull.  Stash them with a descriptive message so they can be recovered.
+  if [[ -n $(git -C "$PWD" status --porcelain 2>/dev/null) ]]; then
+    local stash_msg; stash_msg="backlog-agent auto-stash: orphaned changes after tick $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if git -C "$PWD" stash push -m "$stash_msg" 2>/dev/null; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] orphaned changes stashed — recover with git stash pop" | tee -a "$LOG_FILE"
+    fi
+  fi
 }
 
 # --- Layer 2: plan-limit cooldown (docs/multi-agent-design.md) ---

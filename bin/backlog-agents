@@ -1117,6 +1117,27 @@ do_monitor() {
   local _last_status_commit=0
   local _status_heartbeat=300
   local _self_root; _self_root="$(cd "$ACTIVE_ROOT/backlog-infra" 2>/dev/null && pwd -P || echo '')"
+  local _notify_config="$HOME/.config/backlog/notify.json"
+  local _last_notify=0
+
+  _notify() {
+    local title="${1:-backlog-monitor}" body="${2:-}"
+    [[ -n "$body" ]] || return 0
+    local now_epoch; now_epoch="$(date +%s)"
+    if (( now_epoch - _last_notify < 300 )); then return 0; fi
+    _last_notify="$now_epoch"
+    local slack_webhook local_notify
+    slack_webhook="$(jq -r '.slack_webhook // ""' "$_notify_config" 2>/dev/null || echo '')"
+    local_notify="$(jq -r '.local_notify // false' "$_notify_config" 2>/dev/null || echo 'false')"
+    if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
+      osascript -e "display notification \"${body}\" with title \"${title}\"" 2>/dev/null || true
+    fi
+    if [[ -n "$slack_webhook" ]] && command -v curl >/dev/null 2>&1; then
+      local payload
+      payload="$(jq -nc --arg t "$title" --arg b "$body" --arg h "$this_host"         '{"text": "\($t) (\($h)): \($b)"}')"
+      curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$slack_webhook" >/dev/null 2>&1 || true
+    fi
+  }
 
   _is_self() {
     local p; p="$(cd "${1:-}" 2>/dev/null && pwd -P)" || return 1
@@ -1304,6 +1325,7 @@ JSON
           fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: cooldown fallback — couldn't parse reset time")
           sweep_flagged=$((sweep_flagged + 1))
           _notify "backlog-monitor — cooldown issue" "${name}: couldn't parse reset time from Anthropic plan-limit message"
+          _notify "backlog-monitor — cooldown issue" "${name}: couldn't parse reset time from Anthropic plan-limit message"
         elif (( cd_duration <= 0 )); then
           if (( fix )); then
             rm -f "$cd_file" 2>/dev/null || true
@@ -1329,6 +1351,7 @@ JSON
       if (( fail_count >= 3 && cooldown_fail == 0 )) && ! [[ -f "$cd_file" ]]; then
         fix_descriptions+=("  ${RD}ALERT${RS} ${name}: ${fail_count} tick failures, no cooldown — agent may be stuck")
         sweep_flagged=$((sweep_flagged + 1))
+        _notify "backlog-monitor — stuck agent" "${name}: ${fail_count} tick failures, no cooldown"
       fi
     done
 

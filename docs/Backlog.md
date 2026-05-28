@@ -17,7 +17,7 @@ them to `## Open` when ready for work.
 (see `docs/multi-agent-design.md` for full design)
 
 ## Open
-- [~] Fully doc the architecture and design of our backlog-infra including nice diagrams. Explain the thought process behind key decisions and factors considered and why we decided the way we did.
+- [ ] Fully doc the architecture and design of our backlog-infra including nice diagrams. Explain the thought process behind key decisions and factors considered and why we decided the way we did.
 - [~] Migrate M3 daemon plists from symlink `backlog` paths to canonical `backlog-agent` paths. `do_install_daemon` should also boot out old `*.backlog.plist` and `*.backlog-loop.plist` label variants on install to avoid double-daemon, then run `backlog-agent install-daemon` in all 7 projects on M3.
 - [ ] Web dashboard: mobile-responsive layout
 - [ ] Item aging: surface items stuck `[~]` (in progress) too long in fleet view — compute how long each `[~]` item has been claimed without completion

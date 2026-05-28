@@ -68,6 +68,15 @@
 
 set -euo pipefail
 
+fmt_age() {
+  local d=$1
+  if   (( d < 60 ));    then printf '%ds ago' "$d"
+  elif (( d < 3600 ));  then printf '%dm ago' $((d/60))
+  elif (( d < 86400 )); then printf '%dh ago' $((d/3600))
+  else                       printf '%dd ago' $((d/86400))
+  fi
+}
+
 DOTFILES="$HOME/dotfiles"
 MANIFEST="$DOTFILES/active-projects.txt"
 ACTIVE_ROOT="$HOME/dev/projects/active"
@@ -209,7 +218,7 @@ cmd_new() {
   [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || fail "name must match [A-Za-z0-9._-]+"
 
   local dest="$ACTIVE_ROOT/$name"
-  local template="$DOTFILES/templates/dev-project"
+  local template="$HOME/dev/projects/active/backlog-infra/templates/dev-project"
   [[ -d "$template" ]]  || fail "template dir not found at $template"
   [[ -e "$dest" ]]      && fail "$dest already exists"
 
@@ -609,9 +618,11 @@ cmd_install_watchdog() {
     done
   fi
 
-  local label_x bin_path_x home_x
+  local label_x bin_path_x home_x bin_dir_x
   label_x="$(xml_escape "$label")"
   bin_path_x="$(xml_escape "$bin_path")"
+  local bin_dir; bin_dir="$(dirname "$bin_path")"
+  bin_dir_x="$(xml_escape "$bin_dir")"
   home_x="$(xml_escape "$HOME")"
 
   cat > "$plist" <<EOF
@@ -632,7 +643,7 @@ cmd_install_watchdog() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${home_x}/dev/projects/active/backlog-infra/bin:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${home_x}</string>
     </dict>

@@ -4,7 +4,7 @@
 import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
 const args = [
-  homedir() + "/dotfiles/bin/release.mjs",
+  homedir() + "/dev/projects/active/backlog-infra/bin/release.mjs",
   "--project", "__PROJECT_NAME__",
   ...process.argv.slice(2),
 ];

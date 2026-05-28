@@ -647,9 +647,11 @@ do_install_daemon() {
   # XML-escape each substitution so a path or label containing `&`, `<`,
   # or `>` doesn't produce a malformed plist. Realistic paths under
   # ~/dev/projects/ are alphanumeric+hyphen so this is mostly defensive.
-  local label_x bin_path_x project_root_x home_x
+  local label_x bin_path_x project_root_x home_x bin_dir_x
   label_x="$(xml_escape "$label")"
   bin_path_x="$(xml_escape "$bin_path")"
+  local bin_dir; bin_dir="$(dirname "$bin_path")"
+  bin_dir_x="$(xml_escape "$bin_dir")"
   project_root_x="$(xml_escape "$project_root")"
   home_x="$(xml_escape "$HOME")"
 
@@ -674,7 +676,7 @@ do_install_daemon() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${home_x}/dev/projects/active/backlog-infra/bin:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
         <string>${home_x}</string>
     </dict>

@@ -575,7 +575,7 @@ _parse_reset_to_epoch() {
 
 _run_status_hook() {
   local item="$1" exit_code="${2:-0}" mode="${3:-loop}" pre_head="$4" pulled="${5:-0}"
-  if [[ -n "$HOOK" && -x "$HOOK" ]]; then
+  if [[ -n "$HOOK" && -f "$HOOK" ]]; then
     node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" >> "$LOG_FILE" 2>&1 || true
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] status hook not found or not executable: ${HOOK:-<not set>}" | tee -a "$LOG_FILE"

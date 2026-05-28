@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-28T21:26:03Z",
+  "last_sweep_at": "2026-05-28T21:31:33Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 205,
-  "fixed_total": 48,
-  "flagged_total": 9,
-  "recent_actions": [{"ts":"2026-05-28T18:32:04Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T19:00:21Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-28T19:02:26Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T19:30:43Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-28T19:32:45Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-28T19:34:49Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T19:36:53Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T19:38:55Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-28T19:40:57Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-28T19:45:00Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:01:09Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-28T20:05:14Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:07:18Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:09:22Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:15:27Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:25:34Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T20:31:37Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-28T20:55:49Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-28T21:01:52Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-28T21:26:03Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"}]
+  "sweeps_total": 2,
+  "fixed_total": 1,
+  "flagged_total": 1,
+  "recent_actions": [{"ts":"2026-05-28T21:29:29Z","project":"backlog-infra","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-28T21:31:33Z","project":"backlog-infra","action":"git_dirty","result":"stashed","stash":"stash@{0}"}]
 }

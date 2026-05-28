@@ -568,7 +568,13 @@ snapshot() {
         fi
         local precise_tag=""
         [[ "$cd_parsed" == "true" ]] && precise_tag="${YL}(precise)${RS} " || precise_tag="${DIM}(~estimated)${RS} "
-        local until_time; until_time="$(date -j -f '%s' "$cd_until_epoch" '+%H:%M' 2>/dev/null || echo '?')"
+        local until_time
+        local today_midnight; today_midnight="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-%d') 00:00:00" '+%s' 2>/dev/null || true)"
+        if [[ -n "$today_midnight" ]] && (( cd_until_epoch >= today_midnight + 86400 )); then
+          until_time="$(date -j -f '%s' "$cd_until_epoch" '+%b %d %H:%M' 2>/dev/null || echo '?')"
+        else
+          until_time="$(date -j -f '%s' "$cd_until_epoch" '+%H:%M' 2>/dev/null || echo '?')"
+        fi
         alert_lines+=("  ${RD}${cd_name}${RS} ${precise_tag}cooldown (${cd_reason}) — ${remain_str} (until ${until_time})")
         alert_n=$((alert_n + 1))
       fi

@@ -212,9 +212,9 @@ snapshot() {
     if [[ -n "$log" ]]; then
       local out
       out="$(jq -s -r \
-        --argjson c5h "$cutoff_5h" --argjson cR "$cutoff_right" --arg thisHost "$this_host" '
+        --argjson c5h "$cutoff_5h" --argjson cR "$cutoff_right" --arg thisHost "$this_host_short" '
         def norm: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
-        ([ .[] | { t: (.ts | norm), tok: (.tokens // 0), h: (.host // "") } ] | sort_by(.t)) as $rs
+        ([ .[] | { t: (.ts | norm), tok: (.tokens // 0), h: (.host // "" | sub("\\.local$"; "")) } ] | sort_by(.t)) as $rs
         | ([$rs[] | select(.tok > 0)] | last | .h // "—") as $host
         | ([$rs[].h // empty] | unique | join(",")) as $hosts
         | "\($host)|" +

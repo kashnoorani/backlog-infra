@@ -260,7 +260,7 @@ function formatTokens(n) {
 async function main() {
   const opts = parseArgs();
   const ts = new Date().toISOString();
-  const host = hostname();
+  const host = hostname().replace(/\.local$/, "");
 
   const transcript = findNewestTranscript();
   const usage = extractUsage(transcript);

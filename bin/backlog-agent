@@ -88,6 +88,10 @@ HEARTBEAT_SECONDS=1800
 FAST_TICKS=4
 FAST_SECONDS=300
 DEBOUNCE_SECONDS=2
+# Escalating idle sleep: when tick_once finds no open items, the daemon
+# progressively backs off. Resets to fast-start as soon as work appears.
+# Format: space-separated seconds at each streak level (1st idle, 2nd, …).
+ESCALATING_IDLE_SLEEP="30 60 120 300 600 1800"
 STATE_DIR=".claude"
 # Layer 2 (docs/multi-agent-design.md): when a tick hits the Anthropic
 # plan/session-limit, pause claude invocations for this long. The rolling
@@ -553,6 +557,14 @@ tick_once() {
     _run_status_hook "" 0 loop "$pre_head" 0
     _post_tick_cleanup
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (cooldown)" | tee -a "$LOG_FILE"
+    # Communicate exact wait time to the caller so the daemon loop can
+    # sleep precisely until the reset moment instead of polling.
+    local cooldown_epoch; cooldown_epoch="$(grep -oE '"until_epoch"[[:space:]]*:[[:space:]]*[0-9]+' "$COOLDOWN_FILE" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || echo '')"
+    if [[ -n "$cooldown_epoch" ]]; then
+      local now_ep; now_ep="$(date +%s)"
+      COOLDOWN_WAIT_SECONDS=$(( cooldown_epoch - now_ep > 0 ? cooldown_epoch - now_ep : 0 ))
+    fi
+    TICK_OUTCOME=cooldown
     return 0
   fi
 
@@ -635,6 +647,7 @@ tick_once() {
     _post_tick_cleanup
     [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (idle)" | tee -a "$LOG_FILE"
+    TICK_OUTCOME=idle
     return 0
   fi
 
@@ -741,6 +754,7 @@ tick_once() {
   _post_tick_cleanup
   [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done" | tee -a "$LOG_FILE"
+  TICK_OUTCOME=work
 }
 
 # --- subcommands ---
@@ -836,6 +850,17 @@ do_status() {
   fi
 }
 
+# Read ESCALATING_IDLE_SLEEP at the given 1-based streak index. Falls back
+# to the last element if beyond the list, or HEARTBEAT_SECONDS if unset.
+_pick_idle_sleep() {
+  local streak="$1" idx=0 val
+  for val in $ESCALATING_IDLE_SLEEP; do
+    idx=$((idx + 1))
+    if (( idx == streak )); then echo "$val"; return 0; fi
+  done
+  echo "${val:-$HEARTBEAT_SECONDS}"
+}
+
 do_run() {
   ensure_backlog
   check_interactive_worker
@@ -851,18 +876,37 @@ do_run() {
       done
     ) &
     WATCH_PID=$!
-    echo "watching $BACKLOG_FILE (fswatch pid $WATCH_PID); fast-start ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s heartbeat. ctrl-c to stop."
+    echo "watching $BACKLOG_FILE (fswatch pid $WATCH_PID); fast-start ${FAST_SECONDS}s, idle escalates ${ESCALATING_IDLE_SLEEP// /→}s. ctrl-c to stop."
   else
-    echo "fswatch not installed (brew install fswatch). heartbeat-only every ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s." >&2
+    echo "fswatch not installed (brew install fswatch). heartbeat every ${FAST_SECONDS}s, idle escalates ${ESCALATING_IDLE_SLEEP// /→}s." >&2
   fi
-  local tick_count=0
+  local tick_count=0 idle_streak=0 sleep_sec
+  TICK_OUTCOME=""
   tick_once
   while true; do
-    if (( tick_count < FAST_TICKS )); then
-      sleep_interruptible "$FAST_SECONDS"
-    else
-      sleep_interruptible "$HEARTBEAT_SECONDS"
-    fi
+    sleep_sec=""
+    case "$TICK_OUTCOME" in
+      work)
+        idle_streak=0
+        if (( tick_count < FAST_TICKS )); then
+          sleep_sec="$FAST_SECONDS"
+        else
+          sleep_sec="$HEARTBEAT_SECONDS"
+        fi ;;
+      idle)
+        idle_streak=$((idle_streak + 1))
+        sleep_sec="$(_pick_idle_sleep "$idle_streak")" ;;
+      cooldown)
+        idle_streak=0
+        if [[ -n "${COOLDOWN_WAIT_SECONDS:-}" ]] && (( COOLDOWN_WAIT_SECONDS > 0 )); then
+          sleep_sec="$COOLDOWN_WAIT_SECONDS"
+        else
+          sleep_sec="$HEARTBEAT_SECONDS"
+        fi ;;
+      *) sleep_sec="$FAST_SECONDS" ;;
+    esac
+    [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"
+    TICK_OUTCOME=""
     tick_once
     tick_count=$((tick_count + 1))
   done
@@ -884,15 +928,34 @@ do_watch() {
   acquire_lock
   trap 'release_lock' EXIT
   trap 'exit 130' INT TERM
-  echo "heartbeat-only loop; fast-start ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s. ctrl-c to stop."
-  local tick_count=0
+  echo "heartbeat-only loop; fast-start ${FAST_SECONDS}s, idle escalates ${ESCALATING_IDLE_SLEEP// /→}s. ctrl-c to stop."
+  local tick_count=0 idle_streak=0 sleep_sec
+  TICK_OUTCOME=""
   tick_once
   while true; do
-    if (( tick_count < FAST_TICKS )); then
-      sleep_interruptible "$FAST_SECONDS"
-    else
-      sleep_interruptible "$HEARTBEAT_SECONDS"
-    fi
+    sleep_sec=""
+    case "$TICK_OUTCOME" in
+      work)
+        idle_streak=0
+        if (( tick_count < FAST_TICKS )); then
+          sleep_sec="$FAST_SECONDS"
+        else
+          sleep_sec="$HEARTBEAT_SECONDS"
+        fi ;;
+      idle)
+        idle_streak=$((idle_streak + 1))
+        sleep_sec="$(_pick_idle_sleep "$idle_streak")" ;;
+      cooldown)
+        idle_streak=0
+        if [[ -n "${COOLDOWN_WAIT_SECONDS:-}" ]] && (( COOLDOWN_WAIT_SECONDS > 0 )); then
+          sleep_sec="$COOLDOWN_WAIT_SECONDS"
+        else
+          sleep_sec="$HEARTBEAT_SECONDS"
+        fi ;;
+      *) sleep_sec="$FAST_SECONDS" ;;
+    esac
+    [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"
+    TICK_OUTCOME=""
     tick_once
     tick_count=$((tick_count + 1))
   done

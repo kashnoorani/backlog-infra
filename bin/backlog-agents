@@ -563,6 +563,14 @@ do_sync() {
       warn "$label points to $repo which doesn't exist; skipping (run \`dev-projects sync\`)"
       continue
     fi
+    # If this is a legacy plist and a newer .backlog-agent.plist exists for the
+    # same project, skip it — only restart the canonical daemon.
+    if [[ "$plist" != *backlog-agent.plist ]]; then
+      local agent_plist="$HOME/Library/LaunchAgents/com.${USER}.${name}.backlog-agent.plist"
+      if [[ -f "$agent_plist" ]]; then
+        continue
+      fi
+    fi
     # If a tick is in flight (inflight file younger than 30 min), skip this daemon
     # to avoid killing a running Claude session mid-work.
     local inflight="$repo/.claude/backlog-agent-tick.inflight"
@@ -606,13 +614,20 @@ do_list() {
   local plist label state
   printf '  %s%-40s %-12s %s%s\n' "$DIM" "LABEL" "STATE" "PLIST" "$RS"
   local found=0
-  for plist in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
-               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
-               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
-    [[ -f "$plist" ]] || continue
-    found=1
-    label="$(basename "$plist" .plist)"
-    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+for plist in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
+             "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+             "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+  [[ -f "$plist" ]] || continue
+  label="$(basename "$plist" .plist)"
+  local list_name="${label#com.${USER}.}"
+  list_name="${list_name%.backlog-agent}"
+  list_name="${list_name%.backlog}"
+  list_name="${list_name%.backlog-loop}"
+  if [[ "$plist" != *backlog-agent.plist ]]; then
+    [[ -f "$HOME/Library/LaunchAgents/com.${USER}.${list_name}.backlog-agent.plist" ]] && continue
+  fi
+  found=1
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       state="${GN}running${RS}"
     else
       state="${YL}installed${RS}"

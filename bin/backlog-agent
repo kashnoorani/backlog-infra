@@ -411,22 +411,15 @@ tick_once() {
           claimed=true
           echo "  [claim] ${item_title}" | tee -a "$LOG_FILE"
         else
-          # Push failed (e.g. another machine claimed first). Revert the [~]
-          # marker locally and skip claude — the item stays [ ] for the
-          # next tick or another machine to pick up.
-          (cd "$PWD" && awk -i inplace '
-            BEGIN { in_open=0; done=0 }
-            /^## Open/     { in_open=1; print; next }
-            /^## [A-Z]/    { if (done) exit; in_open=0; print; next }
-            in_open && !done && /^(- )?\[~\] / {
-              sub(/\[~\]/, "[ ]"); done=1
-            }
-            { print }
-          ' "$BACKLOG_FILE") 2>/dev/null || true
-          git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
-          git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1 || true
-          git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
-          echo "  [skipped] claim push failed for '${item_title}' — unclaiming, retry next tick" | tee -a "$LOG_FILE"
+          # Push failed (e.g. another machine claimed first). Discard the
+          # local claim commit and reset to the remote tip so the daemon
+          # can pull cleanly on the next tick. The item stays [ ] on the
+          # remote — another machine or the next tick will pick it up.
+          local branch
+          branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+          git -C "$PWD" fetch origin "$branch" 2>/dev/null || true
+          git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+          echo "  [skipped] claim push failed for '${item_title}' — reset to origin, retry next tick" | tee -a "$LOG_FILE"
         fi
       fi
     fi

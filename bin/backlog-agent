@@ -592,6 +592,36 @@ _run_status_hook() {
   fi
 }
 
+_maybe_auto_complete() {
+  local item="$1"
+  [[ -z "$item" ]] && return 0
+  local still_in_progress
+  still_in_progress="$(sed -n '/^## Open/,/^## [A-Z]/p' "$BACKLOG_FILE" | grep -cE '^(- )?\[~\] ' || true)"
+  [[ "$still_in_progress" -eq 0 ]] && return 0
+  local real_changes
+  real_changes="$(git -C "$PWD" diff --name-only HEAD 2>/dev/null | grep -vE '^\.claude/' || true)"
+  if [[ -n "$real_changes" ]]; then
+    return 2
+  fi
+  if ! git -C "$PWD" diff --name-only HEAD 2>/dev/null | grep -qE '^\.claude/' 2>/dev/null; then
+    return 1
+  fi
+  _local_awk_inplace "$BACKLOG_FILE" '
+    BEGIN { in_open=0; done=0 }
+    /^## Open/       { in_open=1; print; next }
+    /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+    in_open && !done && /^(- )?\[~\] / {
+      sub(/\[~\]/, "[x]"); done=1
+    }
+    { print }
+  ' 2>/dev/null || true
+  git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+  git -C "$PWD" commit -m "auto-complete: ${item} (already implemented)" >/dev/null 2>&1
+  git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+  echo "  [auto-done] ${item} (only metadata changed — already implemented)" | tee -a "$LOG_FILE"
+  return 0
+}
+
 tick_once() {
   local ts pre_head item_title claude_exit
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -831,19 +861,31 @@ tick_once() {
       fi
     fi
     if [[ "$claimed" == "true" ]]; then
-      _local_awk_inplace "$BACKLOG_FILE" '
-        BEGIN { in_open=0; done=0 }
-        /^## Open/       { in_open=1; print; next }
-        /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
-        in_open && !done && /^(- )?\[~\] / {
-          sub(/\[~\]/, "[ ]"); done=1
-        }
-        { print }
-      ' 2>/dev/null || true
-      git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
-      git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
-      git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
-      echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
+      local auto_result=0
+      _maybe_auto_complete "$item_title" || auto_result=$?
+      if [[ $auto_result -eq 0 ]]; then
+        : # auto-complete already handled
+      elif [[ $auto_result -eq 2 ]]; then
+        echo "  [keep] ${item_title} (real changes detected, keeping claimed)" | tee -a "$LOG_FILE"
+      else
+        _local_awk_inplace "$BACKLOG_FILE" '
+          BEGIN { in_open=0; done=0 }
+          /^## Open/       { in_open=1; print; next }
+          /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+          in_open && !done && /^(- )?\[~\] / {
+            sub(/\[~\]/, "[ ]"); done=1
+          }
+          { print }
+        ' 2>/dev/null || true
+        git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+        git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
+        git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+        echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
+      fi
+    fi
+  else
+    if [[ "$claimed" == "true" ]]; then
+      _maybe_auto_complete "$item_title" >/dev/null 2>&1 || true
     fi
   fi
   rm -f "$capture_file" 2>/dev/null || true

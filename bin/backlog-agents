@@ -641,39 +641,36 @@ snapshot() {
     local history; history="$(find_history_file "$proj_dir")"
     [[ -n "$backlog" && -n "$history" ]] || continue
     local pname; pname="$(basename "$proj_dir")"
-    local ip_items
-    ip_items="$(awk '/^## In progress/ { in_ip=1; next } in_ip && /^## / { exit } in_ip && /^- \[~\] / { sub(/^- \[~\] /, ""); sub(/[. ]+$/, ""); print }' "$backlog" 2>/dev/null || true)"
-    [[ -n "$ip_items" ]] || continue
-    while IFS= read -r ip_item; do
-      [[ -z "$ip_item" ]] && continue
+    local wip_items
+    wip_items="$(awk '
+      /^## Open/        { in_sec=1; next }
+      /^## In progress/ { in_sec=1; next }
+      /^## /            { in_sec=0; next }
+      in_sec && /^- \[~\] / { sub(/^- \[~\] /, ""); sub(/[. ]+$/, ""); print }
+    ' "$backlog" 2>/dev/null || true)"
+    [[ -n "$wip_items" ]] || continue
+    while IFS= read -r wip_item; do
+      [[ -z "$wip_item" ]] && continue
       local first_ts
-      first_ts="$(while IFS= read -r hline; do
-        [[ -z "$hline" ]] && continue
-        local hitem; hitem="$(echo "$hline" | jq -r '.item // ""' 2>/dev/null || true)"
-        if [[ "$hitem" == "$ip_item" ]]; then
-          echo "$hline" | jq -r '.ts // ""' 2>/dev/null
-          break
-        fi
-      done < <(tac "$history" 2>/dev/null || true))"
-      if [[ -n "$first_ts" ]]; then
-        local first_epoch; first_epoch="$(iso_to_epoch "$first_ts" 2>/dev/null || echo "")"
-        if [[ -n "$first_epoch" ]]; then
-          local age=$(( now - first_epoch ))
-          if (( age > stuck_threshold )); then
-            local age_str
-            if (( age >= 86400 )); then
-              age_str="$(printf '%dd %dh' $((age/86400)) $(((age%86400)/3600)))"
-            elif (( age >= 3600 )); then
-              age_str="$(printf '%dh %dm' $((age/3600)) $(((age%3600)/60)))"
-            else
-              age_str="$((age/60))m"
-            fi
-            stuck_lines+=("  ${RD}${pname}${RS} ${YL}[~]${RS} ${DIM}${age_str}${RS} — ${ip_item:0:70}")
-            stuck_n=$((stuck_n + 1))
-          fi
-        fi
+      first_ts="$(jq -rs --arg it "$wip_item" \
+        'map(select(.item == $it)) | sort_by(.ts) | .[0].ts // ""' \
+        "$history" 2>/dev/null || true)"
+      [[ -n "$first_ts" ]] || continue
+      local first_epoch; first_epoch="$(iso_to_epoch "$first_ts" 2>/dev/null || echo "")"
+      [[ -n "$first_epoch" ]] || continue
+      local age=$(( now - first_epoch ))
+      (( age > stuck_threshold )) || continue
+      local age_str
+      if (( age >= 86400 )); then
+        age_str="$(printf '%dd %dh' $((age/86400)) $(((age%86400)/3600)))"
+      elif (( age >= 3600 )); then
+        age_str="$(printf '%dh %dm' $((age/3600)) $(((age%3600)/60)))"
+      else
+        age_str="$((age/60))m"
       fi
-    done <<< "$ip_items"
+      stuck_lines+=("  ${RD}${pname}${RS} ${YL}[~]${RS} ${DIM}${age_str}${RS} — ${wip_item:0:70}")
+      stuck_n=$((stuck_n + 1))
+    done <<< "$wip_items"
   done
   if (( stuck_n > 0 )); then
     echo

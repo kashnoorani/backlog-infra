@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// backlog-status.mjs — invoked by ~/dev/projects/active/backlog-infra/bin/backlog after each
-// headless `claude -p` tick AND by the /watch-backlog slash command
+// backlog-agent-status.mjs — invoked by ~/dev/projects/active/backlog-infra/bin/backlog-agent
+// after each headless `backlog-agent run` tick AND by the /watch-backlog slash command
 // after each interactive iteration. Reads the transcript JSONL for the
 // session that just finished, normalises token usage, writes
 // .claude/backlog-status.json (overwrite, headline state) and appends
@@ -12,12 +12,12 @@
 // REPO_ROOT note: this is the SHARED copy in ~/dev/projects/active/backlog-infra/bin/. It derives
 // REPO_ROOT from `process.cwd()` so it works for any project — both the
 // headless driver and /watch-backlog invoke the hook from the project
-// root. Per-project copies at <project>/scripts/backlog-status.mjs use
+// root. Per-project copies at <project>/scripts/backlog-agent-status.mjs use
 // `import.meta.url` (../) — equivalent in practice; the driver prefers
 // the per-project copy when present.
 //
 // Usage:
-//   node ~/dev/projects/active/backlog-infra/bin/backlog-status.mjs \
+//   node ~/dev/projects/active/backlog-infra/bin/backlog-agent-status.mjs \
 //     --item "<title>" \
 //     --exit-code <n> \
 //     --mode loop|watch|manual \
@@ -302,7 +302,7 @@ async function main() {
     const r = git(["pull", "--rebase", "origin", branch], { allowFail: true });
     if (r.status !== 0) {
       console.error(
-        `[backlog-status] git pull --rebase failed (continuing):\n${r.stderr}`,
+        `[backlog-agent-status] git pull --rebase failed (continuing):\n${r.stderr}`,
       );
       // If the rebase left an in-progress state (e.g. conflict in a work
       // file like docs/Backlog.md from divergent work across machines),
@@ -395,7 +395,7 @@ async function main() {
   });
   if (ignored.status === 0) {
     console.log(
-      "[backlog-status] status files are gitignored; wrote locally, skipping commit/push",
+      "[backlog-agent-status] status files are gitignored; wrote locally, skipping commit/push",
     );
     return;
   }
@@ -409,12 +409,12 @@ async function main() {
     cwd: REPO_ROOT,
   });
   if (diffCached.status === 0) {
-    console.log("[backlog-status] no staged changes; skipping commit");
+    console.log("[backlog-agent-status] no staged changes; skipping commit");
     return;
   }
 
   // Build commit message
-  const subject = opts.item ? `backlog-status: "${opts.item}"` : "backlog-status: idle";
+  const subject = opts.item ? `backlog-agent-status: "${opts.item}"` : "backlog-agent-status: idle";
   const durStr = formatDuration(usage.duration_ms);
   const tokStr = formatTokens(headline);
   let tokSegment = `${tokStr} tok`;
@@ -430,13 +430,13 @@ async function main() {
     encoding: "utf8",
   });
   if (commit.status !== 0) {
-    console.error(`[backlog-status] git commit failed:\n${commit.stderr}`);
+    console.error(`[backlog-agent-status] git commit failed:\n${commit.stderr}`);
     process.exit(1);
   }
 
   // Push with exponential backoff. Skip entirely if no upstream.
   if (!upstreamExists) {
-    console.log(`[backlog-status] no origin/${branch}; commit is local only`);
+    console.log(`[backlog-agent-status] no origin/${branch}; commit is local only`);
     return;
   }
   const delays = [0, 2000, 4000, 8000, 16000];
@@ -447,18 +447,18 @@ async function main() {
       encoding: "utf8",
     });
     if (r.status === 0) {
-      console.log("[backlog-status] ok");
+      console.log("[backlog-agent-status] ok");
       return;
     }
     console.error(
-      `[backlog-status] push attempt ${i + 1} failed (delay=${delays[i]}ms):\n${r.stderr}`,
+      `[backlog-agent-status] push attempt ${i + 1} failed (delay=${delays[i]}ms):\n${r.stderr}`,
     );
   }
-  console.error("[backlog-status] push failed after retries; commit is local");
+  console.error("[backlog-agent-status] push failed after retries; commit is local");
   process.exit(2);
 }
 
 main().catch((err) => {
-  console.error(`[backlog-status] fatal: ${err.message}`);
+  console.error(`[backlog-agent-status] fatal: ${err.message}`);
   process.exit(1);
 });

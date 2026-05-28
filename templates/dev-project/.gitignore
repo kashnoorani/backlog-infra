@@ -6,8 +6,8 @@ coverage/
 # Per-user Claude Code config
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
-.claude/backlog.log
-.claude/backlog.lock
+.claude/backlog-agent.log
+.claude/backlog-agent.lock
 .claude/launchd-stdout.log
 .claude/launchd-stderr.log
 

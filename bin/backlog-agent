@@ -1,0 +1,833 @@
+#!/usr/bin/env bash
+# backlog-agent — drive and inspect this project's queue.
+#
+# Subcommands:
+#   backlog-agent             Status: open count, next [ ]/[!] item, in-flight
+#                       tick (if any), last completed tick age.
+#   backlog-agent run         Worker: fswatch on backlog file + 30-min heartbeat,
+#                       tick on either. Idle ticks (no open items) skip the
+#                       claude invocation — only the status file is updated.
+#                       Runs until Ctrl-C.
+#   backlog-agent tick        Single tick, exit.
+#   backlog-agent watch       Heartbeat-only loop (no fswatch). Fast-start:
+#                       first 4 ticks at 5-min intervals, then 30-min.
+#   backlog-agent log         tail -F the worker log (recent context + live).
+#   backlog-agent unblock     List [?] blocked items. With `<N>` flip the Nth to
+#                       [!] (answered, ready to retry); with `--all` flip
+#                       every [?] to [!]. Write your answers inline first
+#                       (e.g. `[user] in-memory is fine`); the worker reads
+#                       the item body on next tick.
+#   backlog-agent compact     Archive done items: moves all `- [x]` from ## Done to
+#                       ## Archive. Looks for scripts/backlog-agent-compact.mjs
+#                       (per-project), falls back to the shared copy at
+#                       ~/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs.
+#   backlog-agent install-daemon
+#                       Template a launchd plist for the current project
+#                       (label com.$USER.<project>.backlog-agent), drop it in
+#                       ~/Library/LaunchAgents, and bootstrap it. Idempotent
+#                       refresh: if a plist already exists for this project,
+#                       it's booted out and replaced.
+#   backlog-agent uninstall-daemon
+#                       Boot out and remove this project's launchd plist.
+#
+# Queue file: prefers docs/Backlog.md (new), falls back to backlog.txt
+# (legacy) during the migration. Operates on the current working directory
+# — run from a project root.
+#
+# Never run alongside an interactive /watch-backlog session — they race
+# for the same items. A .claude/watch-backlog-agent.ping sentinel (touched by
+# the slash command each iteration) guards against accidental overlap;
+# run/tick/watch refuse to start if the ping is < 3 min old.
+
+set -euo pipefail
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$LIB_DIR/_lib.sh"
+
+# --- file discovery (polyglot during Phase 1 migration) ---
+# Canonical location is docs/Backlog.md. Also accept Backlog.md at the
+# repo root (an intermediate form some projects adopted) and the original
+# backlog.txt. Lock/log paths track the convention so the two stacks
+# don't stomp on each other if both happen to run.
+if [[ -f docs/Backlog.md ]]; then
+  BACKLOG_FILE="docs/Backlog.md"
+  LOCK_DIR=".claude/backlog-agent.lock"
+  LOG_FILE=".claude/backlog-agent.log"
+  INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
+elif [[ -f Backlog.md ]]; then
+  BACKLOG_FILE="Backlog.md"
+  LOCK_DIR=".claude/backlog-agent.lock"
+  LOG_FILE=".claude/backlog-agent.log"
+  INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
+elif [[ -f backlog.txt ]]; then
+  BACKLOG_FILE="backlog.txt"
+  LOCK_DIR=".claude/backlog-agent.lock"
+  LOG_FILE=".claude/backlog-agent.log"
+  INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
+else
+  # Allow status/help to run from anywhere; only fail on commands that
+  # actually need a backlog.
+  BACKLOG_FILE=""
+  LOCK_DIR=""
+  LOG_FILE=""
+  INFLIGHT_FILE=""
+fi
+
+HOOK=""
+if [[ -f scripts/backlog-agent-status.mjs ]]; then
+  HOOK="scripts/backlog-agent-status.mjs"
+elif [[ -f scripts/loop-status.mjs ]]; then
+  HOOK="scripts/loop-status.mjs"
+elif [[ -f "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-status.mjs" ]]; then
+  # Shared fallback — used by projects that haven't (or won't) ship a
+  # per-project copy. Derives REPO_ROOT from cwd; relies on the driver
+  # running the hook from the project root.
+  HOOK="$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-status.mjs"
+fi
+
+HEARTBEAT_SECONDS=1800
+FAST_TICKS=4
+FAST_SECONDS=300
+DEBOUNCE_SECONDS=2
+STATE_DIR=".claude"
+
+# Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
+# or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
+# Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
+ITEM_REGEX='^(- )?\[[ !]\] '
+strip_marker() { sed -E 's/^(- )?\[[ !]\] //'; }
+
+require_backlog() {
+  if [[ -z "$BACKLOG_FILE" ]]; then
+    echo "error: no docs/Backlog.md or backlog.txt in $(pwd). expected to run from a project root." >&2
+    exit 1
+  fi
+}
+
+# Auto-create a backlog file if none exists. Only used by subcommands that
+# actively produce work (run/tick/watch/unblock/install-daemon/compact);
+# read-only subcommands (status/log) use require_backlog instead, so they
+# don't accidentally scaffold in the wrong directory.
+ensure_backlog() {
+  if [[ -n "$BACKLOG_FILE" ]]; then
+    return 0
+  fi
+  local project_name
+  project_name="$(basename "$(pwd)")"
+  echo "backlog-agent: no backlog file found; auto-creating docs/Backlog.md" >&2
+  mkdir -p docs
+  cat > docs/Backlog.md <<BACKLOG_EOF
+# ${project_name} — Backlog
+
+A running list of work to do. Mark items \`- [x]\` when done and move
+them to the Done section, \`- [ ]\` when open, \`- [~]\` when in progress,
+\`- [?]\` when blocked on a design decision the user needs to weigh in
+on, and \`- [!]\` once you've written answers inline and want the worker
+to retry. The autonomous worker (see \`/watch-backlog\` or \`backlog
+run\`) picks \`- [ ]\` and \`- [!]\` items and skips \`- [?]\`; surface those
+to the user when waking them.
+
+## Open
+(none)
+
+## In progress
+(none)
+
+## Blocked
+(none)
+
+## Done
+(none)
+BACKLOG_EOF
+  # Re-detect file paths since BACKLOG_FILE was empty at script start.
+  BACKLOG_FILE="docs/Backlog.md"
+  LOCK_DIR=".claude/backlog-agent.lock"
+  LOG_FILE=".claude/backlog-agent.log"
+  INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
+  # HOOK was already set at script start (it doesn't depend on BACKLOG_FILE).
+  echo "backlog-agent: scaffolded docs/Backlog.md for ${project_name}" >&2
+}
+
+# Check if a backlog launchd daemon is already installed for this project.
+# If not (and we're running interactively, not under launchd), auto-install
+# one so the daemon survives reboots. Skips if a plist already exists (new
+# .backlog or legacy .backlog-loop label).
+maybe_install_daemon() {
+  local project_root project label plist_path
+  { read -r project_root; read -r project; read -r label; read -r plist_path; read -r _bin; } < <(daemon_paths 2>/dev/null)
+  if [[ -z "${plist_path:-}" ]]; then
+    return 0  # can't derive paths (not a git repo); skip
+  fi
+  if [[ -f "$plist_path" ]]; then
+    return 0  # new-label plist already exists
+  fi
+  local old_plist="$HOME/Library/LaunchAgents/com.${USER}.${project}.backlog.plist"
+  if [[ -f "$old_plist" ]]; then
+    return 0  # old-label plist exists
+  fi
+  local legacy_plist="$HOME/Library/LaunchAgents/com.${USER}.${project}.backlog-loop.plist"
+  if [[ -f "$legacy_plist" ]]; then
+    return 0  # legacy plist exists
+  fi
+  echo "backlog-agent: no launchd daemon installed for ${project}; auto-installing now (survives reboots)." >&2
+  do_install_daemon
+  # The daemon is now running and holds the lock — we must not proceed
+  # to acquire_lock in do_run/do_watch or we'd race ourselves.
+  echo "backlog-agent: daemon installed and running. exiting — the daemon will pick up work from here." >&2
+  exit 0
+}
+
+# --- helpers ---
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+    return 0
+  fi
+  # Lock dir already exists. Check whether the recorded PID is still alive.
+  # If it isn't, the previous daemon was SIGKILL'd before its EXIT trap
+  # could fire (e.g. `launchctl kickstart -k` escalating past SIGTERM,
+  # or a crash). Reclaim the lock and any orphaned inflight sentinel
+  # rather than refusing to start — otherwise the daemon stays down
+  # until somebody notices and manually `rmdir`s the lock.
+  local lock_pid=""
+  [[ -f "$LOCK_DIR/pid" ]] && lock_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    echo "lock held at $LOCK_DIR by live PID $lock_pid — exiting." >&2
+    exit 1
+  fi
+  echo "lock at $LOCK_DIR is stale (recorded PID '${lock_pid:-?}' is gone); reclaiming." >&2
+  rm -rf "$LOCK_DIR" 2>/dev/null
+  [[ -n "${INFLIGHT_FILE:-}" ]] && rm -f "$INFLIGHT_FILE" 2>/dev/null
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "lock at $LOCK_DIR contested during reclaim — exiting." >&2
+    exit 1
+  fi
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+}
+release_lock() {
+  rm -rf "$LOCK_DIR" 2>/dev/null || true
+  # If a tick was mid-flight when we got signaled, drop the sentinel so
+  # `backlog-agent` doesn't report a phantom in-flight tick after the daemon exits.
+  [[ -n "${INFLIGHT_FILE:-}" ]] && rm -f "$INFLIGHT_FILE" 2>/dev/null || true
+  if [[ -n "${WATCH_PID:-}" ]]; then
+    # WATCH_PID is the wrapping subshell of `( fswatch | while read; do …
+    # done ) &`. fswatch and the while-read bash are peers in the
+    # pipeline, not descendants of the subshell in the SIGTERM-propagation
+    # sense — killing only WATCH_PID orphans them to launchd. Kill the
+    # children first so the whole tree exits.
+    pkill -P "$WATCH_PID" 2>/dev/null || true
+    kill "$WATCH_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${SLEEP_PID:-}" ]]; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+  fi
+}
+
+# Check if an interactive /watch-backlog session appears to be active.
+# The slash command touches .claude/watch-backlog-agent.ping on each iteration;
+# if the file is younger than 3 minutes (2× debounce window + guard
+# band), refuse to start a headless driver — they race for the same
+# items.
+check_interactive_worker() {
+  local ping_file="${STATE_DIR}/watch-backlog-agent.ping"
+  if [[ ! -f "$ping_file" ]]; then
+    return 0
+  fi
+  local now mtime age
+  now="$(date +%s)"
+  mtime="$(stat -f %m "$ping_file" 2>/dev/null || echo 0)"
+  age=$(( now - mtime ))
+  if (( age < 180 )); then
+    echo "error: an interactive /watch-backlog session appears to be active" >&2
+    echo "  (${ping_file} is ${age}s old)." >&2
+    echo "  stop the /watch-backlog session first, or wait for the ping to stale." >&2
+    exit 1
+  fi
+}
+
+# Heartbeat sleep that's interruptible by signals. A bare `sleep N` blocks
+# bash from running the EXIT/TERM trap until the sleep returns (so
+# `launchctl bootout` had to escalate to SIGKILL after a 5s timeout,
+# leaving the mkdir lock behind). Running the sleep as a background job
+# and `wait`ing on it lets the trap fire immediately on SIGTERM/SIGINT.
+sleep_interruptible() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID" 2>/dev/null || true
+  SLEEP_PID=""
+}
+
+# Auto-flip blocked items: scan the backlog for [?] items that have a [user]
+# answer inline (on any line between this item and the next section header or
+# item marker). Flip the marker from [?] to [!] so the worker picks it up on
+# the next tick without manual `backlog-agent unblock <N>`.  The round-trip becomes
+#   [ ] → (worker hits blocker) → [?] → (user writes [user] answer) → [!] → [x]
+# with no manual unblock step needed as long as the answer is present.
+auto_flip_blocked() {
+  local line_num
+  while IFS=: read -r line_num _; do
+    local has_user=1
+    awk -v start="$line_num" '
+      NR < start  { next }
+      NR == start { next }
+      /^## /      { exit }
+      /^(- )?\[/  { exit }
+      /\[user\]/  { found=1; exit }
+      END { exit found ? 0 : 1 }
+    ' "$BACKLOG_FILE" 2>/dev/null || has_user=0
+    if (( has_user )); then
+      sed -i '' "${line_num}s/\[?\]/[!]/" "$BACKLOG_FILE"
+    fi
+  done < <(grep -nE '^(- )?\[\?\] ' "$BACKLOG_FILE" 2>/dev/null || true)
+}
+
+# Post-tick maintenance: log rotation and auto-compact, so the daemon
+# self-heals without manual intervention.
+_post_tick_cleanup() {
+  # Log rotation — keep under 10 MB.
+  local max_log_bytes=$((10 * 1024 * 1024))
+  if [[ -f "$LOG_FILE" ]]; then
+    local log_size
+    log_size="$(wc -c < "$LOG_FILE" 2>/dev/null || echo 0)"
+    if (( log_size > max_log_bytes )); then
+      tail -n 5000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] log rotated (was ~$((log_size/1048576)) MB)" | tee -a "$LOG_FILE"
+    fi
+  fi
+
+  # Auto-compact — archive Done items when they pile up.
+  local done_count
+  done_count="$(grep -cE '^(- )?\[x\] ' "$BACKLOG_FILE" 2>/dev/null || echo 0)"
+  if [[ "$done_count" -gt 20 ]] && [[ -x "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done section has ${done_count} items; auto-compacting..." | tee -a "$LOG_FILE"
+    node "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" >> "$LOG_FILE" 2>&1 || true
+  fi
+}
+
+tick_once() {
+  local ts pre_head item_title claude_exit
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  {
+    echo
+    echo "================================================================"
+    echo "[$ts] tick start"
+    echo "================================================================"
+  } | tee -a "$LOG_FILE"
+
+  # Pull before reading the backlog — catches cross-machine changes from
+  # other computers that pushed to origin. Best-effort: no upstream is fine,
+  # network failure is fine, dirty working tree is fine (leave it alone).
+  # Track how many commits were pulled so the dashboard shows activity.
+  # Pre-check SSH so failures produce a clear diagnostic rather than a
+  # confusing "Permission denied (publickey)" buried in the log.
+  local pulled=0 head_before head_after
+  local ssh_ok=0
+  check_github_ssh && ssh_ok=1
+  if git -C "$PWD" rev-parse --abbrev-ref @{u} >/dev/null 2>&1; then
+    head_before="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
+    git -C "$PWD" pull --ff-only 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE" || true
+    head_after="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
+    if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
+      pulled="$(git -C "$PWD" rev-list --count "${head_before}..${head_after}" 2>/dev/null || echo 0)"
+      echo "  [git] pulled ${pulled} commit(s)" | tee -a "$LOG_FILE"
+    fi
+  fi
+
+  # Auto-flip [?] items that have [user] answers, so manual `backlog-agent unblock`
+  # is only needed when the user explicitly wants to block (no answer yet).
+  auto_flip_blocked
+
+  pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  # Only match items within the Open section (daemon never touches Thinking).
+  # sed extracts from ## Open to next ## header or EOF; grep matches within.
+  item_title="$(sed -n '/^## Open/,/^## [A-Z]/p' "$BACKLOG_FILE" 2>/dev/null | grep -m1 -E "$ITEM_REGEX" | strip_marker || true)"
+
+  # Write the in-flight sentinel so `backlog-agent` (status) can show that a tick
+  # is actively running rather than just "last tick 44m ago". Format:
+  # <daemon_pid>\t<start_epoch>\t<item_title>. Cleared after the HOOK below.
+  # If the daemon is SIGKILL'd mid-tick the sentinel is orphaned; status
+  # reconciles by checking that the recorded PID is still alive.
+  if [[ -n "$INFLIGHT_FILE" ]]; then
+    printf '%s\t%s\t%s\n' "$$" "$(date +%s)" "$item_title" > "$INFLIGHT_FILE"
+  fi
+
+  # If no open [-] or [!] items, skip the claude invocation entirely.
+  # The heartbeat still updates the status file so the fleet view knows
+  # the daemon is alive, but we don't burn tokens on an idle tick.
+  if [[ -z "$item_title" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] no open items; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
+    if [[ -n "$HOOK" ]]; then
+      node "$HOOK" \
+        --item "" \
+        --exit-code 0 \
+        --mode loop \
+        --pre-head "$pre_head" \
+        --pulled "$pulled" \
+        >> "$LOG_FILE" 2>&1 || true
+    fi
+    _post_tick_cleanup
+    [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (idle)" | tee -a "$LOG_FILE"
+    return 0
+  fi
+
+  # Flip the selected item from [ ] → [~] so other machines on the same
+  # project skip it. Commit+push the marker change before claude runs.
+  # If claude fails, flip it back. If the daemon crashes mid-tick the [~]
+  # item stays stuck — recoverable via `backlog-agent unclaim`.
+  local claimed=false
+  if [[ -n "$item_title" ]]; then
+    (cd "$PWD" && awk -i inplace '
+      BEGIN { in_open=0; done=0 }
+      /^## Open/       { in_open=1; print; next }
+      /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+      in_open && !done && /^(- )?\[[ !]\] / {
+        sub(/\[[ !]\]/, "[~]"); done=1
+      }
+      { print }
+    ' "$BACKLOG_FILE") 2>/dev/null || true
+    if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+      git -C "$PWD" add "$BACKLOG_FILE"
+      if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
+        git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+        claimed=true
+        echo "  [claim] ${item_title}" | tee -a "$LOG_FILE"
+      fi
+    fi
+  fi
+
+  local prompt
+  prompt="Execute exactly one iteration of the /watch-backlog contract (see ~/.claude/commands/watch-backlog.md), then exit. Specifically: re-read $BACKLOG_FILE fresh from disk; pick the first [ ] or [!] item from Open (exit silently if none); work it; typecheck + tests green before declaring done; update $BACKLOG_FILE (move the item to Done with [x] + a one-paragraph summary); commit with scoped \`git add <files>\` by filename; then exit. A [!] item is a retry after a previous [?] block — read the item body for the user's answers (typically prefixed \`[user]\`) and proceed using them. If the item turns out to need a user decision mid-work, flip it to [?] with a brief note on what's blocked, commit just the markup change, and exit."
+
+  # `set -e + pipefail` would otherwise abort the daemon on any non-zero
+  # claude exit, before we ever reach the PIPESTATUS capture. Wrapping in
+  # `|| handler` keeps the failure local: PIPESTATUS still reflects the
+  # claude pipeline when the handler runs.
+  claude_exit=0
+  { claude -p "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE"; } \
+    || claude_exit=${PIPESTATUS[0]}
+  if [[ $claude_exit -ne 0 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
+    if [[ "$claimed" == "true" ]]; then
+      (cd "$PWD" && awk -i inplace '
+        BEGIN { in_open=0; done=0 }
+        /^## Open/       { in_open=1; print; next }
+        /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+        in_open && !done && /^(- )?\[~\] / {
+          sub(/\[~\]/, "[ ]"); done=1
+        }
+        { print }
+      ' "$BACKLOG_FILE") 2>/dev/null || true
+      git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+      git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
+      git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+      echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
+    fi
+  fi
+
+  if [[ -n "$HOOK" ]]; then
+    node "$HOOK" \
+      --item "$item_title" \
+      --exit-code "$claude_exit" \
+      --mode loop \
+      --pre-head "$pre_head" \
+      --pulled "$pulled" \
+      >> "$LOG_FILE" 2>&1 || true
+  fi
+
+  _post_tick_cleanup
+  [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done" | tee -a "$LOG_FILE"
+}
+
+# --- subcommands ---
+do_status() {
+  require_backlog
+  local DIM=$'\e[2m' RS=$'\e[0m' GN=$'\e[32m' YL=$'\e[33m' RD=$'\e[31m' B=$'\e[1m' CY=$'\e[36m'
+
+  local open_count
+  # grep -c prints "0" AND exits non-zero on no matches; `|| true` lets us
+  # keep its stdout without duplicating it.
+  open_count="$(grep -c -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null || true)"
+  open_count="${open_count:-0}"
+  local thinking_count
+  thinking_count="$(sed -n '/^## Thinking/,/^## Open/p' "$BACKLOG_FILE" 2>/dev/null | grep -c -E '^- \[ \] ' || true)"
+  thinking_count="${thinking_count:-0}"
+  local progress_count
+  progress_count="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
+  progress_count="${progress_count:-0}"
+  local cc="$GN"
+  (( open_count > 0 )) && cc="$YL"
+  (( open_count > 5 )) && cc="$RD"
+  local extra=""
+  (( thinking_count > 0 )) && extra=" (${thinking_count} thinking)"
+  (( progress_count > 0 )) && extra="${extra} (${progress_count} in progress)"
+  printf '%s%s%s  %s%d open%s%s\n' "${B}${CY}" "$BACKLOG_FILE" "${RS}" "${cc}" "$open_count" "${RS}" "$extra"
+
+  if (( open_count > 0 )); then
+    local next
+    next="$(grep -m1 -E "$ITEM_REGEX" "$BACKLOG_FILE" 2>/dev/null | strip_marker || true)"
+    [[ -n "$next" ]] && printf '  %s→ next:%s %s\n' "$DIM" "$RS" "$next"
+  fi
+
+  # In-flight tick? Sentinel is written by tick_once before invoking claude
+  # and removed on tick completion. We re-verify with `kill -0` so a
+  # sentinel orphaned by a SIGKILL'd daemon doesn't look like a live tick.
+  if [[ -n "$INFLIGHT_FILE" ]] && [[ -f "$INFLIGHT_FILE" ]]; then
+    local in_pid in_epoch in_title in_now in_age in_age_str
+    IFS=$'\t' read -r in_pid in_epoch in_title < "$INFLIGHT_FILE" || true
+    if [[ -n "${in_pid:-}" ]] && kill -0 "$in_pid" 2>/dev/null; then
+      in_now="$(date '+%s')"
+      in_age=$(( in_now - in_epoch ))
+      if   (( in_age < 60 ));   then in_age_str="${in_age}s"
+      elif (( in_age < 3600 )); then in_age_str="$((in_age/60))m"
+      else                           in_age_str="$((in_age/3600))h"
+      fi
+      printf '  %s⚙ in flight%s  started %s ago' "$CY" "$RS" "$in_age_str"
+      [[ -n "$in_title" ]] && printf '  %s· %s%s' "$DIM" "$in_title" "$RS"
+      printf '\n'
+    fi
+  fi
+
+  local status_file=""
+  if [[ -f .claude/backlog-status.json ]]; then
+    status_file=".claude/backlog-status.json"
+  elif [[ -f .claude/loop-status.json ]]; then
+    status_file=".claude/loop-status.json"
+  fi
+  if [[ -n "$status_file" ]] && command -v jq >/dev/null 2>&1; then
+    local last_tick last_item last_exit
+    last_tick="$(jq -r '.last_tick_at // empty' "$status_file")"
+    last_item="$(jq -r '.last_item // ""' "$status_file")"
+    last_exit="$(jq -r '.last_exit_code // 0' "$status_file")"
+    if [[ -n "$last_tick" ]]; then
+      local clean tick_epoch now age age_str state label
+      clean="${last_tick%.*Z}"
+      [[ "$clean" == "$last_tick" ]] && clean="${last_tick%Z}"
+      tick_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "$clean" '+%s' 2>/dev/null || echo '')"
+      if [[ -n "$tick_epoch" ]]; then
+        now="$(date '+%s')"
+        age=$(( now - tick_epoch ))
+        if   (( age < 60 ));    then age_str="${age}s ago"
+        elif (( age < 3600 ));  then age_str="$((age/60))m ago"
+        elif (( age < 86400 )); then age_str="$((age/3600))h ago"
+        else                         age_str="$((age/86400))d ago"
+        fi
+        state="$DIM"; label="idle"
+        if   (( age < 1800 ));  then state="$GN"; label="fresh"
+        elif (( age >= 7200 )); then state="$RD"; label="STALE"
+        fi
+        [[ "$last_exit" != "0" ]] && state="$RD"
+        printf '  %s%s%s  last tick %s' "$state" "$label" "$RS" "$age_str"
+        [[ -n "$last_item" ]] && printf '  %s· %s%s' "$DIM" "$last_item" "$RS"
+        printf '\n'
+      fi
+    fi
+  fi
+}
+
+do_run() {
+  ensure_backlog
+  check_interactive_worker
+  ${INSTALL_DAEMON:-true} && maybe_install_daemon
+  acquire_lock
+  trap 'release_lock' EXIT
+  trap 'exit 130' INT TERM
+  if command -v fswatch >/dev/null 2>&1; then
+    (
+      fswatch -0 "$BACKLOG_FILE" | while IFS= read -r -d '' _; do
+        sleep "$DEBOUNCE_SECONDS"
+        tick_once
+      done
+    ) &
+    WATCH_PID=$!
+    echo "watching $BACKLOG_FILE (fswatch pid $WATCH_PID); fast-start ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s heartbeat. ctrl-c to stop."
+  else
+    echo "fswatch not installed (brew install fswatch). heartbeat-only every ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s." >&2
+  fi
+  local tick_count=0
+  tick_once
+  while true; do
+    if (( tick_count < FAST_TICKS )); then
+      sleep_interruptible "$FAST_SECONDS"
+    else
+      sleep_interruptible "$HEARTBEAT_SECONDS"
+    fi
+    tick_once
+    tick_count=$((tick_count + 1))
+  done
+}
+
+do_tick() {
+  ensure_backlog
+  check_interactive_worker
+  acquire_lock
+  trap 'release_lock' EXIT
+  trap 'exit 130' INT TERM
+  tick_once
+}
+
+do_watch() {
+  ensure_backlog
+  check_interactive_worker
+  ${INSTALL_DAEMON:-true} && maybe_install_daemon
+  acquire_lock
+  trap 'release_lock' EXIT
+  trap 'exit 130' INT TERM
+  echo "heartbeat-only loop; fast-start ${FAST_SECONDS}s → ${HEARTBEAT_SECONDS}s. ctrl-c to stop."
+  local tick_count=0
+  tick_once
+  while true; do
+    if (( tick_count < FAST_TICKS )); then
+      sleep_interruptible "$FAST_SECONDS"
+    else
+      sleep_interruptible "$HEARTBEAT_SECONDS"
+    fi
+    tick_once
+    tick_count=$((tick_count + 1))
+  done
+}
+
+do_log() {
+  require_backlog
+  if [[ ! -f "$LOG_FILE" ]]; then
+    echo "no log file at $LOG_FILE yet — has the daemon ticked?" >&2
+    exit 1
+  fi
+  # tail -F (capital F) keeps following across log rotation; -n 50 gives
+  # enough context to orient on without flooding a fresh terminal.
+  exec tail -n 50 -F "$LOG_FILE"
+}
+
+do_unblock() {
+  ensure_backlog
+  local arg="${1:-}"
+
+  # Collect [?] items as parallel arrays of line-number + stripped-title.
+  local -a lines titles
+  while IFS=$'\t' read -r ln rest; do
+    lines+=("$ln")
+    titles+=("$rest")
+  done < <(awk '/^(- )?\[\?\] / { line=$0; sub(/^(- )?\[\?\] /, "", line); print NR "\t" line }' "$BACKLOG_FILE")
+
+  local n=${#lines[@]}
+  if (( n == 0 )); then
+    echo "no [?] items in $BACKLOG_FILE"
+    return 0
+  fi
+
+  case "$arg" in
+    "")
+      printf '%-3s %s\n' "#" "BLOCKED ITEM"
+      local i
+      for ((i=0; i<n; i++)); do
+        printf '%-3d %s\n' "$((i+1))" "${titles[$i]:0:100}"
+      done
+      echo
+      echo "Flip to [!] (answered, ready to retry):  backlog-agent unblock <N> | --all"
+      ;;
+    --all)
+      sed -i '' -E 's|^(- )?\[\?\] |\1[!] |g' "$BACKLOG_FILE"
+      echo "flipped $n item(s) [?] → [!]"
+      ;;
+    *)
+      [[ "$arg" =~ ^[0-9]+$ ]] || { echo "usage: backlog-agent unblock [<N> | --all]" >&2; exit 2; }
+      local idx="$arg"
+      (( idx >= 1 && idx <= n )) || { echo "no [?] item #$idx (have $n)" >&2; exit 2; }
+      local target_line="${lines[$((idx-1))]}"
+      sed -i '' -E "${target_line}s|^(- )?\[\?\] |\1[!] |" "$BACKLOG_FILE"
+      echo "flipped #$idx: ${titles[$((idx-1))]:0:100}"
+      ;;
+  esac
+}
+
+do_unclaim() {
+  # Flip all [~] items back to [ ] (recovery after a daemon crash mid-tick).
+  ensure_backlog
+  local n
+  n="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
+  n="${n:-0}"
+  if (( n == 0 )); then
+    echo "no [~] (in-progress) items found"
+    return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sed -i '' -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+  else
+    sed -i -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+  fi
+  echo "unclaimed $n item(s) [~] → [ ]"
+}
+
+do_compact() {
+  if [[ -f scripts/backlog-agent-compact.mjs ]]; then
+    exec node scripts/backlog-agent-compact.mjs "$@"
+  elif [[ -f scripts/compact-backlog.mjs ]]; then
+    exec node scripts/compact-backlog.mjs "$@"
+  elif [[ -f "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" ]]; then
+    exec node "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" "$@"
+  else
+    echo "error: no scripts/backlog-agent-compact.mjs in $(pwd) or $HOME/dev/projects/active/backlog-infra/bin/" >&2
+    exit 1
+  fi
+}
+
+# --- launchd daemon install ---
+# XML-escape a string for safe interpolation into the plist heredoc.
+# Order matters: ampersand must be replaced first so we don't double-escape
+# Resolve the canonical paths a generated plist needs to reference.
+# Echos: project_root, project, label, plist_path, bin_path (newline-separated).
+daemon_paths() {
+  local project_root project label plist_path bin_path
+  project_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+  project="$(basename "$project_root")"
+  label="com.${USER}.${project}.backlog-agent"
+  plist_path="$HOME/Library/LaunchAgents/${label}.plist"
+  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  printf '%s\n%s\n%s\n%s\n%s\n' "$project_root" "$project" "$label" "$plist_path" "$bin_path"
+}
+
+do_install_daemon() {
+  ensure_backlog
+  local project_root project label plist_path bin_path
+  { read -r project_root; read -r project; read -r label; read -r plist_path; read -r bin_path; } < <(daemon_paths)
+
+  mkdir -p "$HOME/Library/LaunchAgents" "$project_root/.claude"
+
+  # If a previous plist exists, boot it out so we can replace cleanly.
+  # bootout sends SIGTERM, waits ~5s, then SIGKILLs.
+  if [[ -f "$plist_path" ]]; then
+    echo "replacing existing plist at $plist_path"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    local i=0
+    while launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 && (( i < 10 )); do
+      sleep 1; i=$((i + 1))
+    done
+  fi
+
+  # Always clear any stale mkdir-lock before bootstrap. A prior daemon may
+  # have been SIGKILL'd (by bootout's 5s timeout escalation, by a manual
+  # SIGKILL, or by a crash), skipping the EXIT trap and leaving the
+  # lockdir behind. On first install, this catches locks abandoned by an
+  # earlier manual `backlog run` in the same project.
+  rmdir "${project_root}/.claude/backlog-agent.lock" 2>/dev/null || true
+  rmdir "${project_root}/.claude/backlog.lock" 2>/dev/null || true
+
+  # XML-escape each substitution so a path or label containing `&`, `<`,
+  # or `>` doesn't produce a malformed plist. Realistic paths under
+  # ~/dev/projects/ are alphanumeric+hyphen so this is mostly defensive.
+  local label_x bin_path_x project_root_x home_x bin_dir_x
+  label_x="$(xml_escape "$label")"
+  bin_path_x="$(xml_escape "$bin_path")"
+  local bin_dir; bin_dir="$(dirname "$bin_path")"
+  bin_dir_x="$(xml_escape "$bin_dir")"
+  project_root_x="$(xml_escape "$project_root")"
+  home_x="$(xml_escape "$HOME")"
+
+  cat > "$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label_x}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${bin_path_x}</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>${project_root_x}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${home_x}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>${project_root_x}/.claude/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${project_root_x}/.claude/launchd-stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist_path"; then
+    echo "error: launchctl bootstrap failed for ${label}." >&2
+    echo "  plist is on disk at $plist_path." >&2
+    echo "  to retry manually: launchctl bootstrap gui/\$(id -u) $plist_path" >&2
+    echo "  to inspect: launchctl print gui/\$(id -u)/${label}" >&2
+    exit 1
+  fi
+  echo "bootstrapped ${label}"
+  echo "  plist: ${plist_path}"
+  echo "  cwd:   ${project_root}"
+  echo "  logs:  ${project_root}/.claude/{backlog-agent.log,launchd-stdout.log,launchd-stderr.log}"
+  echo "  status: launchctl print gui/\$(id -u)/${label}"
+}
+
+do_uninstall_daemon() {
+  local project_root project label plist_path _bin
+  { read -r project_root; read -r project; read -r label; read -r plist_path; read -r _bin; } < <(daemon_paths)
+
+  if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/${label}" || true
+    echo "booted out ${label}"
+  fi
+  if [[ -f "$plist_path" ]]; then
+    rm "$plist_path"
+    echo "removed ${plist_path}"
+  else
+    echo "no plist at ${plist_path}; nothing to remove."
+  fi
+  # Symmetric to install-daemon: clear any stale mkdir-lock so a future
+  # reinstall doesn't start in a wedged state.
+  rmdir "${project_root}/.claude/backlog-agent.lock" 2>/dev/null || true
+}
+
+# --- dispatch ---
+cmd="${1:-status}"
+shift 2>/dev/null || true
+
+if [[ "$1" == "--no-daemon" ]]; then
+  INSTALL_DAEMON=false
+  shift
+else
+  INSTALL_DAEMON=true
+fi
+
+case "$cmd" in
+  status|"")  do_status ;;
+  run)        do_run ;;
+  tick)       do_tick ;;
+  watch)      do_watch ;;
+  log|tail)   do_log ;;
+  unblock)    do_unblock "$@" ;;
+  unclaim)    do_unclaim ;;
+  compact)    do_compact "$@" ;;
+  install-daemon)   do_install_daemon ;;
+  uninstall-daemon) do_uninstall_daemon ;;
+  -h|--help)
+    sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    echo "backlog-agent: unknown subcommand: $cmd (try \`backlog-agent --help\`)" >&2
+    exit 2
+    ;;
+esac

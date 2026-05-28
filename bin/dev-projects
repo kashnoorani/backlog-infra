@@ -25,13 +25,13 @@
 #
 #   dev-projects sync
 #       Walk the active/ tree, rewrite the manifest to match the filesystem.
-#       For each active repo that has an installed backlog launchd plist
+#       For each active repo that has an installed agent launchd plist
 #       (either label form), verify the plist's WorkingDirectory matches the
 #       current location; patch + restart if not. Commit + push if the
 #       manifest changed.
 #
 #   dev-projects install-daemons
-#       Install a backlog daemon for every active project that has a backlog
+#       Install an agent for every active project that has a backlog
 #       file but no installed launchd plist. Idempotent: projects with an
 #       existing daemon are skipped.
 #
@@ -56,8 +56,8 @@
 #       Boot out and remove the watchdog launchd plist.
 #
 # Daemon plist labels are polyglot during the migration:
-#   com.${USER}.<name>.backlog        (new — written by `backlog install-daemon`)
-#   com.${USER}.<name>.backlog-loop   (legacy — pre-migration daemons)
+#   com.${USER}.<name>.backlog-agent   (new — written by `backlog install-daemon`)
+#   com.${USER}.<name>.backlog-loop    (legacy — pre-migration daemons)
 # Discovery checks both, preferring the new form.
 #
 # Manifest format (~/dotfiles/active-projects.txt):
@@ -97,7 +97,7 @@ tsv_drop() {
 # new label form over the legacy one. Returns non-zero if neither exists.
 find_daemon_plist() {
   local name="$1" p
-  for suffix in backlog backlog-loop; do
+  for suffix in backlog-agent backlog-loop; do
     p="$HOME/Library/LaunchAgents/com.${USER}.${name}.${suffix}.plist"
     [[ -f "$p" ]] && { echo "$p"; return 0; }
   done
@@ -146,7 +146,7 @@ write_manifest() {
 }
 
 # Bootout + lock-cleanup + bootstrap for a single daemon label.
-# $1 = label (e.g., com.${USER}.sacred-geography.backlog)
+# $1 = label (e.g., com.${USER}.sacred-geography.backlog-agent)
 # $2 = repo path (for lock cleanup)
 # $3 = plist path
 restart_daemon() {
@@ -266,9 +266,9 @@ cmd_new() {
   # Optional daemon install (best-effort; never fail the whole command on this).
   if (( no_daemon == 0 )); then
     if command -v backlog >/dev/null 2>&1; then
-      info "installing backlog daemon"
+      info "installing agent"
       ( cd "$dest" && backlog install-daemon ) \
-        || err "daemon install failed — run manually with: cd $dest && backlog install-daemon"
+        || err "agent install failed — run manually with: cd $dest && backlog install-daemon"
     else
       info "backlog driver not on PATH; skipping daemon install"
     fi
@@ -336,9 +336,9 @@ cmd_activate() {
   if (( no_daemon == 0 )); then
     if [[ -f "$dest/docs/Backlog.md" || -f "$dest/Backlog.md" || -f "$dest/backlog.txt" ]]; then
       if command -v backlog >/dev/null 2>&1; then
-        info "installing backlog daemon"
+        info "installing agent"
         ( cd "$dest" && backlog install-daemon ) \
-          || err "daemon install failed — run manually with: cd $dest && backlog install-daemon"
+          || err "agent install failed — run manually with: cd $dest && backlog install-daemon"
       else
         info "backlog driver not on PATH; skipping daemon install"
       fi
@@ -363,7 +363,7 @@ cmd_archive() {
   # the legacy one. Both are booted out if both exist (defensive — shouldn't
   # happen, but cheap to handle).
   local stopped=""
-  for suffix in backlog backlog-loop; do
+  for suffix in backlog-agent backlog-loop; do
     local label="com.${USER}.${name}.${suffix}"
     if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       info "stopping daemon $label"
@@ -414,13 +414,13 @@ cmd_sync() {
   ok "manifest written"
 
   # Check installed launchd plists for path drift. Polyglot: both new
-  # (com.${USER}.<name>.backlog) and legacy (.backlog-loop) labels.
+  # (com.${USER}.<name>.backlog-agent) and legacy (.backlog-loop) labels.
   info "checking daemon plists for path drift"
   local fixed_any=0
   while IFS=$'\t' read -r rel url; do
     [[ -z "$rel" ]] && continue
     local name="${rel##*/}"   # daemon name = leaf of relative path
-    for suffix in backlog backlog-loop; do
+    for suffix in backlog-agent backlog-loop; do
       local label="com.${USER}.${name}.${suffix}"
       local plist="$HOME/Library/LaunchAgents/${label}.plist"
       [[ -f "$plist" ]] || continue
@@ -448,7 +448,7 @@ cmd_install_daemons() {
   if [[ ! -x "$BACKLOG_BIN" ]]; then
     fail "backlog driver not found at $BACKLOG_BIN"
   fi
-  info "scanning $ACTIVE_ROOT for projects without a backlog daemon"
+  info "scanning $ACTIVE_ROOT for projects without an agent"
   local installed=0 skipped_existing=0 skipped_no_backlog=0 failed=0
   local discovered
   discovered="$(discover_active_repos)"

@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// backlog-status.mjs — invoked by ~/dev/projects/active/backlog-infra/bin/backlog after each
-// `claude -p` tick. Reads the transcript JSONL for the session that just
-// finished, normalises token usage, writes .claude/backlog-status.json
-// (overwrite, headline state) and appends one line to
-// .claude/backlog-history.jsonl (full history), then commits both with a
-// `Claude-Effort:` trailer and pushes. Cross-machine status: every machine
-// commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlogs` aggregates by fetching.
+// backlog-agent-status.mjs — invoked by ~/dev/projects/active/backlog-infra/bin/backlog-agent
+// after each `backlog-agent run` tick. Reads the transcript JSONL for the
+// session that just finished, normalises token usage, writes
+// .claude/backlog-status.json (overwrite, headline state) and appends one
+// line to .claude/backlog-history.jsonl (full history), then commits both
+// with a `Claude-Effort:` trailer and pushes. Cross-machine status: every
+// machine commits its own ticks; `~/dev/projects/active/backlog-infra/bin/backlogs`
+// aggregates by fetching.
 //
 // Usage:
-//   node scripts/backlog-status.mjs \
+//   node scripts/backlog-agent-status.mjs \
 //     --item "<title>" \
 //     --exit-code <n> \
 //     --mode loop|watch|manual \
@@ -294,7 +295,7 @@ async function main() {
     const r = git(["pull", "--rebase", "origin", branch], { allowFail: true });
     if (r.status !== 0) {
       console.error(
-        `[backlog-status] git pull --rebase failed (continuing):\n${r.stderr}`,
+        `[backlog-agent-status] git pull --rebase failed (continuing):\n${r.stderr}`,
       );
       git(["rebase", "--abort"], { allowFail: true });
     }
@@ -383,7 +384,7 @@ async function main() {
   });
   if (ignored.status === 0) {
     console.log(
-      "[backlog-status] status files are gitignored; wrote locally, skipping commit/push",
+      "[backlog-agent-status] status files are gitignored; wrote locally, skipping commit/push",
     );
     return;
   }
@@ -397,12 +398,12 @@ async function main() {
     cwd: REPO_ROOT,
   });
   if (diffCached.status === 0) {
-    console.log("[backlog-status] no staged changes; skipping commit");
+    console.log("[backlog-agent-status] no staged changes; skipping commit");
     return;
   }
 
   // Build commit message
-  const subject = opts.item ? `backlog-status: "${opts.item}"` : "backlog-status: idle";
+  const subject = opts.item ? `backlog-agent-status: "${opts.item}"` : "backlog-agent-status: idle";
   const durStr = formatDuration(usage.duration_ms);
   const tokStr = formatTokens(headline);
   let tokSegment = `${tokStr} tok`;
@@ -418,13 +419,13 @@ async function main() {
     encoding: "utf8",
   });
   if (commit.status !== 0) {
-    console.error(`[backlog-status] git commit failed:\n${commit.stderr}`);
+    console.error(`[backlog-agent-status] git commit failed:\n${commit.stderr}`);
     process.exit(1);
   }
 
   // Push with exponential backoff. Skip entirely if no upstream.
   if (!upstreamExists) {
-    console.log(`[backlog-status] no origin/${branch}; commit is local only`);
+    console.log(`[backlog-agent-status] no origin/${branch}; commit is local only`);
     return;
   }
   const delays = [0, 2000, 4000, 8000, 16000];
@@ -435,18 +436,18 @@ async function main() {
       encoding: "utf8",
     });
     if (r.status === 0) {
-      console.log("[backlog-status] ok");
+      console.log("[backlog-agent-status] ok");
       return;
     }
     console.error(
-      `[backlog-status] push attempt ${i + 1} failed (delay=${delays[i]}ms):\n${r.stderr}`,
+      `[backlog-agent-status] push attempt ${i + 1} failed (delay=${delays[i]}ms):\n${r.stderr}`,
     );
   }
-  console.error("[backlog-status] push failed after retries; commit is local");
+  console.error("[backlog-agent-status] push failed after retries; commit is local");
   process.exit(2);
 }
 
 main().catch((err) => {
-  console.error(`[backlog-status] fatal: ${err.message}`);
+  console.error(`[backlog-agent-status] fatal: ${err.message}`);
   process.exit(1);
 });

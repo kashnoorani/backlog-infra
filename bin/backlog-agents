@@ -1,0 +1,773 @@
+#!/usr/bin/env bash
+# backlog-agents — fleet view across every project's backlog.
+#
+# Subcommands:
+#   backlog-agents              Dashboard: per-project backlog state (last tick,
+#                         current item, freshness, per-project tick-token
+#                         totals). For host-wide Anthropic plan usage, run
+#                         /usage inside Claude Code — the transcript-derived
+#                         host totals previously shown here drifted from
+#                         /usage's numbers and were removed.
+#   backlog-agents sync         Pull dotfiles + every active project; restart every
+#                         agent launchd daemon (both legacy
+#                         com.${USER}.*.backlog-loop and new
+#                         com.${USER}.*.backlog-agent labels).
+#   backlog-agents list         Show installed agent labels + their state.
+#
+#   backlog-agents daemon-sync [--interval <seconds>] [--once]
+#                       Run `backlog-agents sync` in a loop, keeping all projects
+#                       pulled and agents healthy. Default interval is 86400s
+#                       (24h). --once runs a single sync and exits (testing).
+#
+#   backlog-agents install-watchdog
+#                       Install a launchd plist that runs `daemon-sync` as a
+#                       background agent, keeping all projects synced daily.
+#                       Idempotent: replaces an existing plist if present.
+#
+#   backlog-agents uninstall-watchdog
+#                       Boot out and remove the sync-watchdog launchd plist.
+#
+# Dashboard flags:
+#   --fetch    git fetch -q each project before reading state
+#   --watch    refresh every 10s (Ctrl-C to exit)
+#   --effort   add log-size column
+#   --day      bucket right column by today instead of 7d
+#
+# Sync flags:
+#   --no-pull         skip dotfiles + project pulls (just restart agents)
+#   --restart-only    same as --no-pull, also skip the final dashboard print
+#
+# Per-project state lookup is polyglot during the migration:
+#   status file:    .claude/backlog-status.json (new) or .claude/loop-status.json (legacy)
+#   history file:   .claude/backlog-history.jsonl (new) or .claude/effort-log.jsonl (legacy)
+#   daemon plist:   com.${USER}.<n>.backlog-agent.plist (new) or com.${USER}.<n>.backlog-loop.plist (legacy)
+#
+# Requires `jq` (brew install jq).
+
+set -euo pipefail
+LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$LIB_DIR/_lib.sh"
+
+# Walk both ~/dev/projects/active/ and ~/dev/projects/ (legacy top-level
+# layout). Repos with a status file show up regardless of which layer
+# they're in. Override with `BACKLOGS_PROJECTS_ROOTS=(...)`.
+if [[ -z "${BACKLOGS_PROJECTS_ROOTS+x}" ]]; then
+  PROJECTS_ROOTS=("$HOME/dev/projects/active" "$HOME/dev/projects")
+else
+  PROJECTS_ROOTS=("${BACKLOGS_PROJECTS_ROOTS[@]}")
+fi
+DOTFILES="$HOME/dotfiles"
+ACTIVE_ROOT="$HOME/dev/projects/active"
+
+command -v jq >/dev/null 2>&1 || { echo "backlog-agents: requires jq (brew install jq)" >&2; exit 1; }
+
+# ANSI
+B=$'\e[1m'; DIM=$'\e[2m'; RS=$'\e[0m'
+CY=$'\e[36m'; GN=$'\e[32m'; YL=$'\e[33m'; RD=$'\e[31m'
+
+info() { echo "→ $*"; }
+ok()   { echo "  ✓ $*"; }
+warn() { echo "  ! $*"; }
+
+# ---- helpers ----
+
+iso_to_epoch() {
+  local iso="$1"
+  if [[ "$iso" == *.*Z ]]; then
+    iso="${iso%.*Z}Z"
+  fi
+  iso="${iso%Z}"
+  date -j -u -f '%Y-%m-%dT%H:%M:%S' "$iso" '+%s' 2>/dev/null || echo ""
+}
+
+# Discover per-project status + history files, polyglot during migration.
+find_status_file() {
+  local proj="$1"
+  if   [[ -f "$proj/.claude/backlog-status.json" ]]; then echo "$proj/.claude/backlog-status.json"
+  elif [[ -f "$proj/.claude/loop-status.json"    ]]; then echo "$proj/.claude/loop-status.json"
+  fi
+}
+find_history_file() {
+  local proj="$1"
+  if   [[ -f "$proj/.claude/backlog-history.jsonl" ]]; then echo "$proj/.claude/backlog-history.jsonl"
+  elif [[ -f "$proj/.claude/effort-log.jsonl"      ]]; then echo "$proj/.claude/effort-log.jsonl"
+  fi
+}
+find_backlog_file() {
+  local proj="$1"
+  if   [[ -f "$proj/docs/Backlog.md" ]]; then echo "$proj/docs/Backlog.md"
+  elif [[ -f "$proj/Backlog.md"      ]]; then echo "$proj/Backlog.md"
+  elif [[ -f "$proj/backlog.txt"     ]]; then echo "$proj/backlog.txt"
+  fi
+}
+
+# Print the first actionable item in the `## Open` section: a `- [ ]`
+# (open), `- [!]` (retry after answered block), or `- [~]` (in progress).
+# Skips `- [?]` (blocked on user) since the worker can't act on those.
+# Strips the marker, leading emoji prefix tokens (🔴/🟡/🟢, "P1 —", etc.)
+# are preserved so the priority is visible in the dashboard.
+top_open_item() {
+  local file="$1"
+  [[ -f "$file" ]] || { echo ""; return; }
+  awk '
+    /^## Open/        { in_open=1; next }
+    in_open && /^## / { exit }
+    in_open && /^- \[[ !~]\] / {
+      sub(/^- \[[ !~]\] /, "")
+      sub(/[. ]+$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+# ---- subcommand: dashboard (default) ----
+
+snapshot() {
+  local now; now="$(date '+%s')"
+
+  local cutoff_5h cutoff_right
+  cutoff_5h=$(( now - 18000 ))
+  if (( DAY )); then
+    cutoff_right="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-%d') 00:00:00" '+%s')"
+  else
+    cutoff_right=$(( now - 604800 ))
+  fi
+
+  local -a rows=()
+
+  # Fleet-wide host tracking (cross-machine).
+  local this_host; this_host="$(hostname)"
+  this_host_short="${this_host%.local}"
+  local fleet_hosts_set='|'
+  local this_machine_projects=0
+
+  # Per-machine accumulators (built during project loop).
+  # Uses parallel indexed arrays — bash 3.2 compatible (macOS default bash).
+  # _MAP_IDX is a global set by _map_ensure as a side-channel (command
+  # substitution runs in a subshell in bash 3.2, so functions that modify
+  # arrays can't return values via stdout).
+  _MAP_IDX=-1
+  _map_keys=()        # ordered list of unique hostname keys
+  _map_5h=()          # parallel: 5h token sums
+  _map_right=()       # parallel: right-column token sums
+  _map_proj=()        # parallel: project counts
+  _map_seen=()        # parallel: last tick epoch (max)
+
+  _map_idx() {
+    local k="$1" i
+    for i in "${!_map_keys[@]}"; do
+      [[ "${_map_keys[$i]}" == "$k" ]] && { printf '%d' "$i"; return 0; }
+    done
+    return 1
+  }
+  _map_ensure() {
+    local k="$1" i
+    for i in "${!_map_keys[@]}"; do
+      if [[ "${_map_keys[$i]}" == "$k" ]]; then
+        _MAP_IDX=$i
+        return 0
+      fi
+    done
+    _map_keys+=("$k")
+    _map_5h+=(0); _map_right+=(0); _map_proj+=(0); _map_seen+=(0)
+    _MAP_IDX=$((${#_map_keys[@]} - 1))
+    return 0
+  }
+  _map_add() {
+    _map_ensure "$1"
+    local i=$_MAP_IDX t5h="${2:-0}" tr="${3:-0}"
+    _map_5h[$i]=$(( ${_map_5h[$i]:-0} + t5h ))
+    _map_right[$i]=$(( ${_map_right[$i]:-0} + tr ))
+    _map_proj[$i]=$(( ${_map_proj[$i]:-0} + 1 ))
+  }
+  _map_max_seen() {
+    _map_ensure "$1"
+    local i=$_MAP_IDX v="${2:-0}"
+    (( v > ${_map_seen[$i]:-0} )) && _map_seen[$i]=$v
+    return 0
+  }
+
+  # Count local agent plists (new label, old label, legacy label).
+  local local_daemons=0
+  local pl
+  for pl in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
+            "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+            "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$pl" ]] && local_daemons=$((local_daemons + 1))
+  done
+
+  # Dedupe candidates by realpath.
+  local -a candidates=()
+  local root proj_dir
+  for root in "${PROJECTS_ROOTS[@]}"; do
+    [[ -d "$root" ]] || continue
+    for proj_dir in "$root"/*/; do
+      [[ -d "$proj_dir" ]] || continue
+      candidates+=("${proj_dir%/}")
+    done
+  done
+
+  local seen='|'
+  local -a unique=()
+  for proj_dir in "${candidates[@]}"; do
+    local real
+    real="$(cd "$proj_dir" 2>/dev/null && pwd -P)" || continue
+    case "$seen" in
+      *"|$real|"*) continue ;;
+    esac
+    seen="${seen}${real}|"
+    unique+=("$real")
+  done
+
+  for proj_dir in "${unique[@]}"; do
+    local proj="$proj_dir"
+    local status; status="$(find_status_file "$proj")"
+    local log;    log="$(find_history_file "$proj")"
+    [[ -n "$status" ]] || continue
+
+    if (( FETCH )); then
+      git -C "$proj" fetch -q origin 2>/dev/null || true
+    fi
+
+    local name; name="$(basename "$proj")"
+    local last_tick last_item last_exit last_pull
+    last_tick="$(jq -r '.last_tick_at // empty' "$status")"
+    last_item="$(jq -r '.last_item // ""' "$status")"
+    last_exit="$(jq -r '.last_exit_code // 0' "$status")"
+    last_pull="$(jq -r '(.last_pull_count // 0 | tostring)' "$status")"
+    [[ "$last_pull" == "0" || "$last_pull" == "null" ]] && last_pull="—"
+
+    # Prefer the live "top of Open" from docs/Backlog.md over the
+    # status JSON's last_item — last_item is set by the status hook
+    # at end-of-iteration and can drift empty when the hook's scrape
+    # misses (e.g. format drift in the backlog file). The top-of-Open
+    # reading is the forward-looking signal: what's being worked on
+    # right now, or what the worker will pick next.
+    local backlog_file current_item
+    backlog_file="$(find_backlog_file "$proj")"
+    current_item=""
+    if [[ -n "$backlog_file" && "$backlog_file" == *.md ]]; then
+      current_item="$(top_open_item "$backlog_file")"
+    fi
+    [[ -z "$current_item" ]] && current_item="$last_item"
+
+    local tick_epoch="" age=0 state="?" state_color="$DIM"
+    [[ -n "$last_tick" ]] && tick_epoch="$(iso_to_epoch "$last_tick")"
+    if [[ -n "$tick_epoch" ]]; then
+      age=$(( now - tick_epoch ))
+      if   (( age < 1800 )); then state="fresh"; state_color="$GN"
+      elif (( age < 7200 )); then state="idle";  state_color="$DIM"
+      else                        state="STALE"; state_color="$RD"
+      fi
+    fi
+    [[ "$last_exit" != "0" ]] && state_color="$RD"
+
+    local sum_5h=0 sum_right=0 active_host="—" hosts_csv="" has_this_work="false"
+    if [[ -n "$log" ]]; then
+      local out
+      out="$(jq -s -r \
+        --argjson c5h "$cutoff_5h" --argjson cR "$cutoff_right" --arg thisHost "$this_host_short" '
+        def norm: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+        ([ .[] | { t: (.ts | norm), tok: (.tokens // 0), h: (.host // "" | sub("\\.local$"; "")) } ] | sort_by(.t)) as $rs
+        | ([$rs[] | select(.tok > 0)] | last | .h // "—") as $host
+        | ([$rs[].h // empty] | unique | join(",")) as $hosts
+        | "\($host)|" +
+          "\(([$rs[] | select(.t >= $c5h) | .tok] | add // 0))|" +
+          "\(([$rs[] | select(.t >= $cR)  | .tok] | add // 0))|" +
+          "\($hosts)|" +
+          "\([$rs[] | select(.h == $thisHost and .tok > 0)] | length > 0)|" +
+          "\([$rs | group_by(.h)[] | "\(.[0].h):\([.[] | select(.t >= $c5h) | .tok] | add // 0):\([.[] | select(.t >= $cR) | .tok] | add // 0)"] | join(";"))"
+      ' "$log" 2>/dev/null || printf '%s\n' "—|0|0||false|")"
+      IFS='|' read -r active_host sum_5h sum_right hosts_csv has_this_work per_host_groups <<< "$out"
+    fi
+
+    # Per-machine token aggregation from per-host groups.
+    if [[ -n "$per_host_groups" ]]; then
+      IFS=';' read -ra hgroups <<< "$per_host_groups"
+      local group h t5h tr
+      for group in "${hgroups[@]}"; do
+        [[ -z "$group" ]] && continue
+        IFS=':' read -r h t5h tr <<< "$group"
+        [[ -z "$h" || "$h" == "—" ]] && continue
+        _map_add "$h" "$t5h" "$tr"
+        if [[ -n "${tick_epoch:-}" && "${tick_epoch:-0}" != "0" ]]; then
+          _map_max_seen "$h" "$tick_epoch"
+        fi
+      done
+    fi
+
+    local active_host_short="${active_host%.local}"
+    active_host_short="${active_host_short#Kash-MBA-}"
+    (( ${#active_host_short} > 14 )) && active_host_short="${active_host_short:0:11}…"
+
+    # Compute other-hosts column (all hosts that worked on this project, minus the active one).
+    local other_hosts="—"
+    if [[ -n "$hosts_csv" ]]; then
+      local oh_arr=()
+      IFS=',' read -ra host_arr_oh <<< "$hosts_csv"
+      for h in "${host_arr_oh[@]}"; do
+        [[ -z "$h" ]] && continue
+        local hc="${h%.local}"
+        hc="${hc#Kash-MBA-}"
+        (( ${#hc} > 12 )) && hc="${hc:0:9}…"
+        [[ "$hc" == "$active_host_short" ]] && continue
+        oh_arr+=("$hc")
+      done
+      if [[ ${#oh_arr[@]} -gt 0 ]]; then
+        local _saved_ifs="$IFS"
+        IFS=,
+        other_hosts="${oh_arr[*]}"
+        IFS="$_saved_ifs"
+      fi
+    fi
+
+    # Fleet-wide host tracking
+    if [[ -n "$hosts_csv" ]]; then
+      local h
+      IFS=',' read -ra host_arr <<< "$hosts_csv"
+      for h in "${host_arr[@]}"; do
+        [[ -z "$h" ]] && continue
+        h="${h%.local}"
+        case "$fleet_hosts_set" in
+          *"|$h|"*) ;;
+          *) fleet_hosts_set="${fleet_hosts_set}${h}|" ;;
+        esac
+      done
+    fi
+    [[ "$has_this_work" == "true" ]] && this_machine_projects=$((this_machine_projects + 1))
+
+    local age_str="—"
+    [[ -n "$tick_epoch" ]] && age_str="$(fmt_age $age)"
+    local item_short="${current_item:-—}"
+    (( ${#item_short} > 40 )) && item_short="${item_short:0:37}…"
+
+    local log_mb="—"
+    if [[ -n "$log" ]]; then
+      log_mb="$(awk -v b="$(wc -c < "$log")" 'BEGIN{printf "%.2fM", b/1048576}')"
+    fi
+
+    rows+=("$name"$'\t'"$age_str"$'\t'"$active_host_short"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb"$'\t'"$other_hosts")
+  done
+
+  # ---- header ----
+  # right_label feeds the per-project table column header below ("5h | week"
+  # or "5h | today"). The host-wide rolling-totals bars that used to live
+  # here were transcript-derived and drifted from /usage's numbers, so we
+  # just point users at /usage instead — it's authoritative for the plan
+  # budget, and we couldn't match it from a shell script anyway.
+  local right_label="week"; (( DAY )) && right_label="today"
+
+  printf '%sBACKLOGS%s\n' "${B}${CY}" "${RS}"
+  printf '  %sper-project tick state. for host token usage, run %s/usage%s%s in Claude Code.%s\n' \
+    "${DIM}" "${B}" "${RS}${DIM}" "" "${RS}"
+
+  if (( ${#rows[@]} == 0 )); then
+    printf '\n  %sNo projects with .claude/backlog-status.json or .claude/loop-status.json under: %s%s\n' \
+      "$DIM" "${PROJECTS_ROOTS[*]}" "$RS"
+    return
+  fi
+
+  # Health summary: count daemon states and watchdog status.
+  local fresh=0 idle=0 stale=0
+  for row in "${rows[@]}"; do
+    local st; st="${row#*$'\t'*$'\t'*$'\t'*$'\t'}"
+    st="${st%%$'\t'*}"
+    case "$st" in
+      fresh) fresh=$((fresh + 1)) ;;
+      idle)  idle=$((idle + 1)) ;;
+      STALE) stale=$((stale + 1)) ;;
+    esac
+  done
+  local total=$((fresh + idle + stale))
+
+  # Per-machine state counts.
+  local m_active=0 m_idle=0 m_stale=0
+  if (( ${#_map_keys[@]} > 0 )); then
+    local mh_idx
+    for mh_idx in "${!_map_keys[@]}"; do
+      local mage=$(( now - ${_map_seen[$mh_idx]:-0} ))
+      if   (( mage < 1800 )); then m_active=$((m_active + 1))
+      elif (( mage < 7200 )); then m_idle=$((m_idle + 1))
+      else m_stale=$((m_stale + 1))
+      fi
+    done
+  fi
+
+  local fleet_host_count
+  fleet_host_count="$(echo "${fleet_hosts_set#|}" | tr '|' '\n' | grep -c . 2>/dev/null || echo 0)"
+  printf '  %s%d machines%s known  |  this machine (%s%s%s): active on %s%d%s of %d projects\n' \
+    "$B" "$fleet_host_count" "$RS" \
+    "$B" "$this_host_short" "$RS" \
+    "$GN" "$this_machine_projects" "$RS" "$total"
+
+  # Fleet-wide backlog counts: sum open and done across all active projects.
+  local total_open=0 total_done=0
+  for proj_dir in "${unique[@]}"; do
+    local s; s="$(find_status_file "$proj_dir")"
+    [[ -n "$s" ]] || continue
+    local o d
+    o="$(jq -r '(.backlog.open // 0 | tostring)' "$s" 2>/dev/null || echo 0)"
+    d="$(jq -r '(.backlog.done // 0 | tostring)' "$s" 2>/dev/null || echo 0)"
+    [[ "$o" =~ ^[0-9]+$ ]] && total_open=$((total_open + o))
+    [[ "$d" =~ ^[0-9]+$ ]] && total_done=$((total_done + d))
+  done
+
+  local have_sync=0 have_watch=0
+  [[ -f "$HOME/Library/LaunchAgents/com.${USER}.backlog-agents-sync.plist" ]] && have_sync=1
+  [[ -f "$HOME/Library/LaunchAgents/com.${USER}.dev-projects-watchdog.plist" ]] && have_watch=1
+  printf '  projects: %d (%s%d fresh%s, %s%d idle%s, %s%d stale%s)  |' \
+    "$total" "$GN" "$fresh" "$RS" "$DIM" "$idle" "$RS" "$RD" "$stale" "$RS"
+  if (( ${#_map_keys[@]} > 0 )); then
+    printf '  machines: %d (%s%d active%s, %s%d idle%s, %s%d stale%s)  |' \
+      "${#_map_keys[@]}" "$GN" "$m_active" "$RS" "$DIM" "$m_idle" "$RS" "$RD" "$m_stale" "$RS"
+  fi
+  printf '  open: %s%d%s  done: %s%d%s  |' \
+    "$GN" "$total_open" "$RS" "$DIM" "$total_done" "$RS"
+  printf '  this machine: %s%d daemons%s' "$B" "$local_daemons" "$RS"
+  if (( have_sync && have_watch )); then
+    printf ', watchdog %s✓%s\n' "$GN" "$RS"
+  elif (( have_sync || have_watch )); then
+    printf ', watchdog %s%s%s\n' \
+      "$( ((have_sync && have_watch)) && echo "$GN" || echo "$RD")" \
+      "$( ((have_sync)) && printf 'sync' ; ((have_sync && have_watch)) && printf '/' ; ((have_watch)) && printf 'new' )" \
+      "$RS"
+  else
+    printf ', watchdog %s✗%s\n' "$RD" "$RS"
+  fi
+
+  echo
+
+  # ---- MACHINES table ----
+  if (( ${#_map_keys[@]} > 0 )); then
+    local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
+    printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
+    printf '  %s%-20s %-9s %-10s %-11s %-11s %-8s %-7s%s\n' \
+      "$DIM" "MACHINE" "PROJECTS" "5h TOKENS" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
+
+    local sorted_hosts
+    sorted_hosts="$(printf '%s\n' "${_map_keys[@]}" | sort)"
+    local mh mi
+    while IFS= read -r mh; do
+      [[ -z "$mh" ]] && continue
+      mi="$(_map_idx "$mh")"
+      [[ -z "$mi" ]] && continue
+      local mh_short="${mh%.local}"
+      mh_short="${mh_short#Kash-MBA-}"
+      (( ${#mh_short} > 14 )) && mh_short="${mh_short:0:11}…"
+      local mp=${_map_proj[$mi]:-0}
+      local m5h; m5h="$(fmt_tok ${_map_5h[$mi]:-0})"
+      local mr; mr="$(fmt_tok ${_map_right[$mi]:-0})"
+      local mseen=${_map_seen[$mi]:-0}
+      local mseen_str="—"
+      local ms="?" msc="$DIM"
+      if (( mseen > 0 )); then
+        local mage2; mage2=$(( now - mseen ))
+        mseen_str="$(fmt_age $mage2)"
+        if   (( mage2 < 1800 )); then ms="active"; msc="$GN"
+        elif (( mage2 < 7200 )); then ms="idle";  msc="$DIM"
+        else                       ms="stale"; msc="$RD"
+        fi
+      fi
+      # DAEMONS: for this machine, show local plist count + watchdog indicator.
+      # For other machines, show project count (proxy for daemon count).
+      local daemon_str=""
+      if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
+        daemon_str="${local_daemons} d"
+        (( have_sync && have_watch )) && daemon_str+=" +2w"
+        (( have_sync && ! have_watch )) && daemon_str+=" +sw"
+        (( ! have_sync && have_watch )) && daemon_str+=" +pw"
+      else
+        daemon_str="${mp} d"
+      fi
+      printf '  %-20s %-9d %-10s %-11s %-11s %-8s %s%-7s%s\n' \
+        "$mh_short" "$mp" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+    done <<< "$sorted_hosts"
+
+        echo
+  fi
+
+  if (( EFFORT )) ; then
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "LOG" "$RS"
+  else
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "$RS"
+  fi
+  for row in "${rows[@]}"; do
+    local name age host item state state_color s5h sR pulled log_mb other_hosts
+    IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
+    (( ${#other_hosts} > 12 )) && other_hosts="${other_hosts:0:9}…"
+    if (( EFFORT )); then
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s %-8s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR" "$log_mb"
+    else
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
+    fi
+  done
+}
+
+# ---- subcommand: sync ----
+
+do_sync() {
+  local NO_PULL=0 RESTART_ONLY=0
+  for arg in "$@"; do
+    case "$arg" in
+      --no-pull)      NO_PULL=1 ;;
+      --restart-only) NO_PULL=1; RESTART_ONLY=1 ;;
+      *) echo "backlog-agents sync: unknown flag: $arg" >&2; exit 2 ;;
+    esac
+  done
+
+  if (( NO_PULL == 0 )); then
+    need_github_ssh "backlog-agents sync" || warn "SSH to GitHub is broken — pulls will fail"
+
+    info "pulling dotfiles"
+    git -C "$DOTFILES" pull --ff-only origin main && ok "dotfiles up to date"
+
+    info "running kash_setup.sh (idempotent)"
+    ( . "$DOTFILES/bootstrap/kash_setup.sh" ) || warn "kash_setup.sh reported errors above"
+    ok "bootstrap done"
+
+    if [[ -d "$ACTIVE_ROOT" ]]; then
+      info "pulling each active project"
+      for proj in "$ACTIVE_ROOT"/*/; do
+        [[ -d "$proj/.git" ]] || continue
+        local local_name; local_name="$(basename "$proj")"
+        if branch="$(git -C "$proj" symbolic-ref --short HEAD 2>/dev/null)"; then
+          if git -C "$proj" pull --ff-only origin "$branch" >/dev/null 2>&1; then
+            ok "$local_name (on $branch)"
+          else
+            warn "$local_name: pull --ff-only failed (probably dirty or diverged); leaving alone"
+          fi
+        else
+          warn "$local_name: detached HEAD; skipping pull"
+        fi
+      done
+    fi
+  fi
+
+  # Restart daemons — both legacy (.backlog-loop) and new (.backlog-agent) labels.
+  info "restarting agents"
+  local restarted=0
+  local plist label name repo
+  for plist in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
+               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$plist" ]] || continue
+    label="$(basename "$plist" .plist)"
+    name="${label#com.${USER}.}"
+    name="${name%.backlog-agent}"
+    name="${name%.backlog}"
+    name="${name%.backlog-loop}"
+    repo="$ACTIVE_ROOT/$name"
+    if [[ ! -d "$repo" ]]; then
+      warn "$label points to $repo which doesn't exist; skipping (run \`dev-projects sync\`)"
+      continue
+    fi
+    info "restarting $label"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      for _ in $(seq 1 15); do
+        launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || break
+        sleep 1
+      done
+    fi
+    rmdir "$repo/.claude/backlog.lock"      2>/dev/null || true
+    rmdir "$repo/.claude/backlog-loop.lock" 2>/dev/null || true
+    if launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1; then
+      ok "$label running"
+      restarted=$((restarted + 1))
+    else
+      warn "bootstrap failed for $label"
+    fi
+  done
+  ok "$restarted agent(s) restarted"
+
+  if (( RESTART_ONLY == 0 )); then
+    echo
+    snapshot
+  fi
+}
+
+# ---- subcommand: list ----
+
+do_list() {
+  local plist label state
+  printf '  %s%-40s %-12s %s%s\n' "$DIM" "LABEL" "STATE" "PLIST" "$RS"
+  local found=0
+  for plist in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
+               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+               "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$plist" ]] || continue
+    found=1
+    label="$(basename "$plist" .plist)"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      state="${GN}running${RS}"
+    else
+      state="${YL}installed${RS}"
+    fi
+    printf '  %-40s %-22s %s\n' "$label" "$state" "$plist"
+  done
+  if (( found == 0 )); then
+    printf '  %s(no com.%s.*.backlog* plists installed)%s\n' "$DIM" "$USER" "$RS"
+  fi
+}
+
+do_daemon_sync() {
+  local interval=86400 once=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval) interval="$2"; shift 2 ;;
+      --once)     once=1; shift ;;
+      -*)         echo "backlog-agents daemon-sync: unknown flag: $1" >&2; exit 2 ;;
+      *)          echo "backlog-agents daemon-sync: unexpected argument: $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ "$interval" -ge 60 ]] || { echo "backlog-agents daemon-sync: --interval must be >= 60 seconds" >&2; exit 2; }
+  if (( once == 1 )); then
+    info "single sync (--once)"
+    do_sync
+    return
+  fi
+  info "syncing every ${interval}s (ctrl-c to stop)"
+  while true; do
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sync start"
+    do_sync
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sleeping ${interval}s"
+    sleep "$interval"
+  done
+}
+
+do_install_watchdog() {
+  local label="com.${USER}.backlog-agents-sync"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local bin_path
+  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+
+  if [[ -f "$plist" ]]; then
+    info "replacing existing backlog-agents-sync plist"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    local i=0
+    while launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 && (( i < 10 )); do
+      sleep 1; i=$((i + 1))
+    done
+  fi
+
+  local label_x bin_path_x home_x bin_dir_x
+  label_x="$(xml_escape "$label")"
+  bin_path_x="$(xml_escape "$bin_path")"
+  local bin_dir; bin_dir="$(dirname "$bin_path")"
+  bin_dir_x="$(xml_escape "$bin_dir")"
+  home_x="$(xml_escape "$HOME")"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label_x}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${bin_path_x}</string>
+        <string>daemon-sync</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${home_x}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-sync.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-sync.stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  mkdir -p "$HOME/Library/Logs"
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    echo "backlog-agents: bootstrap failed for ${label}. plist is at $plist." >&2
+    exit 1
+  fi
+  ok "backlog-agents-sync agent installed: ${label}"
+  info "  plist: ${plist}"
+  info "  logs:  ~/Library/Logs/backlog-agents-sync.{stdout,stderr}.log"
+  info "  status: launchctl print gui/\$(id -u)/${label}"
+}
+
+do_uninstall_watchdog() {
+  local label="com.${USER}.backlog-agents-sync"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+
+  if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/${label}" || true
+    ok "booted out ${label}"
+  fi
+  if [[ -f "$plist" ]]; then
+    rm "$plist"
+    ok "removed ${plist}"
+  else
+    info "no backlog-agents-sync plist at ${plist}; nothing to remove."
+  fi
+}
+
+# ---- dispatch ----
+
+# Flags only apply to the default (snapshot) command.
+FETCH=0; WATCH=0; EFFORT=0; DAY=0
+
+cmd="${1:-}"
+case "$cmd" in
+  sync) shift; do_sync "$@" ;;
+  list) shift; do_list "$@" ;;
+  daemon-sync) shift; do_daemon_sync "$@" ;;
+  install-watchdog) do_install_watchdog ;;
+  uninstall-watchdog) do_uninstall_watchdog ;;
+  -h|--help)
+    sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    # Default: snapshot. Parse flags here so they're scoped to this path.
+    for arg in "$@"; do
+      case "$arg" in
+        --fetch)  FETCH=1 ;;
+        --watch)  WATCH=1 ;;
+        --effort) EFFORT=1 ;;
+        --day)    DAY=1 ;;
+        *) echo "backlog-agents: unknown flag: $arg" >&2; exit 2 ;;
+      esac
+    done
+    if (( WATCH )); then
+      trap 'exit 0' INT TERM
+      while true; do
+        clear
+        snapshot
+        sleep 10
+      done
+    else
+      snapshot
+    fi
+    ;;
+esac

@@ -19,7 +19,7 @@ docs/Backlog.md          one-input source of truth: - [ ] open / - [~] in-progre
    ▼
 implementation           autonomous worker drains - [ ] and - [!] items
    │                     (either /watch-backlog interactive, or headless
-   │                      `backlog run` driver)
+   │                      `backlog-agent run` driver)
    ▼
 eval / test              `npm run build` chains typecheck → lint → tests → bundle
    │                     (any failure blocks the worker from committing)
@@ -64,7 +64,7 @@ The blocker round-trip:
 [?] (worker writes inline question, commits, exits)
  │
  ├─ user answers inline (e.g. `[user] in-memory is fine`)
- ├─ `backlog unblock <N>`        # or `--all`, or hand-flip the marker
+ ├─ `backlog-agent unblock <N>`        # or `--all`, or hand-flip the marker
  ▼
 [!] (worker re-attempts on next tick, reads body for answers)
  │
@@ -81,7 +81,7 @@ fine — workers read the marker character, not the rendered output.)
   restructure (the user edits in parallel).
 - Workers `- [?]`-flag mid-work if a question arises; they don't guess.
 - Users resolve `- [?]` blockers by writing answers inline and flipping
-  to `- [!]` (via `backlog unblock <N>` or hand-edit).
+  to `- [!]` (via `backlog-agent unblock <N>` or hand-edit).
 - The `Done` section is the audit trail — never silently delete `- [x]`
   entries.
 
@@ -120,9 +120,9 @@ short bursts of focused output.
 replays the entire growing context on every tick. Token cost per task
 grows linearly with iteration count, total grows roughly quadratically.
 
-### Mode B — `backlog run` (headless, fresh session per tick)
+### Mode B — `backlog-agent run` (headless, fresh session per tick)
 
-A bash driver at `~/dev/projects/active/backlog-infra/bin/backlog`. Spawns a fresh `claude -p`
+A bash driver at `~/dev/projects/active/backlog-infra/bin/backlog-agent`. Spawns a fresh `claude -p`
 invocation per tick to execute one iteration of the `/watch-backlog`
 contract, then exits.
 
@@ -135,41 +135,41 @@ completed. Much cheaper for long backlogs.
 **Visibility tradeoff:** no live in-pane view of the work. Monitor via
 the log + git activity (see "Monitoring" below).
 
-Subcommands: `backlog run` (fswatch + heartbeat, default), `backlog watch`
-(heartbeat only), `backlog tick` (single tick, exit), `backlog` (status:
-open count, next item, last tick age), `backlog compact` (delegates to
-`scripts/backlog-compact.mjs` if present). Mkdir-based lock at
-`<project>/.claude/backlog.lock` prevents two driver instances racing on
+Subcommands: `backlog-agent run` (fswatch + heartbeat, default), `backlog-agent watch`
+(heartbeat only), `backlog-agent tick` (single tick, exit), `backlog-agent` (status:
+open count, next item, last tick age), `backlog-agent compact` (delegates to
+`scripts/backlog-agent-compact.mjs` if present). Mkdir-based lock at
+`<project>/.claude/backlog-agent.lock` prevents two driver instances racing on
 the same project.
 
 ### Mode B as a launchd LaunchAgent
 
 For true set-and-forget, package Mode B as a macOS LaunchAgent. The
-`backlog` driver has a built-in installer:
+`backlog-agent` driver has a built-in installer:
 
 ```bash
 cd <project-root>
-backlog install-daemon
+backlog-agent install-daemon
 ```
 
 This templates a plist at
-`~/Library/LaunchAgents/com.$USER.<project-basename>.backlog.plist`
+`~/Library/LaunchAgents/com.$USER.<project-basename>.backlog-agent.plist`
 (project basename comes from `git rev-parse --show-toplevel`) with:
 
-- `Label = com.$USER.<project-basename>.backlog`
+- `Label = com.$USER.<project-basename>.backlog-agent`
 - `WorkingDirectory = <project-root>`
-- `ProgramArguments = [/bin/bash, <absolute path to bin/backlog>, run]`
+- `ProgramArguments = [/bin/bash, <absolute path to bin/backlog-agent>, run]`
 - `RunAtLoad = true`, `KeepAlive = true`, `ThrottleInterval = 60`
 - Logs at `<project>/.claude/launchd-{stdout,stderr}.log`
 
 Then it `launchctl bootstrap`s the plist. Starts immediately, restarts
 on crash, auto-starts on every login.
 
-Re-running `backlog install-daemon` boots out and replaces — use it
+Re-running `backlog-agent install-daemon` boots out and replaces — use it
 after the script's template changes or after moving the project. The
-installer also defensively clears any stale `.claude/backlog.lock` from
+installer also defensively clears any stale `.claude/backlog-agent.lock` from
 a prior SIGKILL'd daemon so the new instance starts in a clean state.
-`backlog uninstall-daemon` is the inverse (bootout + `rm` the plist +
+`backlog-agent uninstall-daemon` is the inverse (bootout + `rm` the plist +
 clear the lockdir).
 
 ---
@@ -296,13 +296,13 @@ Three layers:
 
 **Daemon health:**
 ```bash
-launchctl print gui/$(id -u)/com.kashif.<slug>.backlog \
+launchctl print gui/$(id -u)/com.kashif.<slug>.backlog-agent \
   | grep -E 'state|restart count|last exit'
 ```
 
 **Live output:**
 ```bash
-tail -f <project>/.claude/backlog.log
+tail -f <project>/.claude/backlog-agent.log
 ```
 Look for unmatched `tick start` (work in flight) vs `tick done`.
 
@@ -310,22 +310,22 @@ Look for unmatched `tick start` (work in flight) vs `tick done`.
 
 Two CLIs cover everything else:
 
-- **`backlog`** (at `~/dev/projects/active/backlog-infra/bin/backlog`) — single-project commands,
+- **`backlog-agent`** (at `~/dev/projects/active/backlog-infra/bin/backlog-agent`) — single-project commands,
   always run from the project root. Subcommands:
-  - `backlog` (default) — color-coded status: open count, next
+  - `backlog-agent` (default) — color-coded status: open count, next
     `- [ ]`/`- [!]` item, last tick age + label (fresh / idle / STALE).
-  - `backlog run` / `backlog watch` / `backlog tick` — start the worker
+  - `backlog-agent run` / `backlog-agent watch` / `backlog-agent tick` — start the worker
     in its various modes (see Stage 2).
-  - `backlog unblock` — list `- [?]` blocked items numbered. With `<N>`,
+  - `backlog-agent unblock` — list `- [?]` blocked items numbered. With `<N>`,
     flip the Nth item to `- [!]` (answered, ready to retry); with
     `--all`, flip every `- [?]` to `- [!]`. Write your inline answers
     first (e.g. `[user] in-memory is fine`); the worker reads the item
     body on next tick.
-  - `backlog compact` — delegates to `scripts/backlog-compact.mjs` if
+  - `backlog-agent compact` — delegates to `scripts/backlog-agent-compact.mjs` if
     present (a per-project housekeeping helper that collapses older
     `Done` entries).
 
-- **`backlogs`** (at `~/dev/projects/active/backlog-infra/bin/backlogs`) — fleet view.
+- **`backlog-agents`** (at `~/dev/projects/active/backlog-infra/bin/backlog-agents`) — fleet view.
   Two layers in the default snapshot:
   - **Machine summary** — scans history JSONL files across every
     project, dedupes unique hostnames, and shows how many projects this
@@ -339,9 +339,9 @@ Two CLIs cover everything else:
     state (`fresh` <30min / `idle` <2h / `STALE` ≥2h). Token
     columns sum across all hosts that pushed into the repo.
 
-  Subcommands: `backlogs sync` (pull dotfiles, re-run `kash_setup.sh`,
-  pull every active project, restart every backlog launchd daemon, then
-  print the dashboard — replaces the old `agents-bootstrap`); `backlogs
+  Subcommands: `backlog-agents sync` (pull dotfiles, re-run `kash_setup.sh`,
+  pull every active project, restart every agent, then
+  print the dashboard — replaces the old `agents-bootstrap`); `backlog-agents
   list` (installed daemons + their state).
 
   Dashboard flags: `--fetch` (`git fetch -q origin` per repo first),
@@ -351,7 +351,7 @@ Two CLIs cover everything else:
   `--restart-only` (skip pulls + final dashboard). Requires `jq`.
 
 - **`dev-projects`** (at `~/dev/projects/active/backlog-infra/bin/dev-projects`) — lifecycle
-  for `~/dev/projects/active/`. Distinct concern from `backlog`/`backlogs`
+  for `~/dev/projects/active/`. Distinct concern from `backlog-agent`/`backlog-agents`
   — manages git repos themselves, not their backlogs. Subcommands:
   `activate <url>` (clone + manifest + push), `archive <name>` (mv to
   `archived/` + manifest + push + stop daemon), `sync` (rescan
@@ -360,18 +360,18 @@ Two CLIs cover everything else:
   (three-column read: on-disk / in-manifest / daemon), `list` (print
   manifest).
 
-The per-project effort ledger is populated by `scripts/backlog-status.mjs`
-— a per-project script invoked by `backlog run` after each `claude -p`
+The per-project effort ledger is populated by `scripts/backlog-agent-status.mjs`
+— a per-project script invoked by `backlog-agent run` after each `claude -p`
 tick. See "Per-tick status reporting" below.
 
-Convention: launchd labels are `com.kashif.<project>.backlog`, and the
+Convention: launchd labels are `com.kashif.<project>.backlog-agent`, and the
 helpers assume project repos live at `~/dev/projects/<project>`. If you
 keep projects elsewhere, parameterize the helpers or symlink.
 
 ### Per-tick status reporting (cross-machine token accounting)
 
-Each project that opts in ships `scripts/backlog-status.mjs`. After every
-`claude -p` tick, `backlog run` invokes it with the item title, exit
+Each project that opts in ships `scripts/backlog-agent-status.mjs`. After every
+`claude -p` tick, `backlog-agent run` invokes it with the item title, exit
 code, mode, and pre-tick HEAD. The script:
 
 1. Locates the newest transcript JSONL for the project's cwd under
@@ -390,7 +390,7 @@ git log --grep='Claude-Effort'
 ```
 
 Cross-machine math: every host commits its own ticks under the same
-`.claude/backlog-history.jsonl`; `backlogs --fetch` pulls each repo and
+`.claude/backlog-history.jsonl`; `backlog-agents --fetch` pulls each repo and
 the JSONL replay sums tokens across all hosts. The `host` field on each
 record is for context only.
 
@@ -405,9 +405,9 @@ For the BACKLOG-EFFORT account view, self-imposed budgets live in
   }
 }
 ```
-Missing → `backlogs` shows raw counts only (no bullet graph, no `%`).
+Missing → `backlog-agents` shows raw counts only (no bullet graph, no `%`).
 These are **personal targets**, not Anthropic plan caps. Anthropic's
-limits are message-based and use fixed-reset windows; the `backlogs`
+limits are message-based and use fixed-reset windows; the `backlog-agents`
 dashboard uses tokens and rolling windows. Run `/usage` in Claude
 Code for the authoritative plan view.
 
@@ -419,9 +419,9 @@ For a brand-new repo, `dev-projects new <name>` automates the
 mechanical steps from `~/dotfiles/templates/dev-project/`: it scaffolds
 `docs/Backlog.md` (step 1), drops in a starter `scripts/release.mjs`
 with `CF_PROJECT` set to `<name>` (step 3), templates `.gitignore`
-(step 8), copies `scripts/backlog-status.mjs` (step 8b), git-inits,
+(step 8), copies `scripts/backlog-agent-status.mjs` (step 8b), git-inits,
 creates a private `kashnoorani/<name>` repo and pushes, then runs
-`backlog install-daemon` (step 6). Steps 2, 4, 5, 7, and 9 still need
+`backlog-agent install-daemon` (step 6). Steps 2, 4, 5, 7, and 9 still need
 your eyes — the command prints a punch list when it finishes. Pass
 `--no-gh` for a local-only scaffold or `--no-daemon` to skip the
 LaunchAgent.
@@ -454,29 +454,29 @@ below is what you do once you're inside the clone.
      "deploy": "npm run build && wrangler pages deploy dist --branch=release --commit-dirty=true"
    }
    ```
-   (No need for a `backlog:loop` script — `backlog run` is on `$PATH`.)
+   (No need for a `backlog:loop` script — `backlog-agent run` is on `$PATH`.)
 
 6. **Install the launchd LaunchAgent** when ready to run autonomously:
    ```bash
    cd <project-root>
-   backlog install-daemon
+   backlog-agent install-daemon
    ```
    Templates a plist at
-   `~/Library/LaunchAgents/com.$USER.<project-basename>.backlog.plist`,
+   `~/Library/LaunchAgents/com.$USER.<project-basename>.backlog-agent.plist`,
    bootstraps it, and points logs at `<repo>/.claude/`. Re-run to
-   refresh after the template changes; `backlog uninstall-daemon` is
+   refresh after the template changes; `backlog-agent uninstall-daemon` is
    the inverse.
 
 7. **Project `CLAUDE.md`** — copy the "Backlog draining" and "Release
    workflow & branching model" sections from an existing project as
    starting points. Adjust per-project details.
 
-8. **`.gitignore`** — add `.claude/backlog.log`, `.claude/backlog.lock`,
+8. **`.gitignore`** — add `.claude/backlog-agent.log`, `.claude/backlog-agent.lock`,
    `.claude/launchd-stdout.log`, `.claude/launchd-stderr.log`.
 
 8b. **Per-tick status reporting (optional but recommended).** If you
-    want cross-machine token accounting via `backlogs`:
-    - Copy `scripts/backlog-status.mjs` from an existing project (it's
+    want cross-machine token accounting via `backlog-agents`:
+    - Copy `scripts/backlog-agent-status.mjs` from an existing project (it's
       project-agnostic; reads `process.cwd()` for the transcript
       lookup).
     - Confirm `.claude/backlog-status.json` and
@@ -488,8 +488,8 @@ below is what you do once you're inside the clone.
       `~/.claude/backlog-budgets.json` with your personal targets (see
       the Monitoring section above for the schema). Optional — without
       it the dashboard shows raw counts instead of bullet graphs.
-    - `backlog run` auto-invokes the hook when
-      `scripts/backlog-status.mjs` exists. Nothing else to wire up.
+    - `backlog-agent run` auto-invokes the hook when
+      `scripts/backlog-agent-status.mjs` exists. Nothing else to wire up.
 
 9. **Set up `release` branch** on first release. The script handles
     creation if it doesn't exist yet — just run `npm run release` once
@@ -502,14 +502,14 @@ below is what you do once you're inside the clone.
 | Piece | Lives in | Reusable? |
 |---|---|---|
 | `/watch-backlog` skill | `~/dotfiles/settings/claude/commands/` | Shared — single file used across projects |
-| `backlog` driver | `~/dev/projects/active/backlog-infra/bin/backlog` | Shared — operates on `$PWD`, project-agnostic |
-| `backlogs` fleet view | `~/dev/projects/active/backlog-infra/bin/backlogs` | Shared — walks every repo |
+| `backlog-agent` driver | `~/dev/projects/active/backlog-infra/bin/backlog-agent` | Shared — operates on `$PWD`, project-agnostic |
+| `backlog-agents` fleet view | `~/dev/projects/active/backlog-infra/bin/backlog-agents` | Shared — walks every repo |
 | Backlog markers + section discipline | `~/.claude/CLAUDE.md` | Shared — global instructions |
 | Two-session coordination rules | `~/.claude/CLAUDE.md` | Shared — global instructions |
 | `docs/Backlog.md` | per-repo | Per-project (content) |
 | `scripts/release.mjs` | per-repo | Per-project (CDN/name baked in); pattern reusable |
-| launchd plist | `~/Library/LaunchAgents/com.$USER.<project>.backlog.plist` | Generated by `backlog install-daemon`; per-project paths/label, shared template in `bin/backlog` |
-| `scripts/backlog-status.mjs` | per-repo | Shared shape — reads `process.cwd()`, copy verbatim |
+| launchd plist | `~/Library/LaunchAgents/com.$USER.<project>.backlog-agent.plist` | Generated by `backlog-agent install-daemon`; per-project paths/label, shared template in `bin/backlog-agent` |
+| `scripts/backlog-agent-status.mjs` | per-repo | Shared shape — reads `process.cwd()`, copy verbatim |
 | `npm run build` chain | per-`package.json` | Per-project (toolchain varies); shape reusable |
 | Project `CLAUDE.md` | per-repo | Per-project (project-specific context) |
 
@@ -517,7 +517,7 @@ below is what you do once you're inside the clone.
 
 ## Anti-patterns
 
-- **Running both `/watch-backlog` and `backlog run` at once.**
+- **Running both `/watch-backlog` and `backlog-agent run` at once.**
   They race for the same `- [ ]` items. The mkdir lock only knows about
   other headless instances. Pick one.
 - **`git add -A` or `git add .`.** Sweeps the parallel session's edits.
@@ -527,7 +527,7 @@ below is what you do once you're inside the clone.
 - **Skipping the build gate.** `npm run deploy` (without the gate) is
   an unsafe escape hatch for prod hotfixes only — `npm run release` is
   the default.
-- **Long-running `/watch-backlog` for big backlogs.** Use `backlog run`.
+- **Long-running `/watch-backlog` for big backlogs.** Use `backlog-agent run`.
   Quadratic context cost vs linear.
 - **Auto-deciding `- [?]` blockers.** Workers must surface, not guess.
 - **Documenting the workflow only in one project's `CLAUDE.md`.** It

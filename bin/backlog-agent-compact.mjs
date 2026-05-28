@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// backlog-compact.mjs — move completed items from `## Done` to `## Archive`
+// backlog-agent-compact.mjs — move completed items from `## Done` to `## Archive`
 // so the Done section stays focused on recent completions. Archival is
 // non-destructive: items are preserved under `## Archive` (creating it
 // at the end if it doesn't exist). The `## Done` section is reset to `(none)`.
@@ -22,7 +22,7 @@ function findBacklogFile() {
 function main() {
   const bf = findBacklogFile();
   if (!bf) {
-    console.error("backlog-compact: no docs/Backlog.md or backlog.txt found");
+    console.error("backlog-agent-compact: no docs/Backlog.md or backlog.txt found");
     process.exit(1);
   }
 
@@ -44,7 +44,7 @@ function main() {
   }
 
   if (doneStart === -1) {
-    console.error("backlog-compact: no ## Done section found");
+    console.error("backlog-agent-compact: no ## Done section found");
     process.exit(1);
   }
 
@@ -60,7 +60,7 @@ function main() {
   }
 
   if (doneItems.length === 0) {
-    console.log("backlog-compact: no done items to archive");
+    console.log("backlog-agent-compact: no done items to archive");
     process.exit(0);
   }
 
@@ -90,7 +90,7 @@ function main() {
   }
 
   writeFileSync(bf, final.join("\n"), "utf8");
-  console.log(`backlog-compact: archived ${doneItems.length} item(s) from ## Done → ## Archive`);
+  console.log(`backlog-agent-compact: archived ${doneItems.length} item(s) from ## Done → ## Archive`);
 }
 
 main();

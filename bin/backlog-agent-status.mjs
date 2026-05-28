@@ -468,6 +468,33 @@ async function main() {
     `${JSON.stringify({ ...statusObj, last_host: host }, null, 2)}\n`,
   );
 
+  // Push health to the dashboard so fleet view is near-realtime
+  // (non-blocking — failure is logged and ignored).
+  const healthKeyFile = join(homedir(), ".config", "backlog", "health-key");
+  if (existsSync(healthKeyFile)) {
+    try {
+      const key = readFileSync(healthKeyFile, "utf8").trim();
+      const projectName = (() => {
+        try { return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name; }
+        catch { return REPO_ROOT.split("/").pop(); }
+      })();
+      fetch("https://kash-backlogs.pages.dev/api/health-ingest", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
+        body: JSON.stringify({
+          project: projectName,
+          host: statusObj.last_host,
+          last_tick_at: statusObj.last_tick_at,
+          last_item: statusObj.last_item,
+          last_exit_code: statusObj.last_exit_code,
+          last_tokens: statusObj.last_tokens,
+          last_commit: statusObj.last_work_commit,
+        }),
+      }).then(r => { if (!r.ok) console.error(`health push failed: ${r.status}`); })
+        .catch(e => console.error(`health push error: ${e.message}`));
+    } catch {}
+  }
+
   const effort = {
     ts,
     host,

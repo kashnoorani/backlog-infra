@@ -142,6 +142,60 @@ snapshot() {
   local fleet_hosts_set='|'
   local this_machine_projects=0
 
+  # Per-machine accumulators (built during project loop).
+  # Uses parallel indexed arrays — bash 3.2 compatible (macOS default bash).
+  # _MAP_IDX is a global set by _map_ensure as a side-channel (command
+  # substitution runs in a subshell in bash 3.2, so functions that modify
+  # arrays can't return values via stdout).
+  _MAP_IDX=-1
+  _map_keys=()        # ordered list of unique hostname keys
+  _map_5h=()          # parallel: 5h token sums
+  _map_right=()       # parallel: right-column token sums
+  _map_proj=()        # parallel: project counts
+  _map_seen=()        # parallel: last tick epoch (max)
+
+  _map_idx() {
+    local k="$1" i
+    for i in "${!_map_keys[@]}"; do
+      [[ "${_map_keys[$i]}" == "$k" ]] && { printf '%d' "$i"; return 0; }
+    done
+    return 1
+  }
+  _map_ensure() {
+    local k="$1" i
+    for i in "${!_map_keys[@]}"; do
+      if [[ "${_map_keys[$i]}" == "$k" ]]; then
+        _MAP_IDX=$i
+        return 0
+      fi
+    done
+    _map_keys+=("$k")
+    _map_5h+=(0); _map_right+=(0); _map_proj+=(0); _map_seen+=(0)
+    _MAP_IDX=$((${#_map_keys[@]} - 1))
+    return 0
+  }
+  _map_add() {
+    _map_ensure "$1"
+    local i=$_MAP_IDX t5h="${2:-0}" tr="${3:-0}"
+    _map_5h[$i]=$(( ${_map_5h[$i]:-0} + t5h ))
+    _map_right[$i]=$(( ${_map_right[$i]:-0} + tr ))
+    _map_proj[$i]=$(( ${_map_proj[$i]:-0} + 1 ))
+  }
+  _map_max_seen() {
+    _map_ensure "$1"
+    local i=$_MAP_IDX v="${2:-0}"
+    (( v > ${_map_seen[$i]:-0} )) && _map_seen[$i]=$v
+    return 0
+  }
+
+  # Count local backlog daemon plists installed on this machine.
+  local local_daemons=0
+  local pl
+  for pl in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+            "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$pl" ]] && local_daemons=$((local_daemons + 1))
+  done
+
   # Dedupe candidates by realpath.
   local -a candidates=()
   local root proj_dir
@@ -221,14 +275,51 @@ snapshot() {
           "\(([$rs[] | select(.t >= $c5h) | .tok] | add // 0))|" +
           "\(([$rs[] | select(.t >= $cR)  | .tok] | add // 0))|" +
           "\($hosts)|" +
-          "\([$rs[] | select(.h == $thisHost and .tok > 0)] | length > 0)"
-      ' "$log" 2>/dev/null || printf '%s\n' "—|0|0||false")"
-      IFS='|' read -r active_host sum_5h sum_right hosts_csv has_this_work <<< "$out"
+          "\([$rs[] | select(.h == $thisHost and .tok > 0)] | length > 0)|" +
+          "\([$rs | group_by(.h)[] | "\(.[0].h):\([.[] | select(.t >= $c5h) | .tok] | add // 0):\([.[] | select(.t >= $cR) | .tok] | add // 0)"] | join(";"))"
+      ' "$log" 2>/dev/null || printf '%s\n' "—|0|0||false|")"
+      IFS='|' read -r active_host sum_5h sum_right hosts_csv has_this_work per_host_groups <<< "$out"
+    fi
+
+    # Per-machine token aggregation from per-host groups.
+    if [[ -n "$per_host_groups" ]]; then
+      IFS=';' read -ra hgroups <<< "$per_host_groups"
+      local group h t5h tr
+      for group in "${hgroups[@]}"; do
+        [[ -z "$group" ]] && continue
+        IFS=':' read -r h t5h tr <<< "$group"
+        [[ -z "$h" || "$h" == "—" ]] && continue
+        _map_add "$h" "$t5h" "$tr"
+        if [[ -n "${tick_epoch:-}" && "${tick_epoch:-0}" != "0" ]]; then
+          _map_max_seen "$h" "$tick_epoch"
+        fi
+      done
     fi
 
     local active_host_short="${active_host%.local}"
     active_host_short="${active_host_short#Kash-MBA-}"
     (( ${#active_host_short} > 14 )) && active_host_short="${active_host_short:0:11}…"
+
+    # Compute other-hosts column (all hosts that worked on this project, minus the active one).
+    local other_hosts="—"
+    if [[ -n "$hosts_csv" ]]; then
+      local oh_arr=()
+      IFS=',' read -ra host_arr_oh <<< "$hosts_csv"
+      for h in "${host_arr_oh[@]}"; do
+        [[ -z "$h" ]] && continue
+        local hc="${h%.local}"
+        hc="${hc#Kash-MBA-}"
+        (( ${#hc} > 12 )) && hc="${hc:0:9}…"
+        [[ "$hc" == "$active_host_short" ]] && continue
+        oh_arr+=("$hc")
+      done
+      if [[ ${#oh_arr[@]} -gt 0 ]]; then
+        local _saved_ifs="$IFS"
+        IFS=,
+        other_hosts="${oh_arr[*]}"
+        IFS="$_saved_ifs"
+      fi
+    fi
 
     # Fleet-wide host tracking
     if [[ -n "$hosts_csv" ]]; then
@@ -255,7 +346,7 @@ snapshot() {
       log_mb="$(awk -v b="$(wc -c < "$log")" 'BEGIN{printf "%.2fM", b/1048576}')"
     fi
 
-    rows+=("$name"$'\t'"$age_str"$'\t'"$active_host_short"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb")
+    rows+=("$name"$'\t'"$age_str"$'\t'"$active_host_short"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb"$'\t'"$other_hosts")
   done
 
   # ---- header ----
@@ -289,6 +380,19 @@ snapshot() {
   done
   local total=$((fresh + idle + stale))
 
+  # Per-machine state counts.
+  local m_active=0 m_idle=0 m_stale=0
+  if (( ${#_map_keys[@]} > 0 )); then
+    local mh_idx
+    for mh_idx in "${!_map_keys[@]}"; do
+      local mage=$(( now - ${_map_seen[$mh_idx]:-0} ))
+      if   (( mage < 1800 )); then m_active=$((m_active + 1))
+      elif (( mage < 7200 )); then m_idle=$((m_idle + 1))
+      else m_stale=$((m_stale + 1))
+      fi
+    done
+  fi
+
   local fleet_host_count
   fleet_host_count="$(echo "${fleet_hosts_set#|}" | tr '|' '\n' | grep -c . 2>/dev/null || echo 0)"
   printf '  %s%d machines%s known  |  this machine (%s%s%s): active on %s%d%s of %d projects\n' \
@@ -313,39 +417,92 @@ snapshot() {
   [[ -f "$HOME/Library/LaunchAgents/com.${USER}.dev-projects-watchdog.plist" ]] && have_watch=1
   printf '  projects: %d (%s%d fresh%s, %s%d idle%s, %s%d stale%s)  |' \
     "$total" "$GN" "$fresh" "$RS" "$DIM" "$idle" "$RS" "$RD" "$stale" "$RS"
+  if (( ${#_map_keys[@]} > 0 )); then
+    printf '  machines: %d (%s%d active%s, %s%d idle%s, %s%d stale%s)  |' \
+      "${#_map_keys[@]}" "$GN" "$m_active" "$RS" "$DIM" "$m_idle" "$RS" "$RD" "$m_stale" "$RS"
+  fi
   printf '  open: %s%d%s  done: %s%d%s  |' \
     "$GN" "$total_open" "$RS" "$DIM" "$total_done" "$RS"
+  printf '  this machine: %s%d daemons%s' "$B" "$local_daemons" "$RS"
   if (( have_sync && have_watch )); then
-    printf '  sync watchdog: %s✓%s  new-project watchdog: %s✓%s\n' "$GN" "$RS" "$GN" "$RS"
+    printf ', watchdog %s✓%s\n' "$GN" "$RS"
   elif (( have_sync || have_watch )); then
-    printf '  sync watchdog: %s%s%s  new-project: %s%s%s\n' \
-      "$( ((have_sync)) && echo "$GN" || echo "$RD")" \
-      "$( ((have_sync)) && echo "✓" || echo "✗")" \
-      "$RS" \
-      "$( ((have_watch)) && echo "$GN" || echo "$RD")" \
-      "$( ((have_watch)) && echo "✓" || echo "✗")" \
+    printf ', watchdog %s%s%s\n' \
+      "$( ((have_sync && have_watch)) && echo "$GN" || echo "$RD")" \
+      "$( ((have_sync)) && printf 'sync' ; ((have_sync && have_watch)) && printf '/' ; ((have_watch)) && printf 'new' )" \
       "$RS"
   else
-    printf '  watchdogs: %s✗ not installed%s (run backlogs install-watchdog && dev-projects install-watchdog)\n' "$RD" "$RS"
+    printf ', watchdog %s✗%s\n' "$RD" "$RS"
   fi
 
   echo
-  if (( EFFORT )); then
-    printf '  %s%-18s %-14s %-11s %-40s %-7s %-5s %-7s %-7s %-8s%s\n' \
-      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "LOG" "$RS"
+
+  # ---- MACHINES table ----
+  if (( ${#_map_keys[@]} > 0 )); then
+    local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
+    printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
+    printf '  %s%-20s %-9s %-10s %-11s %-11s %-8s %-7s%s\n' \
+      "$DIM" "MACHINE" "PROJECTS" "5h TOKENS" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
+
+    local sorted_hosts
+    sorted_hosts="$(printf '%s\n' "${_map_keys[@]}" | sort)"
+    local mh mi
+    while IFS= read -r mh; do
+      [[ -z "$mh" ]] && continue
+      mi="$(_map_idx "$mh")"
+      [[ -z "$mi" ]] && continue
+      local mh_short="${mh%.local}"
+      mh_short="${mh_short#Kash-MBA-}"
+      (( ${#mh_short} > 14 )) && mh_short="${mh_short:0:11}…"
+      local mp=${_map_proj[$mi]:-0}
+      local m5h; m5h="$(fmt_tok ${_map_5h[$mi]:-0})"
+      local mr; mr="$(fmt_tok ${_map_right[$mi]:-0})"
+      local mseen=${_map_seen[$mi]:-0}
+      local mseen_str="—"
+      local ms="?" msc="$DIM"
+      if (( mseen > 0 )); then
+        local mage2; mage2=$(( now - mseen ))
+        mseen_str="$(fmt_age $mage2)"
+        if   (( mage2 < 1800 )); then ms="active"; msc="$GN"
+        elif (( mage2 < 7200 )); then ms="idle";  msc="$DIM"
+        else                       ms="stale"; msc="$RD"
+        fi
+      fi
+      # DAEMONS: for this machine, show local plist count + watchdog indicator.
+      # For other machines, show project count (proxy for daemon count).
+      local daemon_str=""
+      if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
+        daemon_str="${local_daemons} d"
+        (( have_sync && have_watch )) && daemon_str+=" +2w"
+        (( have_sync && ! have_watch )) && daemon_str+=" +sw"
+        (( ! have_sync && have_watch )) && daemon_str+=" +pw"
+      else
+        daemon_str="${mp} d"
+      fi
+      printf '  %-20s %-9d %-10s %-11s %-11s %-8s %s%-7s%s\n' \
+        "$mh_short" "$mp" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+    done <<< "$sorted_hosts"
+
+        echo
+  fi
+
+  if (( EFFORT )) ; then
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "LOG" "$RS"
   else
-    printf '  %s%-18s %-14s %-11s %-40s %-7s %-5s %-7s %-7s%s\n' \
-      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "$RS"
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-12s %-5s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "O-HOSTS" "PULL" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
-    local name age host item state state_color s5h sR pulled log_mb
-    IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb <<< "$row"
+    local name age host item state state_color s5h sR pulled log_mb other_hosts
+    IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb other_hosts <<< "$row"
+    (( ${#other_hosts} > 12 )) && other_hosts="${other_hosts:0:9}…"
     if (( EFFORT )); then
-      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-5s %-7s %-7s %-8s\n' \
-        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR" "$log_mb"
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s %-8s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR" "$log_mb"
     else
-      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-5s %-7s %-7s\n' \
-        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR"
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-12s %-5s %-7s %-7s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
     fi
   done
 }

@@ -11,3 +11,4 @@ dist/
 .claude/launchd-stdout.log
 .claude/launchd-stderr.log
 opencode.json
+.wrangler/

@@ -363,6 +363,8 @@ do_sync() {
   done
 
   if (( NO_PULL == 0 )); then
+    need_github_ssh "backlogs sync" || warn "SSH to GitHub is broken — pulls will fail"
+
     info "pulling dotfiles"
     git -C "$DOTFILES" pull --ff-only origin main && ok "dotfiles up to date"
 

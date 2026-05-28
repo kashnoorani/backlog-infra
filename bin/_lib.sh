@@ -30,3 +30,49 @@ xml_escape() {
   s="${s//>/&gt;}"
   printf '%s' "$s"
 }
+
+# Check SSH connectivity to GitHub. Critical for cloning, pulling, and pushing.
+# $1 = timeout in seconds (default 5). Returns 0 if healthy, non-zero if broken.
+check_github_ssh() {
+  local timeout="${1:-5}"
+  local out
+  out="$(ssh -o ConnectTimeout="$timeout" -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1)" || true
+  if echo "$out" | grep -qi "successfully authenticated"; then
+    return 0
+  fi
+  return 1
+}
+
+# Diagnostic helper: if SSH to GitHub is broken, print actionable steps and
+# return 1. Callers use this before operations that need GitHub access, passing
+# the command name for the error header.
+need_github_ssh() {
+  local caller="${1:-$(basename "$0")}"
+  if check_github_ssh; then
+    return 0
+  fi
+  echo >&2
+  echo "================================================================================" >&2
+  echo "  SSH TO GITHUB IS BROKEN" >&2
+  echo "  $caller requires SSH access to GitHub." >&2
+  echo "================================================================================" >&2
+  echo >&2
+  echo "  Quick fix:" >&2
+  echo "    1. Generate a key (if you don't have one):" >&2
+  echo "       ssh-keygen -t ed25519 -C \"your-email@example.com\"" >&2
+  echo >&2
+  echo "    2. Start the SSH agent and add the key:" >&2
+  echo "       eval \"\$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519" >&2
+  echo >&2
+  echo "    3. Copy the public key:" >&2
+  echo "       pbcopy < ~/.ssh/id_ed25519.pub" >&2
+  echo >&2
+  echo "    4. Add it to GitHub:" >&2
+  echo "       https://github.com/settings/ssh" >&2
+  echo >&2
+  echo "    5. Verify:" >&2
+  echo "       ssh -T git@github.com" >&2
+  echo >&2
+  echo "================================================================================" >&2
+  return 1
+}

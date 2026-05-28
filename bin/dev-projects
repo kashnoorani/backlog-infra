@@ -311,6 +311,7 @@ cmd_activate() {
     fail "$dest already exists"
   fi
   mkdir -p "$ACTIVE_ROOT"
+  need_github_ssh "dev-projects activate" || fail "SSH to GitHub is required to clone repos"
   info "cloning $url → $dest"
   git clone "$url" "$dest"
   ok "cloned"

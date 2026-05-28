@@ -99,6 +99,10 @@ STATE_DIR=".claude"
 # still limited the signature re-arms it.
 COOLDOWN_SECONDS=3600
 COOLDOWN_FILE="${STATE_DIR}/agent-cooldown.json"
+# Opt-in cooldown alerts (docs/multi-agent-design.md, Layer 2). When a
+# cooldown is armed, notify_cooldown reads this file and fires a Slack
+# and/or email alert. Absent file / empty keys → silent no-op.
+NOTIFY_CONFIG="${HOME}/.claude/agent-notify.json"
 
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
@@ -447,6 +451,38 @@ JSON
     wait_info="until ${until_iso:-+${COOLDOWN_SECONDS}s}"
   fi
   echo "  [cooldown] plan/session limit detected — pausing claude ticks ${wait_info} (rm ${COOLDOWN_FILE} to clear)" | tee -a "$LOG_FILE"
+  notify_cooldown "$until_iso"
+}
+
+# Fire an opt-in Slack/email alert that this project's daemon just entered a
+# plan-limit cooldown. Opt-in via ~/.claude/agent-notify.json:
+#   { "slack_webhook_url": "https://hooks.slack.com/...", "email": "you@x.com" }
+# Both keys optional. Best-effort by design: no config / no jq → silent no-op,
+# and every send is backgrounded with a short timeout so a slow or unreachable
+# endpoint can never stall or abort the daemon. start_cooldown only runs once
+# per cooldown window (active cooldowns short-circuit the claude tick), so this
+# fires once per "entered cooldown" event rather than every heartbeat.
+notify_cooldown() {
+  local until_str="${1:-?}"
+  [[ -f "$NOTIFY_CONFIG" ]] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  local slack_url email
+  slack_url="$(jq -r '.slack_webhook_url // empty' "$NOTIFY_CONFIG" 2>/dev/null || true)"
+  email="$(jq -r '.email // empty' "$NOTIFY_CONFIG" 2>/dev/null || true)"
+  [[ -z "$slack_url" && -z "$email" ]] && return 0
+  local project host msg
+  project="$(basename "$(pwd)")"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+  msg="⏸ backlog-agent [${project}@${host}] hit the Anthropic plan/session limit — claude ticks paused until ${until_str}"
+  if [[ -n "$slack_url" ]] && command -v curl >/dev/null 2>&1; then
+    local payload; payload="$(jq -nc --arg t "$msg" '{text: $t}')"
+    ( curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+        --data "$payload" "$slack_url" >/dev/null 2>&1 || true ) &
+  fi
+  if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
+    ( printf '%s\n' "$msg" | mail -s "backlog-agent cooldown: ${project}@${host}" "$email" >/dev/null 2>&1 || true ) &
+  fi
+  return 0
 }
 
 # ---- helpers: parse claude's "resets X:XXpm" into an epoch ----
@@ -455,8 +491,11 @@ JSON
 __time_to_24h() {
   local t="$1"
   t="$(echo "$t" | sed -E 's/([0-9])([ap]m)/\1 \2/i')"
-  local hour="${t%%:*}" rest="${t#*:}" min="${rest%%[apAP ]*}"
-  local ampm; ampm="$(echo "$rest" | tr '[:upper:]' '[:lower:]' | grep -o '[ap]m' || true)"
+  local hour rest min ampm
+  hour="${t%%:*}"
+  rest="${t#*:}"
+  min="${rest%%[apAP ]*}"
+  ampm="$(echo "$rest" | tr '[:upper:]' '[:lower:]' | grep -o '[ap]m' || true)"
   hour="${hour// /}"; min="${min// /}"
   if [[ "$ampm" == "pm" ]]; then
     if [[ "$hour" != "12" ]]; then hour=$(( hour + 12 )); fi
@@ -585,15 +624,38 @@ tick_once() {
     # to origin to recover the sync channel. The daemon's work is
     # idempotent — a discarded commit will be redone on the next tick
     # if the item is still open.
-    branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+     branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
     git -C "$PWD" fetch origin "$branch" 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE" || true
     if git -C "$PWD" merge-base --is-ancestor HEAD "origin/$branch" 2>/dev/null; then
+      # Stash dirty per-host status files before merge — they are written
+      # every tick by the status hook and cause frequent merge conflicts
+      # when the other machine has pushed its own copies.
+      local stashed=false
+      if ! git -C "$PWD" diff --quiet -- ".claude/backlog-status-"*".json" 2>/dev/null; then
+        if git -C "$PWD" stash push -- ".claude/backlog-status-"*".json" 2>/dev/null; then
+          stashed=true
+        fi
+      fi
       if ! git -C "$PWD" merge --ff-only "origin/$branch" 2>&1 | sed 's/^/  [git] /' | tee -a "$LOG_FILE"; then
         echo "  [git] fast-forward merge failed (continuing)" | tee -a "$LOG_FILE"
       fi
+      if [[ "$stashed" == "true" ]]; then
+        git -C "$PWD" stash pop 2>/dev/null || git -C "$PWD" stash drop 2>/dev/null || true
+      fi
     else
+      # Stash dirty per-host files before resetting to avoid losing
+      # status data written by this machine's status hook.
+      local stashed=false
+      if ! git -C "$PWD" diff --quiet -- ".claude/backlog-status-"*".json" 2>/dev/null; then
+        if git -C "$PWD" stash push -- ".claude/backlog-status-"*".json" 2>/dev/null; then
+          stashed=true
+        fi
+      fi
       echo "  [git] local diverged from origin/${branch}; resetting to sync" | tee -a "$LOG_FILE"
       git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
+      if [[ "$stashed" == "true" ]]; then
+        git -C "$PWD" stash pop 2>/dev/null || git -C "$PWD" stash drop 2>/dev/null || true
+      fi
     fi
     head_after="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
     if [[ -n "$head_before" && -n "$head_after" && "$head_before" != "$head_after" ]]; then
@@ -1077,6 +1139,29 @@ do_install_daemon() {
       sleep 1; i=$((i + 1))
     done
   fi
+
+  # Retire any OLD-label daemons for this project so we don't end up with two
+  # daemons (old + new label) racing for the same backlog. Pre-migration
+  # installs used the `.backlog` symlink label or the even older `.backlog-loop`
+  # label; both must be booted out AND their plists removed — leaving a plist
+  # with RunAtLoad on disk would resurrect the daemon on the next login/reboot,
+  # and maybe_install_daemon treats a stray old plist as "already installed".
+  local old_suffix old_label old_plist
+  for old_suffix in backlog backlog-loop; do
+    old_label="com.${USER}.${project}.${old_suffix}"
+    old_plist="$HOME/Library/LaunchAgents/${old_label}.plist"
+    if launchctl print "gui/$(id -u)/${old_label}" >/dev/null 2>&1; then
+      echo "booting out old-label daemon ${old_label}"
+      launchctl bootout "gui/$(id -u)/${old_label}" 2>/dev/null || true
+      local j=0
+      while launchctl print "gui/$(id -u)/${old_label}" >/dev/null 2>&1 && (( j < 10 )); do
+        sleep 1; j=$((j + 1))
+      done
+    fi
+    if [[ -f "$old_plist" ]]; then
+      rm -f "$old_plist" && echo "removed old-label plist ${old_plist}"
+    fi
+  done
 
   # Always clear any stale mkdir-lock before bootstrap. A prior daemon may
   # have been SIGKILL'd (by bootout's 5s timeout escalation, by a manual

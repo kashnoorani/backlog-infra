@@ -549,7 +549,9 @@ async function main() {
   // Only stage per-host files — STATUS_FILE (shared) causes M1 ↔ M3 conflicts.
   // HOST_STATUS_FILE is unique per machine, HISTORY_LOG is append-only (merges
   // clean), COOLDOWN_FILE is shared but rarely changes.
-  git(["add", HOST_STATUS_FILE, HISTORY_LOG, COOLDOWN_FILE]);
+  const addFiles = [HOST_STATUS_FILE, HISTORY_LOG];
+  if (existsSync(COOLDOWN_FILE)) addFiles.push(COOLDOWN_FILE);
+  git(["add", ...addFiles]);
 
   // Skip commit if nothing was staged (defensive — appended JSONL line
   // means the diff is always non-empty in practice).

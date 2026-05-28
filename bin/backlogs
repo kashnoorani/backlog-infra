@@ -136,6 +136,12 @@ snapshot() {
 
   local -a rows=()
 
+  # Fleet-wide host tracking (cross-machine).
+  local this_host; this_host="$(hostname)"
+  this_host_short="${this_host%.local}"
+  local fleet_hosts_set='|'
+  local this_machine_projects=0
+
   # Dedupe candidates by realpath.
   local -a candidates=()
   local root proj_dir
@@ -202,30 +208,53 @@ snapshot() {
     fi
     [[ "$last_exit" != "0" ]] && state_color="$RD"
 
-    local sum_5h=0 sum_right=0
+    local sum_5h=0 sum_right=0 active_host="—" hosts_csv="" has_this_work="false"
     if [[ -n "$log" ]]; then
       local out
       out="$(jq -s -r \
-        --argjson c5h "$cutoff_5h" --argjson cR "$cutoff_right" '
+        --argjson c5h "$cutoff_5h" --argjson cR "$cutoff_right" --arg thisHost "$this_host" '
         def norm: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
-        [ .[] | { t: (.ts | norm), tok: (.tokens // 0) } ] as $rs
-        | "\(([$rs[] | select(.t >= $c5h) | .tok] | add // 0)) " +
-          "\(([$rs[] | select(.t >= $cR)  | .tok] | add // 0))"
-      ' "$log" 2>/dev/null || echo "0 0")"
-      read -r sum_5h sum_right <<< "$out"
+        ([ .[] | { t: (.ts | norm), tok: (.tokens // 0), h: (.host // "") } ] | sort_by(.t)) as $rs
+        | ([$rs[] | select(.tok > 0)] | last | .h // "—") as $host
+        | ([$rs[].h // empty] | unique | join(",")) as $hosts
+        | "\($host)|" +
+          "\(([$rs[] | select(.t >= $c5h) | .tok] | add // 0))|" +
+          "\(([$rs[] | select(.t >= $cR)  | .tok] | add // 0))|" +
+          "\($hosts)|" +
+          "\([$rs[] | select(.h == $thisHost and .tok > 0)] | length > 0)"
+      ' "$log" 2>/dev/null || printf '%s\n' "—|0|0||false")"
+      IFS='|' read -r active_host sum_5h sum_right hosts_csv has_this_work <<< "$out"
     fi
+
+    local active_host_short="${active_host%.local}"
+    (( ${#active_host_short} > 14 )) && active_host_short="${active_host_short:0:11}…"
+
+    # Fleet-wide host tracking
+    if [[ -n "$hosts_csv" ]]; then
+      local h
+      IFS=',' read -ra host_arr <<< "$hosts_csv"
+      for h in "${host_arr[@]}"; do
+        [[ -z "$h" ]] && continue
+        h="${h%.local}"
+        case "$fleet_hosts_set" in
+          *"|$h|"*) ;;
+          *) fleet_hosts_set="${fleet_hosts_set}${h}|" ;;
+        esac
+      done
+    fi
+    [[ "$has_this_work" == "true" ]] && this_machine_projects=$((this_machine_projects + 1))
 
     local age_str="—"
     [[ -n "$tick_epoch" ]] && age_str="$(fmt_age $age)"
     local item_short="${current_item:-—}"
-    (( ${#item_short} > 48 )) && item_short="${item_short:0:45}…"
+    (( ${#item_short} > 40 )) && item_short="${item_short:0:37}…"
 
     local log_mb="—"
     if [[ -n "$log" ]]; then
       log_mb="$(awk -v b="$(wc -c < "$log")" 'BEGIN{printf "%.2fM", b/1048576}')"
     fi
 
-    rows+=("$name"$'\t'"$age_str"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb")
+    rows+=("$name"$'\t'"$age_str"$'\t'"$active_host_short"$'\t'"$item_short"$'\t'"$state"$'\t'"$state_color"$'\t'"$(fmt_tok $sum_5h)"$'\t'"$(fmt_tok $sum_right)"$'\t'"$last_pull"$'\t'"$log_mb")
   done
 
   # ---- header ----
@@ -249,7 +278,7 @@ snapshot() {
   # Health summary: count daemon states and watchdog status.
   local fresh=0 idle=0 stale=0
   for row in "${rows[@]}"; do
-    local st; st="${row#*$'\t'*$'\t'*$'\t'}"
+    local st; st="${row#*$'\t'*$'\t'*$'\t'*$'\t'}"
     st="${st%%$'\t'*}"
     case "$st" in
       fresh) fresh=$((fresh + 1)) ;;
@@ -258,6 +287,13 @@ snapshot() {
     esac
   done
   local total=$((fresh + idle + stale))
+
+  local fleet_host_count
+  fleet_host_count="$(echo "${fleet_hosts_set#|}" | tr '|' '\n' | grep -c . 2>/dev/null || echo 0)"
+  printf '  %s%d machines%s known  |  this machine (%s%s%s): active on %s%d%s of %d projects\n' \
+    "$B" "$fleet_host_count" "$RS" \
+    "$B" "$this_host_short" "$RS" \
+    "$GN" "$this_machine_projects" "$RS" "$total"
 
   # Fleet-wide backlog counts: sum open and done across all active projects.
   local total_open=0 total_done=0
@@ -294,21 +330,21 @@ snapshot() {
 
   echo
   if (( EFFORT )); then
-    printf '  %s%-20s %-11s %-48s %-7s %-5s %-7s %-7s %-8s%s\n' \
-      "$DIM" "PROJECT" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "LOG" "$RS"
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-5s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "LOG" "$RS"
   else
-    printf '  %s%-20s %-11s %-48s %-7s %-5s %-7s %-7s%s\n' \
-      "$DIM" "PROJECT" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "$RS"
+    printf '  %s%-18s %-14s %-11s %-40s %-7s %-5s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "HOST" "LAST TICK" "ITEM" "STATE" "PULL" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
-    local name age item state state_color s5h sR pulled log_mb
-    IFS=$'\t' read -r name age item state state_color s5h sR pulled log_mb <<< "$row"
+    local name age host item state state_color s5h sR pulled log_mb
+    IFS=$'\t' read -r name age host item state state_color s5h sR pulled log_mb <<< "$row"
     if (( EFFORT )); then
-      printf '  %-20s %-11s %-48s %s%-7s%s %-5s %-7s %-7s %-8s\n' \
-        "$name" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR" "$log_mb"
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-5s %-7s %-7s %-8s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR" "$log_mb"
     else
-      printf '  %-20s %-11s %-48s %s%-7s%s %-5s %-7s %-7s\n' \
-        "$name" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR"
+      printf '  %-18s %-14s %-11s %-40s %s%-7s%s %-5s %-7s %-7s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$pulled" "$s5h" "$sR"
     fi
   done
 }

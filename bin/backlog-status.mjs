@@ -207,14 +207,23 @@ function extractUsage(path) {
 // ---------- backlog markers ----------
 function countBacklogMarkers() {
   const f = findBacklogFile();
-  const counts = { open: 0, in_progress: 0, blocked: 0, done: 0 };
+  const counts = { thinking: 0, open: 0, in_progress: 0, blocked: 0, done: 0 };
   if (!f) return counts;
-  // Accept both bare `[ ] foo` (legacy) and GFM `- [ ] foo` (canonical).
+  let section = null;
   for (const line of readFileSync(f, "utf8").split("\n")) {
-    if (/^(- )?\[ \] /.test(line)) counts.open++;
-    else if (/^(- )?\[~\] /.test(line)) counts.in_progress++;
-    else if (/^(- )?\[\?\] /.test(line)) counts.blocked++;
-    else if (/^(- )?\[x\] /.test(line)) counts.done++;
+    if (/^## Thinking/i.test(line))   { section = "thinking"; continue; }
+    if (/^## Open/i.test(line))       { section = "open"; continue; }
+    if (/^## In progress/i.test(line)) { section = "in_progress"; continue; }
+    if (/^## Blocked/i.test(line))    { section = "blocked"; continue; }
+    if (/^## Done/i.test(line))       { section = "done"; continue; }
+    if (/^## /i.test(line))           { section = null; continue; }
+    if (!section) continue;
+    if (/^(- )?\[ \] /.test(line)) {
+      if (section === "thinking") counts.thinking++;
+      else if (section === "open") counts.open++;
+    } else if (/^(- )?\[~\] /.test(line)) { counts.in_progress++; }
+    else if (/^(- )?\[\?\] /.test(line))  { counts.blocked++; }
+    else if (/^(- )?\[x\] /.test(line))   { counts.done++; }
   }
   return counts;
 }

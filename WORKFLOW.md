@@ -325,24 +325,19 @@ Two CLIs cover everything else:
     present (a per-project housekeeping helper that collapses older
     `Done` entries).
 
-- **`backlogs`** (at `~/dev/projects/active/backlog-infra/bin/backlogs`) — fleet view. Two scopes
-  shown together in the default snapshot:
-  - **BACKLOG EFFORT (this machine)** — scans every
-    `~/.claude/projects/*/*.jsonl` from the last 8 days (every
-    Claude Code session on this host: interactive, `claude -p`,
-    `/ultrareview`, all of it), dedupes assistant messages by
-    `message.id`, sums `input + output + cache_creation` tokens
-    inside rolling 5h and 7d windows. If
-    `~/.claude/backlog-budgets.json` exists, bullet-graphs against
-    your self-imposed targets. NOT a mirror of Anthropic's
-    `/usage` — that tracks messages per fixed-reset window; this
-    tracks tokens per rolling-now window. Use `/usage` in Claude
-    Code for plan budget.
-  - **Per-project table (cross-machine)** — reads each repo's
-    `.claude/backlog-status.json` + `.claude/backlog-history.jsonl`
-    from `~/dev/projects/active/*` (and `~/dev/projects/*` as fallback).
-    Liveness state (`fresh` <30min / `idle` <2h / `STALE` ≥2h).
-    Token columns sum across all hosts that pushed into the repo.
+- **`backlogs`** (at `~/dev/projects/active/backlog-infra/bin/backlogs`) — fleet view.
+  Two layers in the default snapshot:
+  - **Machine summary** — scans history JSONL files across every
+    project, dedupes unique hostnames, and shows how many projects this
+    machine has done non-zero work on. Separates "fleet" (projects) from
+    "machines" (hosts) visually.
+  - **Per-project table (cross-machine, per-host annotated)** — reads
+    each repo's `.claude/backlog-status.json` +
+    `.claude/backlog-history.jsonl` from `~/dev/projects/active/*`
+    (and `~/dev/projects/*` as fallback). Every row shows the last
+    host that did non-zero-token work on that project. Liveness
+    state (`fresh` <30min / `idle` <2h / `STALE` ≥2h). Token
+    columns sum across all hosts that pushed into the repo.
 
   Subcommands: `backlogs sync` (pull dotfiles, re-run `kash_setup.sh`,
   pull every active project, restart every backlog launchd daemon, then

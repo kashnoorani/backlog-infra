@@ -8,6 +8,12 @@ to retry. The autonomous worker (see `/watch-backlog` or `backlog
 run`) picks `- [ ]` and `- [!]` items and skips `- [?]`; surface those
 to the user when waking them.
 
+Items parked in `## Thinking` are never picked by the daemon — move
+them to `## Open` when ready for work.
+
+## Thinking
+(none)
+
 ## Open
 (none)
 

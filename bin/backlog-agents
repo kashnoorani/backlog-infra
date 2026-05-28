@@ -468,16 +468,29 @@ snapshot() {
     printf ', watchdog %s✗%s\n' "$RD" "$RS"
   fi
 
-  # Monitor daemon status
-  local mon_status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status.json"
+  # Monitor daemon status — aggregate from per-host files
+  local mon_status_dir="$ACTIVE_ROOT/backlog-infra/.claude"
   if launchctl print "gui/$(id -u)/com.${USER}.backlog-agents-monitor" >/dev/null 2>&1; then
-    if [[ -f "$mon_status_file" ]]; then
-      local mon_sweeps mon_fixed mon_flagged mon_last
-      mon_sweeps="$(jq -r '.sweeps_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
-      mon_fixed="$(jq -r '.fixed_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
-      mon_flagged="$(jq -r '.flagged_total // 0' "$mon_status_file" 2>/dev/null || echo 0)"
-      printf '  monitor: %sactive%s  sweeps: %s%d%s  fixed: %s%d%s  flagged: %s%d%s\n' \
-        "$GN" "$RS" "$B" "$mon_sweeps" "$RS" "$GN" "$mon_fixed" "$RS" "$YL" "$mon_flagged" "$RS"
+    local mon_sweeps=0 mon_fixed=0 mon_flagged=0 mon_hosts=0
+    local ms_file
+    for ms_file in "$mon_status_dir"/monitor-status-*.json; do
+      [[ -f "$ms_file" ]] || continue
+      mon_sweeps=$(( mon_sweeps + $(jq -r '.sweeps_total // 0' "$ms_file" 2>/dev/null || echo 0) ))
+      mon_fixed=$(( mon_fixed + $(jq -r '.fixed_total // 0' "$ms_file" 2>/dev/null || echo 0) ))
+      mon_flagged=$(( mon_flagged + $(jq -r '.flagged_total // 0' "$ms_file" 2>/dev/null || echo 0) ))
+      mon_hosts=$(( mon_hosts + 1 ))
+    done
+    # Also accept legacy single file
+    local leg="$mon_status_dir/monitor-status.json"
+    if [[ -f "$leg" ]]; then
+      mon_sweeps=$(( mon_sweeps + $(jq -r '.sweeps_total // 0' "$leg" 2>/dev/null || echo 0) ))
+      mon_fixed=$(( mon_fixed + $(jq -r '.fixed_total // 0' "$leg" 2>/dev/null || echo 0) ))
+      mon_flagged=$(( mon_flagged + $(jq -r '.flagged_total // 0' "$leg" 2>/dev/null || echo 0) ))
+      mon_hosts=$(( mon_hosts + 1 ))
+    fi
+    if (( mon_hosts > 0 )); then
+      printf '  monitor: %sactive%s (%d host%s)  sweeps: %s%d%s  fixed: %s%d%s  flagged: %s%d%s\n' \
+        "$GN" "$RS" "$mon_hosts" "$([[ $mon_hosts -eq 1 ]] && echo '' || echo 's')" "$B" "$mon_sweeps" "$RS" "$GN" "$mon_fixed" "$RS" "$YL" "$mon_flagged" "$RS"
     else
       printf '  monitor: %sactive%s (no status file yet)\n' "$GN" "$RS"
     fi
@@ -1098,7 +1111,7 @@ do_monitor() {
 
   local this_host; this_host="$(hostname)"
   this_host="${this_host%.local}"
-  local status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status.json"
+  local status_file="$ACTIVE_ROOT/backlog-infra/.claude/monitor-status-${this_host}.json"
   local sweeps_total=0 fixed_total=0 flagged_total=0
   local log_tail_lines=150
   local _last_status_commit=0

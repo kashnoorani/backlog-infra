@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.DS_Store
+.claude/backlog.log
+.claude/backlog.lock/
+.claude/launchd-stdout.log
+.claude/launchd-stderr.log
+opencode.json

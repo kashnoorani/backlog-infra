@@ -1,0 +1,702 @@
+#!/usr/bin/env bash
+# dev-projects — lifecycle for active projects under ~/dev/projects/active/.
+#
+# The filesystem on your primary machine is the source of truth. This tool
+# keeps a manifest at ~/dotfiles/active-projects.txt in sync with the
+# filesystem so other machines can mirror the set via kash_setup.sh.
+#
+# Subcommands:
+#   dev-projects new <name> [--no-daemon] [--no-gh]
+#       Scaffold a brand-new project from ~/dev/projects/active/backlog-infra/templates/dev-project/
+#       into ~/dev/projects/active/<name>/, git init + initial commit,
+#       create a private repo at kashnoorani/<name> on GitHub, push, add
+#       to manifest, and (unless --no-daemon) run `backlog install-daemon`.
+#       --no-gh skips repo creation (local-only scaffold).
+#
+#   dev-projects activate <github-url> [<local-name>] [--no-daemon]
+#       Clone the repo into ~/dev/projects/active/<name>/, add to manifest,
+#       commit + push dotfiles, and (unless --no-daemon) run
+#       `backlog install-daemon`. <local-name> defaults to the repo basename.
+#
+#   dev-projects archive <name>
+#       Move ~/dev/projects/active/<name>/ → ~/dev/projects/archived/<name>/,
+#       remove from manifest, commit + push, and (if a launchd backlog daemon
+#       exists for it) bootout that daemon.
+#
+#   dev-projects sync
+#       Walk the active/ tree, rewrite the manifest to match the filesystem.
+#       For each active repo that has an installed backlog launchd plist
+#       (either label form), verify the plist's WorkingDirectory matches the
+#       current location; patch + restart if not. Commit + push if the
+#       manifest changed.
+#
+#   dev-projects install-daemons
+#       Install a backlog daemon for every active project that has a backlog
+#       file but no installed launchd plist. Idempotent: projects with an
+#       existing daemon are skipped.
+#
+#   dev-projects list
+#       Print the manifest. Doesn't read the filesystem; shows the wire format.
+#
+#   dev-projects status
+#       Three-column read: filesystem (active/), manifest, daemons. Flags
+#       drift between any pair (e.g., "in manifest but not on disk").
+#
+#   dev-projects watch-daemons [--interval <seconds>] [--once]
+#       Run install-daemons in a loop, scanning for new projects every
+#       <interval> seconds (default 1800 = 30 min). Intended to run as a
+#       launchd daemon. --once runs a single scan and exits (for testing).
+#
+#   dev-projects install-watchdog
+#       Install a launchd plist that runs `dev-projects watch-daemons` as a
+#       background daemon, auto-detecting new projects on the configured
+#       interval. Idempotent: replaces an existing plist if present.
+#
+#   dev-projects uninstall-watchdog
+#       Boot out and remove the watchdog launchd plist.
+#
+# Daemon plist labels are polyglot during the migration:
+#   com.${USER}.<name>.backlog        (new — written by `backlog install-daemon`)
+#   com.${USER}.<name>.backlog-loop   (legacy — pre-migration daemons)
+# Discovery checks both, preferring the new form.
+#
+# Manifest format (~/dotfiles/active-projects.txt):
+#   One repo per line: `<relative-path-under-active>\t<git-url>`.
+#   Lines starting with `#` or empty lines are ignored.
+#   Relative-path lets a clone live at a different name than the URL basename
+#   (e.g., RallyCut.git → active/RallyCut-claude/).
+
+set -euo pipefail
+
+DOTFILES="$HOME/dotfiles"
+MANIFEST="$DOTFILES/active-projects.txt"
+ACTIVE_ROOT="$HOME/dev/projects/active"
+ARCHIVED_ROOT="$HOME/dev/projects/archived"
+
+err() { echo "dev-projects: $*" >&2; }
+fail() { err "$@"; exit 1; }
+info() { echo "→ $*"; }
+ok() { echo "  ✓ $*"; }
+
+# Portable equivalents of `grep -qP "^<name>\t"` / `grep -vP "^<name>\t"`.
+# BSD grep on macOS doesn't support -P, so use awk for TSV matching.
+# tsv_has <input> <name>  → exit 0 if a line with first column == name
+tsv_has() {
+  awk -F'\t' -v n="$2" '$1==n {found=1} END{exit found?0:1}' <<< "$1"
+}
+# tsv_drop <input> <name>  → echo input with rows matching first col == name removed
+tsv_drop() {
+  awk -F'\t' -v n="$2" '$1!=n' <<< "$1"
+}
+
+# ----- helpers -----
+
+# Print the plist path for <name>'s installed backlog daemon, preferring the
+# new label form over the legacy one. Returns non-zero if neither exists.
+find_daemon_plist() {
+  local name="$1" p
+  for suffix in backlog backlog-loop; do
+    p="$HOME/Library/LaunchAgents/com.${USER}.${name}.${suffix}.plist"
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# Label string (filename minus .plist) for a given plist path.
+daemon_label_for() {
+  basename "$1" .plist
+}
+
+# Print "<rel-path>\t<git-url>" for each git repo found under $ACTIVE_ROOT
+# (up to 2 levels deep, so both active/<repo>/ and active/<workspace>/<repo>/
+# are caught). Sorted by relative path.
+discover_active_repos() {
+  [[ -d "$ACTIVE_ROOT" ]] || return 0
+  find "$ACTIVE_ROOT" -mindepth 2 -maxdepth 3 -name '.git' -type d 2>/dev/null \
+    | while read -r git_dir; do
+        local repo_dir rel url
+        repo_dir="$(dirname "$git_dir")"
+        rel="${repo_dir#$ACTIVE_ROOT/}"
+        url="$(git -C "$repo_dir" remote get-url origin 2>/dev/null)" || continue
+        # Normalize GitHub https → ssh so fresh-machine clones don't hit
+        # password-auth (kash_setup.sh assumes ssh, like the dotfiles clone).
+        url="${url/#https:\/\/github.com\//git@github.com:}"
+        printf '%s\t%s\n' "$rel" "$url"
+      done | sort
+}
+
+read_manifest() {
+  [[ -f "$MANIFEST" ]] || return 0
+  grep -v '^[[:space:]]*\(#\|$\)' "$MANIFEST" || true
+}
+
+write_manifest() {
+  local content="$1"
+  mkdir -p "$(dirname "$MANIFEST")"
+  {
+    echo "# Active projects manifest — consumed by kash_setup.sh on new"
+    echo "# machines to mirror the set of repos under ~/dev/projects/active/."
+    echo "# Format: <relative-path-under-active>\\t<git-url>"
+    echo "# Edit via \`dev-projects activate / archive / sync\`."
+    echo
+    echo "$content"
+  } > "$MANIFEST"
+}
+
+# Bootout + lock-cleanup + bootstrap for a single daemon label.
+# $1 = label (e.g., com.${USER}.sacred-geography.backlog)
+# $2 = repo path (for lock cleanup)
+# $3 = plist path
+restart_daemon() {
+  local label="$1" repo="$2" plist="$3"
+  info "restarting daemon $label"
+  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    # Wait up to 15s for full teardown (avoids the "Input/output error" race).
+    for _ in $(seq 1 15); do
+      launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 || break
+      sleep 1
+    done
+  fi
+  rmdir "$repo/.claude/backlog.lock"      2>/dev/null || true
+  rmdir "$repo/.claude/backlog-loop.lock" 2>/dev/null || true
+  if launchctl bootstrap "gui/$(id -u)" "$plist" 2>&1; then
+    ok "daemon $label running"
+  else
+    err "bootstrap failed for $label — investigate manually"
+    return 1
+  fi
+}
+
+commit_and_push_manifest() {
+  local subject="$1"
+  if git -C "$DOTFILES" diff --quiet -- active-projects.txt 2>/dev/null \
+     && ! git -C "$DOTFILES" ls-files --error-unmatch active-projects.txt >/dev/null 2>&1; then
+    # Untracked but unchanged — fall through to add
+    :
+  elif git -C "$DOTFILES" diff --quiet -- active-projects.txt 2>/dev/null; then
+    info "manifest unchanged; skipping commit"
+    return 0
+  fi
+  git -C "$DOTFILES" add active-projects.txt
+  if git -C "$DOTFILES" diff --cached --quiet; then
+    info "no staged manifest changes; skipping commit"
+    return 0
+  fi
+  git -C "$DOTFILES" commit -m "$subject"
+  ok "manifest committed"
+  if git -C "$DOTFILES" push origin main 2>&1; then
+    ok "manifest pushed"
+  else
+    err "push failed; manifest is committed locally — push manually when ready"
+  fi
+}
+
+# ----- subcommands -----
+
+cmd_new() {
+  local name="" no_daemon=0 no_gh=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-daemon) no_daemon=1 ;;
+      --no-gh)     no_gh=1 ;;
+      -*)          fail "unknown flag: $1" ;;
+      *)           [[ -z "$name" ]] && name="$1" || fail "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+  [[ -n "$name" ]] || fail "usage: dev-projects new <name> [--no-daemon] [--no-gh]"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || fail "name must match [A-Za-z0-9._-]+"
+
+  local dest="$ACTIVE_ROOT/$name"
+  local template="$DOTFILES/templates/dev-project"
+  [[ -d "$template" ]]  || fail "template dir not found at $template"
+  [[ -e "$dest" ]]      && fail "$dest already exists"
+
+  if (( no_gh == 0 )); then
+    command -v gh >/dev/null 2>&1 || fail "gh CLI not installed (brew install gh) — or pass --no-gh"
+    gh auth status >/dev/null 2>&1 || fail "gh not authenticated (run: gh auth login) — or pass --no-gh"
+    if gh repo view "kashnoorani/$name" >/dev/null 2>&1; then
+      fail "GitHub repo kashnoorani/$name already exists"
+    fi
+  fi
+
+  mkdir -p "$ACTIVE_ROOT"
+  info "scaffolding $dest from $template"
+  cp -R "$template" "$dest"
+  # Substitute __PROJECT_NAME__ throughout the copied tree.
+  while IFS= read -r f; do
+    sed -i '' "s|__PROJECT_NAME__|$name|g" "$f"
+  done < <(find "$dest" -type f)
+  ok "scaffolded"
+
+  info "initializing git"
+  git -C "$dest" init -q -b main
+  git -C "$dest" add .
+  git -C "$dest" commit -q -m "initial scaffold from dev-project template"
+  ok "initial commit"
+
+  local url
+  if (( no_gh == 0 )); then
+    info "creating private GitHub repo kashnoorani/$name"
+    ( cd "$dest" && gh repo create "kashnoorani/$name" --private --source=. --push )
+    url="git@github.com:kashnoorani/${name}.git"
+    ok "github repo created and pushed"
+  else
+    url="(local-only — no remote)"
+  fi
+
+  # Append to manifest if not already listed.
+  local current new_line="$name"$'\t'"$url"
+  current="$(read_manifest)"
+  if tsv_has "$current" "$name"; then
+    info "manifest already lists $name; not appending"
+  else
+    if [[ -n "$current" ]]; then
+      write_manifest "$current"$'\n'"$new_line"
+    else
+      write_manifest "$new_line"
+    fi
+    ok "manifest updated"
+  fi
+  (( no_gh == 0 )) && commit_and_push_manifest "dev-projects: new $name"
+
+  # Optional daemon install (best-effort; never fail the whole command on this).
+  if (( no_daemon == 0 )); then
+    if command -v backlog >/dev/null 2>&1; then
+      info "installing backlog daemon"
+      ( cd "$dest" && backlog install-daemon ) \
+        || err "daemon install failed — run manually with: cd $dest && backlog install-daemon"
+    else
+      info "backlog driver not on PATH; skipping daemon install"
+    fi
+  fi
+
+  echo
+  info "next steps:"
+  echo "    cd $dest"
+  echo "    # 1. Fill in package.json scripts (build / deploy:preview / deploy)"
+  echo "    #    — see WORKFLOW.md \"Bootstrap checklist\" step 5"
+  echo "    # 2. Adjust scripts/release.mjs if your CDN isn't Cloudflare Pages"
+  echo "    # 3. Copy CLAUDE.md sections (Backlog draining + Release workflow)"
+  echo "    #    from ~/dev/projects/active/sacred-geography/CLAUDE.md"
+  echo "    # 4. On your CDN, set the production branch to 'release'"
+  echo "    # 5. Populate docs/Backlog.md with first items"
+}
+
+cmd_activate() {
+  local url="" name="" no_daemon=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-daemon) no_daemon=1 ;;
+      -*)          fail "unknown flag: $1" ;;
+      *)
+        if [[ -z "$url" ]]; then url="$1"
+        elif [[ -z "$name" ]]; then name="$1"
+        else fail "unexpected argument: $1"
+        fi
+        ;;
+    esac
+    shift
+  done
+  [[ -n "$url" ]] || fail "usage: dev-projects activate <github-url> [<local-name>] [--no-daemon]"
+  if [[ -z "$name" ]]; then
+    name="${url##*/}"
+    name="${name%.git}"
+  fi
+  local dest="$ACTIVE_ROOT/$name"
+  if [[ -e "$dest" ]]; then
+    fail "$dest already exists"
+  fi
+  mkdir -p "$ACTIVE_ROOT"
+  info "cloning $url → $dest"
+  git clone "$url" "$dest"
+  ok "cloned"
+
+  # Append to manifest (relative path = $name).
+  local current new_line="$name"$'\t'"$url"
+  current="$(read_manifest)"
+  if tsv_has "$current" "$name"; then
+    info "manifest already lists $name; not appending"
+  else
+    if [[ -n "$current" ]]; then
+      write_manifest "$current"$'\n'"$new_line"
+    else
+      write_manifest "$new_line"
+    fi
+    ok "manifest updated"
+  fi
+  commit_and_push_manifest "dev-projects: activate $name ($url)"
+
+  # Install daemon if the project has a backlog file. Best-effort; missing
+  # backlog file just means this isn't a workflow-stack project (skip silently).
+  if (( no_daemon == 0 )); then
+    if [[ -f "$dest/docs/Backlog.md" || -f "$dest/Backlog.md" || -f "$dest/backlog.txt" ]]; then
+      if command -v backlog >/dev/null 2>&1; then
+        info "installing backlog daemon"
+        ( cd "$dest" && backlog install-daemon ) \
+          || err "daemon install failed — run manually with: cd $dest && backlog install-daemon"
+      else
+        info "backlog driver not on PATH; skipping daemon install"
+      fi
+    else
+      info "no backlog file in $dest; skipping daemon install (pass --no-daemon to silence)"
+    fi
+  fi
+
+  echo
+  info "next steps: cd $dest"
+}
+
+cmd_archive() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || fail "usage: dev-projects archive <name>"
+  local src="$ACTIVE_ROOT/$name"
+  local dest="$ARCHIVED_ROOT/$name"
+  [[ -d "$src" ]] || fail "$src not found"
+  [[ -e "$dest" ]] && fail "$dest already exists"
+
+  # Stop the daemon first (if any). Polyglot: try the new label form, then
+  # the legacy one. Both are booted out if both exist (defensive — shouldn't
+  # happen, but cheap to handle).
+  local stopped=""
+  for suffix in backlog backlog-loop; do
+    local label="com.${USER}.${name}.${suffix}"
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      info "stopping daemon $label"
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      stopped="$label"
+    fi
+  done
+  [[ -n "$stopped" ]] && ok "daemon stopped"
+
+  mkdir -p "$ARCHIVED_ROOT"
+  info "moving $src → $dest"
+  mv "$src" "$dest"
+  ok "moved"
+
+  # Remove from manifest.
+  local current
+  current="$(read_manifest)"
+  local filtered
+  filtered="$(tsv_drop "$current" "$name")"
+  if [[ "$filtered" != "$current" ]]; then
+    write_manifest "$filtered"
+    ok "manifest updated"
+    commit_and_push_manifest "dev-projects: archive $name"
+  else
+    info "manifest had no entry for $name; no change"
+  fi
+  echo
+  local leftover
+  if leftover="$(find_daemon_plist "$name")"; then
+    info "note: the launchd plist at $leftover is left in place."
+    info "      \`rm\` it manually if you want the agent fully gone."
+  fi
+}
+
+cmd_sync() {
+  info "scanning $ACTIVE_ROOT"
+  local discovered
+  discovered="$(discover_active_repos)"
+  local count
+  count="$(echo "$discovered" | grep -c . || true)"
+  ok "found $count active repo(s)"
+
+  if [[ -n "$discovered" ]]; then
+    write_manifest "$discovered"
+  else
+    write_manifest ""
+  fi
+  ok "manifest written"
+
+  # Check installed launchd plists for path drift. Polyglot: both new
+  # (com.${USER}.<name>.backlog) and legacy (.backlog-loop) labels.
+  info "checking daemon plists for path drift"
+  local fixed_any=0
+  while IFS=$'\t' read -r rel url; do
+    [[ -z "$rel" ]] && continue
+    local name="${rel##*/}"   # daemon name = leaf of relative path
+    for suffix in backlog backlog-loop; do
+      local label="com.${USER}.${name}.${suffix}"
+      local plist="$HOME/Library/LaunchAgents/${label}.plist"
+      [[ -f "$plist" ]] || continue
+      local expected="$ACTIVE_ROOT/$rel"
+      local current_wd
+      current_wd="$(grep -A1 'WorkingDirectory' "$plist" | tail -1 | sed -E 's|.*<string>(.*)</string>.*|\1|')"
+      if [[ "$current_wd" != "$expected" ]]; then
+        info "patching $plist (was: $current_wd → now: $expected)"
+        # Replace EVERY occurrence of the old path with the new path (covers
+        # WorkingDirectory + StandardOut/ErrPath which all share the same prefix).
+        sed -i '' "s|$current_wd|$expected|g" "$plist"
+        ok "plist patched"
+        restart_daemon "$label" "$expected" "$plist" || true
+        fixed_any=1
+      fi
+    done
+  done <<< "$discovered"
+  (( fixed_any == 0 )) && ok "all daemon plists already match filesystem"
+
+  commit_and_push_manifest "dev-projects: sync manifest from filesystem"
+}
+
+cmd_install_daemons() {
+  local BACKLOG_BIN="$HOME/dev/projects/active/backlog-infra/bin/backlog"
+  if [[ ! -x "$BACKLOG_BIN" ]]; then
+    fail "backlog driver not found at $BACKLOG_BIN"
+  fi
+  info "scanning $ACTIVE_ROOT for projects without a backlog daemon"
+  local installed=0 skipped_existing=0 skipped_no_backlog=0 failed=0
+  local discovered
+  discovered="$(discover_active_repos)"
+  while IFS=$'\t' read -r rel url; do
+    [[ -z "$rel" ]] && continue
+    local name="${rel##*/}"
+    local dest="$ACTIVE_ROOT/$rel"
+    if find_daemon_plist "$name" >/dev/null; then
+      info "$name: daemon already installed; skipping"
+      skipped_existing=$((skipped_existing + 1))
+      continue
+    fi
+    if [[ ! -f "$dest/docs/Backlog.md" && ! -f "$dest/Backlog.md" && ! -f "$dest/backlog.txt" ]]; then
+      info "$name: no backlog file; skipping"
+      skipped_no_backlog=$((skipped_no_backlog + 1))
+      continue
+    fi
+    info "installing daemon for $name"
+    if ( cd "$dest" && "$BACKLOG_BIN" install-daemon ); then
+      ok "$name daemon installed"
+      installed=$((installed + 1))
+    else
+      err "$name daemon install failed"
+      failed=$((failed + 1))
+    fi
+  done <<< "$discovered"
+  echo
+  ok "installed: $installed | already-installed: $skipped_existing | no-backlog: $skipped_no_backlog | failed: $failed"
+}
+
+cmd_list() {
+  if [[ ! -f "$MANIFEST" ]]; then
+    echo "(no manifest yet at $MANIFEST — run \`dev-projects sync\`)"
+    return
+  fi
+  cat "$MANIFEST"
+}
+
+cmd_status() {
+  local DIM=$'\e[2m' RS=$'\e[0m' GN=$'\e[32m' YL=$'\e[33m' RD=$'\e[31m'
+
+  local fs manifest
+  fs="$(discover_active_repos)"
+  manifest="$(read_manifest)"
+
+  printf '%-30s %-12s %-12s %s\n' "REPO" "ON DISK" "MANIFEST" "DAEMON"
+
+  # Build a combined name set
+  local all_names
+  all_names="$( { echo "$fs"; echo "$manifest"; } | awk -F$'\t' 'NF>0 {print $1}' | sort -u)"
+
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local on_disk="${RD}no${RS}" in_man="${RD}no${RS}" daemon="${DIM}—${RS}"
+    if tsv_has "$fs" "$rel"; then
+      on_disk="${GN}yes${RS}"
+    fi
+    if tsv_has "$manifest" "$rel"; then
+      in_man="${GN}yes${RS}"
+    fi
+    local name="${rel##*/}"
+    local plist
+    if plist="$(find_daemon_plist "$name")"; then
+      local label; label="$(daemon_label_for "$plist")"
+      if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        daemon="${GN}running${RS}"
+      else
+        daemon="${YL}installed${RS}"
+      fi
+    fi
+    printf '%-30s %-22s %-22s %s\n' "$rel" "$on_disk" "$in_man" "$daemon"
+  done <<< "$all_names"
+}
+
+# XML-escape a string for safe interpolation into a plist heredoc.
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"
+  s="${s//</&lt;}"
+  s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+# Health check: for every active project with a daemon, verify the daemon
+# has ticked recently. If last_tick_at is > 2h old, restart the daemon.
+# Called from the watchdog loop so stale daemons self-heal within 30 min.
+cmd_health_check() {
+  local discovered
+  discovered="$(discover_active_repos)"
+  local stale_count=0
+  while IFS=$'\t' read -r rel url; do
+    [[ -z "$rel" ]] && continue
+    local name="${rel##*/}"
+    local dest="$ACTIVE_ROOT/$rel"
+    local status_json="$dest/.claude/backlog-status.json"
+    [[ -f "$status_json" ]] || continue
+    local last_tick now age
+    last_tick="$(jq -r '.last_tick_at // empty' "$status_json" 2>/dev/null || echo "")"
+    [[ -n "$last_tick" ]] || continue
+    now="$(date +%s)"
+    local tick_epoch; tick_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%S' "${last_tick%.*Z}" '+%s' 2>/dev/null || echo "")"
+    [[ -z "$tick_epoch" ]] && tick_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$last_tick" '+%s' 2>/dev/null || echo "")"
+    [[ -z "$tick_epoch" ]] && continue
+    age=$(( now - tick_epoch ))
+    if (( age > 7200 )); then
+      local plist
+      if plist="$(find_daemon_plist "$name")"; then
+        warn "$name: last tick $(fmt_age $age) — restarting daemon"
+        local label; label="$(daemon_label_for "$plist")"
+        restart_daemon "$label" "$dest" "$plist" || true
+        stale_count=$((stale_count + 1))
+      fi
+    fi
+  done <<< "$discovered"
+  (( stale_count == 0 )) && ok "all daemons healthy" || true
+}
+
+cmd_watch_daemons() {
+  [[ -x "$HOME/dev/projects/active/backlog-infra/bin/backlog" ]] || fail "backlog driver not found at $HOME/dev/projects/active/backlog-infra/bin/backlog"
+  local interval=1800 once=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval) interval="$2"; shift 2 ;;
+      --once)     once=1; shift ;;
+      -*)         fail "unknown flag: $1" ;;
+      *)          fail "unexpected argument: $1" ;;
+    esac
+  done
+  [[ "$interval" -ge 60 ]] || fail "--interval must be >= 60 seconds"
+    if (( once == 1 )); then
+    info "single scan (--once)"
+    cmd_install_daemons
+    cmd_health_check
+    return
+  fi
+  info "watching for new projects every ${interval}s (ctrl-c to stop)"
+  while true; do
+    echo
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] scanning..."
+    cmd_install_daemons
+    cmd_health_check
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] sleeping ${interval}s"
+    sleep "$interval"
+  done
+}
+
+cmd_install_watchdog() {
+  local label="com.${USER}.dev-projects-watchdog"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local bin_path
+  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+  mkdir -p "$HOME/Library/LaunchAgents"
+
+  if [[ -f "$plist" ]]; then
+    info "replacing existing watchdog plist"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    local i=0
+    while launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 && (( i < 10 )); do
+      sleep 1; i=$((i + 1))
+    done
+  fi
+
+  local label_x bin_path_x home_x
+  label_x="$(xml_escape "$label")"
+  bin_path_x="$(xml_escape "$bin_path")"
+  home_x="$(xml_escape "$HOME")"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label_x}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${bin_path_x}</string>
+        <string>watch-daemons</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${home_x}/dev/projects/active/backlog-infra/bin:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${home_x}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>${home_x}/Library/Logs/dev-projects-watchdog.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${home_x}/Library/Logs/dev-projects-watchdog.stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  mkdir -p "$HOME/Library/Logs"
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    fail "bootstrap failed for ${label}. plist is at $plist."
+  fi
+  ok "watchdog daemon installed: ${label}"
+  info "  plist: ${plist}"
+  info "  logs:  ~/Library/Logs/dev-projects-watchdog.{stdout,stderr}.log"
+  info "  status: launchctl print gui/\$(id -u)/${label}"
+}
+
+cmd_uninstall_watchdog() {
+  local label="com.${USER}.dev-projects-watchdog"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+
+  if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+    launchctl bootout "gui/$(id -u)/${label}" || true
+    ok "booted out ${label}"
+  fi
+  if [[ -f "$plist" ]]; then
+    rm "$plist"
+    ok "removed ${plist}"
+  else
+    info "no watchdog plist at ${plist}; nothing to remove."
+  fi
+}
+
+# ----- dispatch -----
+
+cmd="${1:-}"; shift 2>/dev/null || true
+case "$cmd" in
+  new)      cmd_new      "$@" ;;
+  activate) cmd_activate "$@" ;;
+  archive)  cmd_archive  "$@" ;;
+  sync)             cmd_sync     "$@" ;;
+  install-daemons)  cmd_install_daemons "$@" ;;
+  list)             cmd_list     "$@" ;;
+  status)           cmd_status   "$@" ;;
+  watch-daemons)    cmd_watch_daemons "$@" ;;
+  install-watchdog) cmd_install_watchdog ;;
+  uninstall-watchdog) cmd_uninstall_watchdog ;;
+  ""|-h|--help)
+    sed -n '2,67p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+  *) fail "unknown subcommand: $cmd (try \`dev-projects --help\`)" ;;
+esac

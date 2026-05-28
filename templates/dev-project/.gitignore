@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
+
+# Per-user Claude Code config
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/backlog.log
+.claude/backlog.lock
+.claude/launchd-stdout.log
+.claude/launchd-stderr.log
+
+# OpenCode workspace config
+opencode.json

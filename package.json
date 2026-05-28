@@ -1,0 +1,7 @@
+{
+  "name": "backlog-infra",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Autonomous backlog daemon system — per-project backlogs, fleet tools, project templates, and release pipeline.",
+  "type": "module"
+}

@@ -409,26 +409,125 @@ cooldown_until_str() {
     | sed -E 's/.*"([^"]*)"$/\1/' | head -n1 || true
 }
 
-# Arm a cooldown: write COOLDOWN_FILE with `until_epoch` COOLDOWN_SECONDS in
-# the future, plus ISO timestamps for humans. `date -u -r EPOCH` is BSD
-# (macOS); `date -u -d @EPOCH` is the GNU (Linux) fallback.
+# Arm a cooldown: write COOLDOWN_FILE. If $1 is a numeric epoch (parsed
+# from claude's "resets X:XXpm" message), use it directly; otherwise fall
+# back to COOLDOWN_SECONDS from now.
 start_cooldown() {
   mkdir -p "$STATE_DIR"
-  local now until_epoch until_iso detected_iso
+  local now until_epoch until_iso detected_iso parsed_from
   now="$(date +%s)"
-  until_epoch=$(( now + COOLDOWN_SECONDS ))
+  if [[ -n "${1:-}" ]] && [[ "$1" =~ ^[0-9]+$ ]]; then
+    until_epoch="$1"
+    parsed_from="true"
+  else
+    until_epoch=$(( now + COOLDOWN_SECONDS ))
+    parsed_from="false"
+  fi
   until_iso="$(date -u -r "$until_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
             || date -u -d "@$until_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '')"
   detected_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '')"
+  local reason="anthropic-plan-limit"
   cat > "$COOLDOWN_FILE" <<JSON
 {
   "until": "${until_iso}",
   "until_epoch": ${until_epoch},
-  "reason": "anthropic-plan-limit",
-  "detected_at": "${detected_iso}"
+  "reason": "${reason}",
+  "detected_at": "${detected_iso}",
+  "parsed_from_reset": ${parsed_from}
 }
 JSON
-  echo "  [cooldown] plan/session limit detected — pausing claude ticks until ${until_iso:-+${COOLDOWN_SECONDS}s} (rm ${COOLDOWN_FILE} to clear)" | tee -a "$LOG_FILE"
+  local wait_info
+  if [[ "$parsed_from" == "true" ]]; then
+    wait_info="until ${until_iso:-?} (parsed from claude output)"
+  else
+    wait_info="until ${until_iso:-+${COOLDOWN_SECONDS}s}"
+  fi
+  echo "  [cooldown] plan/session limit detected — pausing claude ticks ${wait_info} (rm ${COOLDOWN_FILE} to clear)" | tee -a "$LOG_FILE"
+}
+
+# ---- helpers: parse claude's "resets X:XXpm" into an epoch ----
+
+# Convert "3:45pm" or "12:00am" to "HH:MM:SS" (24h).
+__time_to_24h() {
+  local t="$1"
+  t="$(echo "$t" | sed -E 's/([0-9])([ap]m)/\1 \2/i')"
+  local hour="${t%%:*}" rest="${t#*:}" min="${rest%%[apAP ]*}"
+  local ampm; ampm="$(echo "$rest" | tr '[:upper:]' '[:lower:]' | grep -o '[ap]m' || true)"
+  hour="${hour// /}"; min="${min// /}"
+  if [[ "$ampm" == "pm" ]]; then
+    if [[ "$hour" != "12" ]]; then hour=$(( hour + 12 )); fi
+  else
+    if [[ "$hour" == "12" ]]; then hour=0; fi
+  fi
+  printf '%02d:%02d:00' "$hour" "$min"
+}
+
+# Parse date+time string to epoch. macOS first, GNU fallback.
+__date_parse() {
+  local str="$1"
+  date -j -f '%Y-%m-%d %H:%M:%S' "$str" '+%s' 2>/dev/null \
+    || date -d "$str" '+%s' 2>/dev/null \
+    || echo ""
+}
+
+# Add N days to an epoch.
+__date_add_days() {
+  local epoch="$1" days="$2"
+  date -j -v+"${days}"d -f '%s' "$epoch" '+%s' 2>/dev/null \
+    || date -d "@${epoch} +${days} days" '+%s' 2>/dev/null \
+    || echo ""
+}
+
+# Parse time-only reset like "3:45pm" → epoch.
+__parse_time_only() {
+  local time_str="$1" now_epoch="$2" today hms epoch
+  today="$(date '+%Y-%m-%d')"
+  hms="$(__time_to_24h "$time_str")"
+  epoch="$(__date_parse "${today} ${hms}")"
+  [[ -z "$epoch" ]] && { echo ""; return 0; }
+  if (( epoch <= now_epoch )); then
+    epoch="$(__date_add_days "$epoch" 1)"
+  fi
+  echo "${epoch:-}"
+}
+
+# Parse day+time reset like "Mon 12:00am" → epoch.
+__parse_day_time() {
+  local day_time="$1" now_epoch="$2" day_str time_str today hms epoch
+  day_str="${day_time%% *}"; time_str="${day_time#* }"
+  today="$(date '+%Y-%m-%d')"
+  hms="$(__time_to_24h "$time_str")"
+  epoch="$(__date_parse "${today} ${hms}")"
+  [[ -z "$epoch" ]] && { echo ""; return 0; }
+  local target_num=0
+  case "$day_str" in
+    Mon) target_num=1 ;; Tue) target_num=2 ;; Wed) target_num=3 ;;
+    Thu) target_num=4 ;; Fri) target_num=5 ;; Sat) target_num=6 ;;
+    Sun) target_num=7 ;; *) echo ""; return 0 ;;
+  esac
+  local current_num; current_num="$(date '+%u')"
+  local days_ahead=$(( (target_num - current_num + 7) % 7 ))
+  if (( days_ahead == 0 )); then
+    if (( epoch <= now_epoch )); then days_ahead=7; fi
+  fi
+  if (( days_ahead > 0 )); then
+    epoch="$(__date_add_days "$epoch" "$days_ahead")"
+  fi
+  echo "${epoch:-}"
+}
+
+# Extract "resets X:XXpm" from claude output, return epoch (or "").
+_parse_reset_to_epoch() {
+  local capture_file="$1" raw reset_str now_epoch
+  raw="$(grep -oiE 'resets[[:space:]]+([A-Z][a-z]{2}[[:space:]]+)?[0-9]{1,2}:[0-9]{2}[ap]m' "$capture_file" 2>/dev/null | head -n1 || true)"
+  [[ -z "$raw" ]] && { echo ""; return 0; }
+  reset_str="$(echo "$raw" | sed -E 's/.*resets[[:space:]]+//i')"
+  now_epoch="$(date +%s)"
+  if echo "$reset_str" | grep -qiE '^[a-z]{3}[[:space:]][0-9]'; then
+    __parse_day_time "$reset_str" "$now_epoch"
+  else
+    __parse_time_only "$reset_str" "$now_epoch"
+  fi
 }
 
 tick_once() {
@@ -612,7 +711,12 @@ tick_once() {
     # cooldown so subsequent ticks idle gracefully instead of re-failing
     # every heartbeat until the rolling window resets.
     if grep -qiE "$PLAN_LIMIT_REGEX" "$capture_file" 2>/dev/null; then
-      start_cooldown
+      local parsed_epoch; parsed_epoch="$(_parse_reset_to_epoch "$capture_file")"
+      if [[ -n "$parsed_epoch" ]]; then
+        start_cooldown "$parsed_epoch"
+      else
+        start_cooldown
+      fi
     fi
     if [[ "$claimed" == "true" ]]; then
       _local_awk_inplace "$BACKLOG_FILE" '

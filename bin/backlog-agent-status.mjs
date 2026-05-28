@@ -45,6 +45,7 @@ const CLAUDE_DIR = join(REPO_ROOT, ".claude");
 const STATUS_FILE = join(CLAUDE_DIR, "backlog-status.json");
 const HOST_STATUS_FILE = join(CLAUDE_DIR, `backlog-status-${hostname()}.json`);
 const HISTORY_LOG = join(CLAUDE_DIR, "backlog-history.jsonl");
+const COOLDOWN_FILE = join(CLAUDE_DIR, "agent-cooldown.json");
 const PLAN_LIMITS = join(homedir(), ".claude", "plan-limits.json");
 const TRANSCRIPTS_ROOT = join(homedir(), ".claude", "projects");
 
@@ -478,6 +479,16 @@ async function main() {
         try { return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name; }
         catch { return REPO_ROOT.split("/").pop(); }
       })();
+      let cdEpoch = 0, cdReason = null;
+      if (existsSync(COOLDOWN_FILE)) {
+        try {
+          const cd = JSON.parse(readFileSync(COOLDOWN_FILE, "utf8"));
+          if (cd.until_epoch && cd.until_epoch > Date.now() / 1000) {
+            cdEpoch = cd.until_epoch;
+            cdReason = cd.reason || null;
+          }
+        } catch {}
+      }
       fetch("https://kash-backlogs.pages.dev/api/health-ingest", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
@@ -489,6 +500,8 @@ async function main() {
           last_exit_code: statusObj.last_exit_code,
           last_tokens: statusObj.last_tokens,
           last_commit: statusObj.last_work_commit,
+          cooldown_until_epoch: cdEpoch,
+          cooldown_reason: cdReason,
         }),
       }).then(r => { if (!r.ok) console.error(`health push failed: ${r.status}`); })
         .catch(e => console.error(`health push error: ${e.message}`));
@@ -533,7 +546,7 @@ async function main() {
   }
 
   // Stage explicit paths (per CLAUDE.md — never `git add -A`)
-  git(["add", STATUS_FILE, HOST_STATUS_FILE, HISTORY_LOG]);
+  git(["add", STATUS_FILE, HOST_STATUS_FILE, HISTORY_LOG, COOLDOWN_FILE]);
 
   // Skip commit if nothing was staged (defensive — appended JSONL line
   // means the diff is always non-empty in practice).

@@ -1,13 +1,13 @@
 {
-  "last_tick_at": "2026-05-28T06:45:54.536Z",
+  "last_tick_at": "2026-05-28T06:46:04.665Z",
   "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
-  "last_item": "Implement Layer 2: plan-limit detection + cooldown file + short-circuit in `tick_once`. Verify the plan-limit signature first by reading a real `.claude/backlog-agent.log` failure.",
+  "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 88933,
-  "last_work_commit": "a8ad273",
+  "last_work_commit": null,
   "last_pull_count": 0,
-  "rolling_7d_tokens": 1403141,
+  "rolling_7d_tokens": 1492074,
   "backlog": {
     "thinking": 1,
     "open": 0,
@@ -22,7 +22,7 @@
         "path": ".claude/backlog-agent-tick.inflight"
       }
     ],
-    "unpushed_commits": 1,
-    "computed_at": "2026-05-28T06:45:56.678Z"
+    "unpushed_commits": 0,
+    "computed_at": "2026-05-28T06:46:06.641Z"
   }
 }

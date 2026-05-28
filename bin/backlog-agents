@@ -33,7 +33,7 @@
 #   --effort   add log-size column
 #   --day      bucket right column by today instead of 7d
 #   --compact  single-line per project, skip machines table
-#   --artefacts show uncommitted changes per host per project
+#   --artifacts show uncommitted changes per host per project
 #
 # Sync flags:
 #   --no-pull         skip dotfiles + project pulls (just restart agents)
@@ -568,8 +568,8 @@ snapshot() {
     echo
   fi
 
-  # ---- artefacts ----
-  if (( ARTEFACTS )); then
+  # ---- artifacts ----
+  if (( ARTIFACTS )); then
     local art_n=0 art_any=0
     local art_lines=()
     for proj_dir in "${unique[@]}"; do
@@ -598,7 +598,7 @@ snapshot() {
       done
     done
     if (( art_any )); then
-      printf '  %sARTEFACTS%s (%d file(s))\n' "${B}${CY}" "${RS}" "$art_n"
+      printf '  %sARTIFACTS%s (%d file(s))\n' "${B}${CY}" "${RS}" "$art_n"
       for line in "${art_lines[@]}"; do printf '%s\n' "$line"; done
     echo
   fi
@@ -875,7 +875,7 @@ do_uninstall_watchdog() {
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
-FETCH=0; WATCH=0; EFFORT=0; DAY=0; COMPACT=0; ARTEFACTS=0
+FETCH=0; WATCH=0; EFFORT=0; DAY=0; COMPACT=0; ARTIFACTS=0
 
 cmd="${1:-}"
 case "$cmd" in
@@ -896,7 +896,7 @@ case "$cmd" in
         --effort) EFFORT=1 ;;
         --day)    DAY=1 ;;
         --compact) COMPACT=1 ;;
-        --artefacts) ARTEFACTS=1 ;;
+        --artifacts) ARTIFACTS=1 ;;
         *) echo "backlog-agents: unknown flag: $arg" >&2; exit 2 ;;
       esac
     done

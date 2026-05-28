@@ -336,9 +336,13 @@ async function main() {
       ? currentHead.slice(0, 7)
       : null;
 
-  // Pull --rebase BEFORE writing local artefacts so a clean working tree
-  // lets rebase proceed without --autostash heroics. If origin/<branch>
-  // doesn't exist (no upstream), skip.
+  // Pull --rebase BEFORE writing local artefacts so origin is current.
+  // Uses explicit fetch + rebase origin/<branch> instead of `git pull
+  // --rebase` to bypass branch-tracking config. `git pull --rebase` can
+  // fail with "Cannot rebase onto multiple branches" when
+  // branch.<name>.merge has multiple values or the upstream resolves
+  // ambiguously. Explicit commands are immune to config drift.
+  // If origin/<branch> doesn't exist (no upstream), skip.
   const upstreamExists =
     spawnSync(
       "git",
@@ -346,9 +350,8 @@ async function main() {
       { cwd: REPO_ROOT },
     ).status === 0;
   if (upstreamExists) {
-    // Stash any dirty files before pull --rebase. Claude may leave unstaged
-    // changes in the working tree if it exits abnormally; without a stash,
-    // `git pull --rebase` fails with "You have unstaged changes."
+    // Stash any dirty files before rebase. Claude may leave unstaged
+    // changes in the working tree if it exits abnormally.
     let stashed = false;
     const stashR = spawnSync(
       "git",
@@ -357,15 +360,21 @@ async function main() {
     );
     stashed = stashR.status === 0 && !stashR.stdout.includes("No local changes");
 
-    const r = git(["pull", "--rebase", "origin", branch], { allowFail: true });
-    if (r.status !== 0) {
+    // Fetch first (always safe, no-op on failure).
+    const fetchR = spawnSync(
+      "git", ["fetch", "origin"],
+      { cwd: REPO_ROOT, encoding: "utf8" },
+    );
+    if (fetchR.status !== 0) {
+      console.error(`[backlog-agent-status] git fetch failed (continuing):\n${fetchR.stderr}`);
+    }
+
+    // Rebase onto origin/<branch> (explicit ref, no tracking config needed).
+    const rebaseR = git(["rebase", `origin/${branch}`], { allowFail: true });
+    if (rebaseR.status !== 0) {
       console.error(
-        `[backlog-agent-status] git pull --rebase failed (continuing):\n${r.stderr}`,
+        `[backlog-agent-status] git rebase failed (continuing):\n${rebaseR.stderr}`,
       );
-      // If the rebase left an in-progress state (e.g. conflict in a work
-      // file like docs/Backlog.md from divergent work across machines),
-      // abort it so the next tick doesn't walk into a broken repo.
-      // `git rebase --abort` is a no-op when no rebase is in progress.
       git(["rebase", "--abort"], { allowFail: true });
     }
 
@@ -403,8 +412,12 @@ async function main() {
   // Write artefacts
   mkdirSync(CLAUDE_DIR, { recursive: true });
 
-  // On idle ticks (no tokens spent), preserve previous host/item/tokens so the
-  // fleet dashboard and machines tab reflect the last machine that did real work.
+  // On idle ticks (no tokens spent), preserve previous item/tokens so the
+  // fleet dashboard shows what was last worked on even during idle periods.
+  // last_host is NOT preserved — the "LAST BY" column in the fleet dashboard
+  // reads from the history JSONL (append-only per-host records), not from
+  // this field. Preserving it across idle ticks created a phantom last-writer-
+  // wins race with no consumer.
   let statusHost = host;
   let statusItem = opts.item;
   let statusTokens = headline;
@@ -412,7 +425,6 @@ async function main() {
   if (headline === 0 && existsSync(STATUS_FILE)) {
     try {
       const prev = JSON.parse(readFileSync(STATUS_FILE, "utf8"));
-      statusHost = prev.last_host || host;
       statusItem = prev.last_item || opts.item;
       statusTokens = prev.last_tokens ?? headline;
       statusWorkCommit = prev.last_work_commit || workCommit;
@@ -433,9 +445,8 @@ async function main() {
     artifacts,
   };
   writeFileSync(STATUS_FILE, `${JSON.stringify(statusObj, null, 2)}\n`);
-  // Per-host file always records the local machine's hostname — never
-  // inherit the shared file's preserved last_host (that's for the fleet
-  // "LAST BY" column, not for per-machine attribution).
+  // Per-host file always records the local machine — used by the fleet
+  // dashboard's artefacts and per-machine views.
   writeFileSync(
     HOST_STATUS_FILE,
     `${JSON.stringify({ ...statusObj, last_host: host }, null, 2)}\n`,

@@ -13,6 +13,7 @@ them to `## Open` when ready for work.
 
 ## Thinking
 - [ ] Implement Layer 3: opt-in `~/.claude/agent-fallback.json`, OpenCode invocation, status-hook extension to log `agent=` in the trailer.
+- [ ] Fully doc the architecture and design of our backlog-infra including nice diagrams. Explain the thought process behind key decisions and factors considered and why we decided the way we did.
 
 (see `docs/multi-agent-design.md` for full design)
 

@@ -1,13 +1,13 @@
 {
-  "last_tick_at": "2026-05-28T04:11:07.777Z",
-  "last_host": "Kash-MBA-M1-16GB.local",
+  "last_tick_at": "2026-05-28T04:41:13.043Z",
+  "last_host": "Kash-MBA-M1-16GB",
   "last_mode": "loop",
   "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 71221,
   "last_work_commit": null,
   "last_pull_count": 0,
-  "rolling_7d_tokens": 1060655,
+  "rolling_7d_tokens": 1131876,
   "backlog": {
     "thinking": 0,
     "open": 0,

@@ -831,7 +831,7 @@ daemon_paths() {
   project="$(basename "$project_root")"
   label="com.${USER}.${project}.backlog-agent"
   plist_path="$HOME/Library/LaunchAgents/${label}.plist"
-  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")"
   printf '%s\n%s\n%s\n%s\n%s\n' "$project_root" "$project" "$label" "$plist_path" "$bin_path"
 }
 

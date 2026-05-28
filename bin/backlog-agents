@@ -469,6 +469,12 @@ snapshot() {
         else                       ms="stale"; msc="$RD"
         fi
       fi
+      # For the local machine, project count = actual installed daemons.
+      # For remote machines, use history-derived count as a proxy.
+      local show_proj="$mp"
+      if [[ "$mh" == "$this_host" || "$mh" == "${this_host%.local}" ]]; then
+        show_proj="$local_daemons"
+      fi
       # DAEMONS: for this machine, show local plist count + watchdog indicator.
       # For other machines, show project count (proxy for daemon count).
       local daemon_str=""
@@ -481,10 +487,10 @@ snapshot() {
         daemon_str="${mp} d"
       fi
       printf '  %-20s %-9d %-10s %-11s %-11s %-8s %s%-7s%s\n' \
-        "$mh_short" "$mp" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+        "$mh_short" "$show_proj" "$m5h" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
     done <<< "$sorted_hosts"
 
-        echo
+    echo
   fi
 
   if (( EFFORT )) ; then

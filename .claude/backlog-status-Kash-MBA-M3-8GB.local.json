@@ -1,14 +1,14 @@
 {
-  "last_tick_at": "2026-05-28T22:07:29.739Z",
+  "last_tick_at": "2026-05-28T22:09:37.993Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
   "last_item": "",
   "last_exit_code": 0,
   "last_tokens": 15592,
   "last_work_commit": null,
-  "last_pull_count": 0,
+  "last_pull_count": 4,
   "last_session_id": "e03da41a-3782-4b2a-92d1-4785ce437cd4",
-  "rolling_7d_tokens": 316097,
+  "rolling_7d_tokens": 358633,
   "backlog": {
     "thinking": 0,
     "open": 0,
@@ -17,17 +17,8 @@
     "done": 0
   },
   "artifacts": {
-    "uncommitted": [
-      {
-        "status": " M",
-        "path": "bin/backlog-agent"
-      },
-      {
-        "status": " M",
-        "path": "docs/cross-machine-locking.md"
-      }
-    ],
+    "uncommitted": [],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-28T22:07:31.547Z"
+    "computed_at": "2026-05-28T22:09:40.020Z"
   }
 }

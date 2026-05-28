@@ -447,7 +447,7 @@ cmd_sync() {
 
 cmd_install_daemons() {
   local AGENT_BIN="$HOME/dev/projects/active/backlog-infra/bin/backlog-agent"
-  if [[ ! -x "$BACKLOG_BIN" ]]; then
+  if [[ ! -x "$AGENT_BIN" ]]; then
     fail "backlog-agent driver not found at $AGENT_BIN"
   fi
   info "scanning $ACTIVE_ROOT for projects without an agent"

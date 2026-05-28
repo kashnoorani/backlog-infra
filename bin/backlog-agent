@@ -93,6 +93,11 @@ DEBOUNCE_SECONDS=2
 # Format: space-separated seconds at each streak level (1st idle, 2nd, …).
 ESCALATING_IDLE_SLEEP="30 60 120 300 600 1800"
 STATE_DIR=".claude"
+# Per-tick mutex (distinct from the daemon-lifetime process lock LOCK_DIR).
+# do_run drives tick_once from two contexts — the polling loop and the
+# fswatch subshell — so a single live daemon can otherwise run two ticks
+# at once. Held only for the duration of one tick. See tick_once.
+TICK_LOCK_DIR="${STATE_DIR}/backlog-agent.tick.lock"
 # Layer 2 (docs/multi-agent-design.md): when a tick hits the Anthropic
 # plan/session-limit, pause claude invocations for this long. The rolling
 # window resets on its own; after the cooldown expires we retry, and if
@@ -231,6 +236,9 @@ acquire_lock() {
   fi
   echo "lock at $LOCK_DIR is stale (recorded PID '${lock_pid:-?}' is gone); reclaiming." >&2
   rm -rf "$LOCK_DIR" 2>/dev/null
+  # A SIGKILL'd daemon skips release_lock, so a per-tick lock can survive it.
+  # Clear it here too or every future tick would mkdir-fail and skip forever.
+  [[ -n "${TICK_LOCK_DIR:-}" ]] && rm -rf "$TICK_LOCK_DIR" 2>/dev/null
   [[ -n "${INFLIGHT_FILE:-}" ]] && rm -f "$INFLIGHT_FILE" 2>/dev/null
   # Flip any orphaned [~] items back to [ ] so the daemon picks them up on
   # its next tick. These are items that were mid-tick when the previous daemon
@@ -256,6 +264,9 @@ acquire_lock() {
 }
 release_lock() {
   rm -rf "$LOCK_DIR" 2>/dev/null || true
+  # Drop any per-tick lock too, so a daemon that exits mid-tick (errexit or
+  # SIGTERM) doesn't leave a lock that blocks every tick of the next daemon.
+  [[ -n "${TICK_LOCK_DIR:-}" ]] && rm -rf "$TICK_LOCK_DIR" 2>/dev/null || true
   # If a tick was mid-flight when we got signaled, drop the sentinel so
   # `backlog-agent` doesn't report a phantom in-flight tick after the daemon exits.
   [[ -n "${INFLIGHT_FILE:-}" ]] && rm -f "$INFLIGHT_FILE" 2>/dev/null || true
@@ -625,6 +636,21 @@ _maybe_auto_complete() {
 
 tick_once() {
   local ts pre_head item_title claude_exit
+
+  # Per-tick mutex. do_run runs the polling loop AND an fswatch subshell that
+  # fires whenever BACKLOG_FILE changes — including the daemon's OWN claim /
+  # reclaim commits. Without this, the two drivers can run tick_once
+  # concurrently, each claiming the same item and spawning its own claude.
+  # The process lock (acquire_lock) is held for the daemon's whole lifetime
+  # and does NOT serialize ticks within one daemon. Take a short-lived lock
+  # here; if another tick holds it, skip silently. Released via the RETURN
+  # trap below; cleared across daemon restarts by release_lock / acquire_lock.
+  if ! mkdir "$TICK_LOCK_DIR" 2>/dev/null; then
+    TICK_OUTCOME=idle
+    return 0
+  fi
+  trap 'rmdir "$TICK_LOCK_DIR" 2>/dev/null || true' RETURN
+
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
   {
     echo

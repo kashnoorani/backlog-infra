@@ -245,6 +245,25 @@ GATE_TIMEOUT_SECS="${GATE_TIMEOUT_SECS:-600}"
 # Set to 1 in tests / to hard-disable verification (forces the fail-open path).
 GATE_DISABLE="${GATE_DISABLE:-0}"
 
+# --- Secret-scanning pre-push gate (W2; docs/secret-scan.md) ---
+# Unlike Guards 1-4 (all POST-push: flag/reopen an already-pushed commit), a
+# secret gate must run BEFORE the push — a published key can't be un-published.
+# Since the daemon does NOT mediate claude's `git push`, prevention lives in a
+# per-clone git `pre-push` HOOK that runs the scanner and rejects the push on a
+# hit. The driver's job is keeping that hook installed + current (ensure-on-tick,
+# below) — NOT scanning post-hoc. A belt-and-suspenders POST-push scan (Guard 5,
+# in the Guards 2/3 block) still DETECTS + alerts if a clone is missing the hook
+# (fresh machine pre-first-tick, hand-edited .git/hooks, `push --no-verify`).
+#   - SECRET_SCAN_BIN: the standalone scanner (ONE source of truth for the regex
+#     set), resolved next to this driver. Shared by the hook, Guard 5, the CLI.
+#   - PREPUSH_HOOK_VERSION / PREPUSH_HOOK_MARKER / prepush_hook_body: defined in
+#     _lib.sh (shared with the CLI). ensure_prepush_hook + doctor rewrite any
+#     clone whose hook marker differs; a hook NOT carrying our marker is a
+#     FOREIGN user hook — left untouched (never clobbered).
+SECRET_SCAN_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/backlog-secret-scan"
+# Set to 1 in tests / to hard-disable the secret gate (skips ensure + Guard 5).
+SECRET_SCAN_DISABLE="${SECRET_SCAN_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -1404,6 +1423,37 @@ run_gate() {
   return "$grc"
 }
 
+# --- Secret-scanning pre-push gate: install (docs/secret-scan.md) ---
+# The hook stub (prepush_hook_body), version/marker, and foreign/current
+# detectors live in _lib.sh — shared with the CLI's install-hooks + doctor.
+#
+# Ensure THIS repo's .git/hooks/pre-push is our current-version gate. Idempotent,
+# version-keyed, best-effort (never aborts a tick). Self-heals a missing/empty or
+# stale-version hook every tick; LEAVES a foreign hook (non-empty, no marker)
+# untouched so we never clobber a user's own pre-push hook. Echoes a one-line note
+# only on a (re)write or a foreign-hook skip.
+ensure_prepush_hook() {
+  [[ "$SECRET_SCAN_DISABLE" == "1" ]] && return 0
+  local gitdir; gitdir="$(git -C "$PWD" rev-parse --git-dir 2>/dev/null || true)"
+  [[ -n "$gitdir" ]] || return 0
+  case "$gitdir" in /*) : ;; *) gitdir="$PWD/$gitdir" ;; esac
+  local hook="$gitdir/hooks/pre-push"
+  # A NON-EMPTY pre-push hook without our marker is a real user hook — never
+  # clobber it (use `backlog-agents install-hooks --force`). Empty/missing ⇒ ok.
+  if prepush_hook_is_foreign "$hook"; then
+    echo "  [secret-scan] pre-push hook present but not ours — leaving foreign hook untouched (use \`backlog-agents install-hooks --force\` to replace)" | tee -a "$LOG_FILE"
+    return 0
+  fi
+  prepush_hook_is_current "$hook" && return 0
+  mkdir -p "$gitdir/hooks" 2>/dev/null || return 0
+  if prepush_hook_body "$SECRET_SCAN_BIN" > "$hook" 2>/dev/null; then
+    chmod +x "$hook" 2>/dev/null || true
+    echo "  [secret-scan] installed/updated pre-push gate (version ${PREPUSH_HOOK_VERSION})" | tee -a "$LOG_FILE"
+    log_event secret_hook_installed version "$PREPUSH_HOOK_VERSION"
+  fi
+  return 0
+}
+
 tick_once() {
   local ts pre_head item_title claude_exit
   # Layer 3: which agent runs this tick. "claude" normally; set to the fallback
@@ -1433,6 +1483,11 @@ tick_once() {
     echo "================================================================"
   } | tee -a "$LOG_FILE"
   log_event tick_start
+
+  # Self-heal the secret-scanning pre-push gate every tick (cheap file write,
+  # best-effort) — BEFORE any short-circuit so even an idle/heartbeat/cooldown
+  # tick keeps the clone's hook current. docs/secret-scan.md.
+  ensure_prepush_hook
 
   # --- Layer 2: plan-limit cooldown short-circuit (local + account-wide) ---
   # A prior tick may have hit the Anthropic plan/session cap and armed a
@@ -1996,6 +2051,27 @@ tick_once() {
           protected_hit="${protected_hit% }"
           echo "  [WARNING] protected-path guardrail: '${item_title}' modified protected file(s): ${protected_hit} — review this tick" | tee -a "$LOG_FILE"
           log_event protected_path_touched item "$item_title" paths "$protected_hit"
+        fi
+
+        # --- Guard 5 (W2): secret-scan post-push flag (docs/secret-scan.md) ---
+        # The pre-push HOOK is the real prevention (rejects claude's push before a
+        # key leaves the machine). This is belt-and-suspenders: if THIS clone was
+        # missing the hook (fresh machine pre-first-tick, hand-edited .git/hooks,
+        # `push --no-verify`), the commit is already pushed — we can't un-publish
+        # it, but we DETECT it and alert LOUDLY so the user can rotate the key.
+        # Flag-only, like Guards 2/3 (no reopen — the leak is in git history, and
+        # the actionable response is key rotation, not a code retry). Scoped to
+        # work_base..work_head; runs the builtin floor directly (no hook needed).
+        if [[ "$SECRET_SCAN_DISABLE" != "1" && -x "$SECRET_SCAN_BIN" ]]; then
+          local secret_out secret_rc=0
+          secret_out="$(SECRET_SCAN_DISABLE=0 "$SECRET_SCAN_BIN" --range "$work_base" "$work_head" 2>&1)" || secret_rc=$?
+          if [[ $secret_rc -ne 0 ]]; then
+            echo "  [WARNING] secret-scan: '${item_title}' pushed a commit with secret-like content (the pre-push hook was bypassed/absent) — ROTATE the key; it is in git history" | tee -a "$LOG_FILE"
+            log_event secret_detected item "$item_title" range "${work_base}..${work_head}"
+            local sshost; sshost="$(_health_host 2>/dev/null || hostname -s 2>/dev/null || echo '?')"
+            notify_send "backlog-agent SECRET LEAK: $(basename "$PWD")@${sshost}" \
+              "🔓 backlog-agent [$(basename "$PWD")@${sshost}] pushed a commit with secret-like content for item '${item_title}' (pre-push hook bypassed/absent). The secret is in git history — ROTATE it now. Range ${work_base}..${work_head}."
+          fi
         fi
 
         # --- Fleet-freeze auto-arm (docs/fleet-freeze.md §2) ---

@@ -1361,6 +1361,61 @@ do_uninstall_monitor() {
   fi
 }
 
+# ---- subcommand: install-hooks (secret-scanning pre-push gate) ----
+# Install/refresh the secret-scan pre-push hook in every active project's clone
+# (docs/secret-scan.md). The per-clone .git/hooks/pre-push is NOT version-
+# controlled, so it must be installed per (project × machine). The driver also
+# self-heals it on every tick (ensure_prepush_hook); this is the explicit
+# one-shot for a fresh machine (gate live before the first tick) + non-daemon
+# repos. Idempotent + version-keyed: rewrites a missing/stale-version hook,
+# LEAVES a foreign hook (one without our marker) untouched unless --force.
+do_install_hooks() {
+  local FORCE=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force) FORCE=1 ;;
+      *) echo "backlog-agents install-hooks: unknown flag: $arg" >&2; exit 2 ;;
+    esac
+  done
+  local scanner; scanner="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/backlog-secret-scan"
+  if [[ ! -x "$scanner" ]]; then
+    err "scanner not found/executable at $scanner — cannot install hooks"
+    exit 1
+  fi
+  local installed=0 current=0 foreign=0 skipped=0 proj pn gitdir hook
+  for proj in "$ACTIVE_ROOT"/*/; do
+    proj="${proj%/}"
+    [[ -d "$proj/.git" ]] || { [[ -e "$proj/.git" ]] || continue; }
+    pn="$(basename "$proj")"
+    gitdir="$(git -C "$proj" rev-parse --git-dir 2>/dev/null || true)"
+    [[ -n "$gitdir" ]] || { skipped=$((skipped+1)); continue; }
+    case "$gitdir" in /*) : ;; *) gitdir="$proj/$gitdir" ;; esac
+    hook="$gitdir/hooks/pre-push"
+    # A NON-EMPTY hook without our marker is a real user hook — leave it unless
+    # --force. Empty (0-byte) / missing ⇒ safe to (over)write.
+    if prepush_hook_is_foreign "$hook"; then
+      if (( FORCE )); then
+        warn "$pn: replacing FOREIGN pre-push hook (--force)"
+      else
+        warn "$pn: foreign pre-push hook present — leaving untouched (use --force to replace)"
+        foreign=$((foreign+1)); continue
+      fi
+    fi
+    if prepush_hook_is_current "$hook" && (( FORCE == 0 )); then
+      current=$((current+1)); continue
+    fi
+    mkdir -p "$gitdir/hooks" 2>/dev/null || { skipped=$((skipped+1)); continue; }
+    if prepush_hook_body "$scanner" > "$hook" 2>/dev/null; then
+      chmod +x "$hook" 2>/dev/null || true
+      ok "$pn: pre-push gate installed (version ${PREPUSH_HOOK_VERSION})"
+      installed=$((installed+1))
+    else
+      warn "$pn: failed to write $hook"; skipped=$((skipped+1))
+    fi
+  done
+  ok "install-hooks: ${installed} installed/updated, ${current} already current, ${foreign} foreign-left, ${skipped} skipped"
+}
+
 # ---- subcommand: migrate-daemons ----
 
 # Migrate old-style plists (com.${USER}.*.backlog.plist and
@@ -1996,6 +2051,23 @@ do_doctor() {
       _d_fail "$pn: no status hook resolves (and shared fallback missing)"
     elif command -v node >/dev/null 2>&1 && ! node --check "$hook" >/dev/null 2>&1; then
       _d_fail "$pn: status hook has a syntax error ($hook)"
+    fi
+    # Secret-scanning pre-push gate (docs/secret-scan.md): assert this clone
+    # carries the CURRENT-version hook. Missing/empty/stale ⇒ warn (the driver
+    # self-heals on the next tick; `install-hooks` is the one-shot). A NON-EMPTY
+    # foreign pre-push hook ⇒ warn (we won't clobber it without --force).
+    if [[ -e "$proj/.git" ]]; then
+      local pp_gitdir pp_hook
+      pp_gitdir="$(git -C "$proj" rev-parse --git-dir 2>/dev/null || true)"
+      if [[ -n "$pp_gitdir" ]]; then
+        case "$pp_gitdir" in /*) : ;; *) pp_gitdir="$proj/$pp_gitdir" ;; esac
+        pp_hook="$pp_gitdir/hooks/pre-push"
+        if prepush_hook_is_foreign "$pp_hook"; then
+          _d_warn "$pn: foreign pre-push hook (no secret gate; \`install-hooks --force\` to replace)"
+        elif ! prepush_hook_is_current "$pp_hook"; then
+          _d_warn "$pn: no current pre-push secret gate (run \`backlog-agents install-hooks\` or wait for the next tick)"
+        fi
+      fi
     fi
   done
   (( fails == 0 )) && _d_pass "status hooks resolve; ephemeral .claude/ set ignored & untracked"
@@ -2664,6 +2736,7 @@ case "$cmd" in
   uninstall-watchdog) do_uninstall_watchdog ;;
   install-monitor) do_install_monitor ;;
   uninstall-monitor) do_uninstall_monitor ;;
+  install-hooks) shift; do_install_hooks "$@" ;;
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)

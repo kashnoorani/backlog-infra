@@ -34,6 +34,12 @@ _setup_repo() {
   # it (ACCOUNT_COOLDOWN_DISABLE=0) behind a curl stub.
   export ACCOUNT_COOLDOWN_DISABLE=1
 
+  # Secret-scanning pre-push gate (bin/backlog-agent ensure_prepush_hook + Guard
+  # 5): disabled by default so ordinary tick tests don't install a pre-push hook
+  # into the throwaway repo or run a post-push scan; secret-scan.bats re-enables
+  # it (SECRET_SCAN_DISABLE=0).
+  export SECRET_SCAN_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

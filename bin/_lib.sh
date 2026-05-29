@@ -76,3 +76,47 @@ need_github_ssh() {
   echo "================================================================================" >&2
   return 1
 }
+
+# --- Secret-scanning pre-push gate (W2; docs/secret-scan.md) ---
+# Shared by the DRIVER (backlog-agent: ensure_prepush_hook + Guard 5) and the CLI
+# (backlog-agents: install-hooks + doctor) so the version, marker, and hook stub
+# have ONE definition. Bump PREPUSH_HOOK_VERSION when the stub changes — the next
+# tick / `install-hooks` rewrites every clone's hook; doctor flags stale ones.
+PREPUSH_HOOK_VERSION="1"
+PREPUSH_HOOK_MARKER="backlog secret-scan pre-push gate"
+
+# Emit the pre-push hook stub to stdout. $1 = absolute path to backlog-secret-scan.
+# Tiny on purpose: it execs the standalone scanner (the regex set has ONE home).
+# Fail-OPEN if the scanner can't be found (don't wedge a human's push); the
+# scanner itself fails CLOSED on an actual secret (exit 1 -> git aborts the push).
+prepush_hook_body() {
+  local scanner="$1"
+  cat <<EOF
+#!/usr/bin/env bash
+# ${PREPUSH_HOOK_MARKER} (version ${PREPUSH_HOOK_VERSION}) — auto-installed by backlog-agent; do not edit.
+# Rejects a push (exit 1) if a commit being pushed adds a secret. docs/secret-scan.md.
+SCANNER="${scanner}"
+[[ -x "\$SCANNER" ]] && exec "\$SCANNER" --prepush "\$@"
+command -v backlog-secret-scan >/dev/null 2>&1 && exec backlog-secret-scan --prepush "\$@"
+echo "backlog secret-scan: scanner not found on PATH; allowing push (fail-open)" >&2
+exit 0
+EOF
+}
+
+# True if a pre-push hook file should be treated as a FOREIGN user hook we must
+# not clobber: it exists, is NON-EMPTY, and lacks our marker. An empty (0-byte)
+# or missing file is NOT foreign — it's a no-op git ignores, safe to overwrite.
+# $1 = path to the hook file.
+prepush_hook_is_foreign() {
+  local hook="$1"
+  [[ -s "$hook" ]] || return 1                      # missing/empty ⇒ not foreign
+  grep -q "$PREPUSH_HOOK_MARKER" "$hook" 2>/dev/null && return 1   # ours ⇒ not foreign
+  return 0
+}
+
+# True if the hook at $1 is ours AND current-version (no rewrite needed).
+prepush_hook_is_current() {
+  local hook="$1"
+  [[ -s "$hook" ]] || return 1
+  grep -q "${PREPUSH_HOOK_MARKER} (version ${PREPUSH_HOOK_VERSION})" "$hook" 2>/dev/null
+}

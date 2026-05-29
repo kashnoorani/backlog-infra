@@ -178,6 +178,7 @@ snapshot() {
   _map_right=()       # parallel: right-column token sums
   _map_proj=()        # parallel: project counts
   _map_seen=()        # parallel: last tick epoch (max)
+  _map_driver=()      # parallel: driver SHA this host last reported (version-skew)
 
   _map_idx() {
     local k="$1" i
@@ -195,9 +196,18 @@ snapshot() {
       fi
     done
     _map_keys+=("$k")
-    _map_5h+=(0); _map_right+=(0); _map_proj+=(0); _map_seen+=(0)
+    _map_5h+=(0); _map_right+=(0); _map_proj+=(0); _map_seen+=(0); _map_driver+=("")
     _MAP_IDX=$((${#_map_keys[@]} - 1))
     return 0
+  }
+  # Record the driver SHA a host last reported (only for hosts already in the
+  # map; doesn't conjure phantom machines). Last write wins — all projects on a
+  # host run the same shared driver, so they agree.
+  _map_set_driver() {
+    local k="$1" v="$2" i
+    [[ -z "$v" || "$v" == "null" ]] && return 0
+    i="$(_map_idx "$k")" || return 0
+    _map_driver[$i]="$v"
   }
   _map_add() {
     _map_ensure "$1"
@@ -508,13 +518,36 @@ snapshot() {
 
   echo
 
+  # ---- driver version-skew (W1) ----
+  # Capture each host's reported driver SHA from its per-host status file, and
+  # compute the reference (origin/main's last bin commit). The MACHINES table
+  # flags any host whose driver differs from the reference — that's the "M1 ran
+  # the broken driver for hours because the fix was unpulled" incident, now a
+  # glance instead of a guess.
+  local dh_proj dh_file dh_key dh_sha
+  for dh_proj in "${unique[@]}"; do
+    for dh_file in "$dh_proj/.claude/backlog-status-"*.json; do
+      [[ -f "$dh_file" ]] || continue
+      dh_key="$(basename "$dh_file" .json)"; dh_key="${dh_key#backlog-status-}"
+      dh_key="${dh_key%.local}"   # map keys are .local-stripped (see _map_add)
+      dh_sha="$(jq -r '.driver_sha // empty' "$dh_file" 2>/dev/null || true)"
+      _map_set_driver "$dh_key" "$dh_sha"
+    done
+  done
+  local ref_driver_sha="" infra_dir="$ACTIVE_ROOT/backlog-infra"
+  if [[ -d "$infra_dir/.git" ]]; then
+    (( FETCH )) && git -C "$infra_dir" fetch -q origin 2>/dev/null || true
+    ref_driver_sha="$(git -C "$infra_dir" log -1 --format=%h origin/main -- bin 2>/dev/null || true)"
+    [[ -z "$ref_driver_sha" ]] && ref_driver_sha="$(git -C "$infra_dir" log -1 --format=%h -- bin 2>/dev/null || true)"
+  fi
+
   # ---- MACHINES table ----
   if (( ! COMPACT )); then
   if (( ${#_map_keys[@]} > 0 )); then
     local right_upper; right_upper="$(printf '%s' "$right_label" | tr '[:lower:]' '[:upper:]')"
     printf '  %sMACHINES%s (%d known)\n' "${B}${CY}" "${RS}" "${#_map_keys[@]}"
-    printf '  %s%-20s %-21s %-11s %-11s %-9s %-7s%s\n' \
-      "$DIM" "MACHINE" "5h TOKENS (rate)" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "$RS"
+    printf '  %s%-20s %-21s %-11s %-11s %-9s %-7s %-10s%s\n' \
+      "$DIM" "MACHINE" "5h TOKENS (rate)" "$right_upper" "LAST SEEN" "DAEMONS" "STATUS" "DRIVER" "$RS"
 
     local sorted_hosts
     sorted_hosts="$(printf '%s\n' "${_map_keys[@]}" | sort)"
@@ -566,10 +599,23 @@ snapshot() {
       else
         daemon_str="${_map_proj[$mi]:-0} d"
       fi
-      printf '  %-20s %s %-11s %-11s %-9s %s%-7s%s\n' \
-        "$mh_short" "$tok_field" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS"
+      # Driver column: green if it matches the reference, red + ⚠ if it's skewed.
+      local mdriver="${_map_driver[$mi]:-}"
+      local driver_field
+      if [[ -z "$mdriver" ]]; then
+        driver_field="${DIM}—${RS}"
+      elif [[ -n "$ref_driver_sha" && "$mdriver" != "$ref_driver_sha" ]]; then
+        driver_field="${RD}${mdriver} ⚠${RS}"
+      else
+        driver_field="${GN}${mdriver}${RS}"
+      fi
+      printf '  %-20s %s %-11s %-11s %-9s %s%-7s%s %s\n' \
+        "$mh_short" "$tok_field" "$mr" "$mseen_str" "$daemon_str" "$msc" "$ms" "$RS" "$driver_field"
     done <<< "$sorted_hosts"
 
+    if [[ -n "$ref_driver_sha" ]]; then
+      printf '  %sdriver ref (origin/main bin): %s%s\n' "$DIM" "$ref_driver_sha" "$RS"
+    fi
     echo
   fi
 

@@ -664,9 +664,16 @@ _parse_reset_to_epoch() {
 
 _run_status_hook() {
   local item="$1" exit_code="${2:-0}" mode="${3:-loop}" pre_head="$4" pulled="${5:-0}"
+  # Driver version-skew (W1): stamp the tick with the git SHA of the *shared
+  # driver* this daemon is actually running — the last commit touching the bin
+  # dir ($LIB_DIR), so it only changes when the machinery changes, not on every
+  # docs commit. The dashboard compares this to origin to surface "M1 is running
+  # a stale driver" at a glance. Empty if backlog-infra isn't a git checkout.
+  local driver_sha
+  driver_sha="$(git -C "$LIB_DIR" log -1 --format=%h -- "$LIB_DIR" 2>/dev/null || true)"
   if [[ -n "$HOOK" && -f "$HOOK" ]]; then
     local hook_rc=0
-    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" >> "$LOG_FILE" 2>&1 || hook_rc=$?
+    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" --driver-sha "$driver_sha" >> "$LOG_FILE" 2>&1 || hook_rc=$?
     if [[ $hook_rc -eq 0 ]]; then
       log_event status_ok item "$item"
     else

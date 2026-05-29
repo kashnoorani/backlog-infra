@@ -327,16 +327,34 @@ flowchart TD
 What each artefact is for:
 
 - **`backlog-status.json`** — the headline state (`last_tick_at`, `last_item`,
-  `last_exit_code`, `last_tokens`, `rolling_7d_tokens`, `backlog` marker counts,
-  uncommitted `artifacts`). Overwritten each tick; last-writer-wins across
-  machines (cosmetic only).
+  `last_exit_code`, `last_tokens`, `driver_sha`, `rolling_7d_tokens`, `backlog`
+  marker counts, uncommitted `artifacts`). Overwritten each tick; last-writer-wins
+  across machines (cosmetic only). `driver_sha` is the git SHA of the shared
+  driver this daemon is running (W1 version-skew — see below).
 - **`backlog-status-<hostname>.json`** — the *canonical per-machine* record;
   always stamped with the local host regardless of idle preservation. These are
   the files the tick loop stashes before a pull to avoid merge churn.
 - **`backlog-history.jsonl`** — append-only, one JSON line per tick (`ts`,
   `host`, `item`, `exit_code`, `tokens`, `tokens_breakdown`, `num_turns`,
-  `work_commit`, …). This is the ledger `backlog-agents` replays to sum tokens
-  across every host.
+  `work_commit`, `driver_sha`, …). This is the ledger `backlog-agents` replays to
+  sum tokens across every host.
+
+### Driver version-skew (W1)
+
+Because `bin/` is *shared*, a fix isn't live until every machine pulls — and a
+machine running a stale driver (the 2026-05-28 incident: M1 ran the broken driver
+for hours because the fix was unpulled) is invisible until something breaks. To
+make "is everyone on the fix?" a glance: the driver stamps each tick's status
+with `driver_sha` — the git SHA of the **last commit touching `backlog-infra/bin`**
+in the checkout it's running (passed `--driver-sha` → recorded by the status hook
+into `backlog-status.json`, the per-host file, and the history ledger). The
+`backlog-agents` **MACHINES** table adds a **DRIVER** column comparing each host's
+SHA to the reference (`origin/main`'s last `bin` commit) and flags drift in red
+with `⚠`; a `driver ref (origin/main bin): <sha>` line shows the target. This is
+the *skew-zero* signal the future fleet-freeze uses as its clear condition. The
+**on-demand fleet-sync** half (push a driver fix to every machine without waiting
+on the 24 h `daemon-sync`) is deferred to ride the D1 freeze-flag; the local
+on-demand path already exists as `backlog-agents sync`.
 
 The commit trailer is grep-able: `git log --grep='Claude-Effort'`. The hook
 no-ops the commit/push gracefully if `.claude/` is wholesale-gitignored (local

@@ -63,7 +63,7 @@ function findBacklogFile() {
 // ---------- arg parsing ----------
 function parseArgs() {
   const argv = process.argv.slice(2);
-  const opts = { item: "", exitCode: 0, mode: "loop", preHead: null, pulled: 0 };
+  const opts = { item: "", exitCode: 0, mode: "loop", preHead: null, pulled: 0, driverSha: "" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--item") opts.item = argv[++i] ?? "";
@@ -73,6 +73,7 @@ function parseArgs() {
     else if (a === "--pre-head") opts.preHead = argv[++i] ?? null;
     else if (a === "--pulled")
       opts.pulled = Number.parseInt(argv[++i] ?? "0", 10);
+    else if (a === "--driver-sha") opts.driverSha = argv[++i] ?? "";
   }
   if (!opts.preHead) {
     try {
@@ -457,6 +458,9 @@ async function main() {
     last_work_commit: statusWorkCommit,
     last_pull_count: opts.pulled,
     last_session_id: sessionKey,
+    // Driver version-skew (W1): the git SHA of the shared driver this daemon is
+    // running. The fleet dashboard compares it to origin to flag stale drivers.
+    driver_sha: opts.driverSha || null,
     rolling_7d_tokens: rolling7d + headline,
     backlog,
     artifacts,
@@ -500,6 +504,7 @@ async function main() {
           last_exit_code: statusObj.last_exit_code,
           last_tokens: statusObj.last_tokens,
           last_commit: statusObj.last_work_commit,
+          driver_sha: statusObj.driver_sha,
           cooldown_until_epoch: cdEpoch,
           cooldown_reason: cdReason,
         }),
@@ -526,6 +531,7 @@ async function main() {
     session_id: usage.session_id,
     work_commit: workCommit,
     pulled: opts.pulled,
+    driver_sha: opts.driverSha || null,
   };
   appendFileSync(HISTORY_LOG, `${JSON.stringify(effort)}\n`);
 

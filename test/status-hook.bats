@@ -44,6 +44,22 @@ setup() { _setup_status_repo; }
   [ "$(grep -c . "$WORK/.claude/backlog-history.jsonl")" -eq 2 ]
 }
 
+# Version-skew (W1): --driver-sha is recorded into the status JSON and history
+# so the dashboard can flag a host running a stale shared driver.
+@test "records driver_sha into status and history" {
+  run_hook --driver-sha abc1234
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .driver_sha "$WORK/.claude/backlog-status.json")" = "abc1234" ]
+  grep -q '"driver_sha":"abc1234"' "$WORK/.claude/backlog-history.jsonl"
+}
+
+# Absent --driver-sha → field present but null (never crashes / omits).
+@test "driver_sha is null when not supplied" {
+  run_hook
+  [ "$status" -eq 0 ]
+  [ "$(jq -r .driver_sha "$WORK/.claude/backlog-status.json")" = "null" ]
+}
+
 # REGRESSION GUARD for the untrack interaction: now that the SHARED
 # backlog-status.json is gitignored, the hook must STILL commit the per-host
 # file + history (they are tracked). It must not treat "the shared file is

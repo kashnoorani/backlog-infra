@@ -52,6 +52,8 @@ Tests drive the real entry point black-box: `backlog-agent tick`.
    is gitignored** — caught a real regression: the ignore-check included the
    (now-gitignored) shared file, so it silently skipped every status commit.
    Fixed to check only the staged files.
+6. `--driver-sha` is recorded into the status JSON + history (W1 version-skew)
+7. `driver_sha` is `null` when not supplied (no crash / omission)
 
 `events.bats` — structured event log (`.claude/backlog-agent-events.jsonl`,
 W0), the machine-readable stream that replaces regex-on-prose for downstream

@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-29T20:09:59Z",
+  "last_sweep_at": "2026-05-29T20:12:05Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 5,
-  "fixed_total": 5,
+  "sweeps_total": 6,
+  "fixed_total": 6,
   "flagged_total": 0,
-  "recent_actions": [{"ts":"2026-05-29T20:01:21Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:03:27Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:05:33Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:07:39Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:09:57Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"}]
+  "recent_actions": [{"ts":"2026-05-29T20:01:21Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:03:27Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:05:33Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:07:39Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:09:57Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"},{"ts":"2026-05-29T20:12:03Z","project":"backlog-infra","action":"git_push_rejected","result":"stashed","stash":"stash@{0}"}]
 }

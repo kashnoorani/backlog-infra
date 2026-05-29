@@ -16,6 +16,12 @@ _setup_repo() {
   CLAUDE_CALLED="$BATS_TEST_TMPDIR/claude_called"
   export CLAUDE_CALLED
 
+  # Redirect HOME to a scratch dir (as _setup_status_repo does) so the reaper's
+  # D1 heartbeat read controls $HOME/.config/backlog/health-key instead of the
+  # real user key, and HOME-rooted lookups (compact script) resolve hermetically.
+  export HOME="$BATS_TEST_TMPDIR/home"
+  mkdir -p "$HOME"
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com
@@ -108,6 +114,38 @@ case "$mode" in
 esac
 EOF
   chmod +x "$SHIM/claude"
+}
+
+# Generate the `curl` PATH stub for heartbeat-read tests (reaper liveness).
+# The reaper's _d1_heartbeat_epoch calls `curl -s -m 5 … -w '\n%{http_code}'`,
+# so the shim emits the JSON body followed by a newline + the HTTP status code
+# on the last line. Modes:
+#   live        -> 200, found:true, heartbeat_epoch = NOW        (daemon alive)
+#   dead        -> 200, found:true, heartbeat_epoch = NOW-7200    (>90m, dead)
+#   notfound    -> 404, found:false
+#   unreachable -> exit 7 (curl "couldn't connect"), no body
+# Also seeds a health-key so the bearer-auth branch is exercised.
+make_curl() {
+  local mode="$1"
+  mkdir -p "$HOME/.config/backlog"
+  echo testkey > "$HOME/.config/backlog/health-key"
+  cat > "$SHIM/curl" <<EOF
+#!/usr/bin/env bash
+mode="$mode"
+now="\$(date +%s)"
+EOF
+  cat >> "$SHIM/curl" <<'EOF'
+# Emulate body + status line (the reaper appends -w $'\n%{http_code}').
+emit() { printf '%s\n%s' "$1" "$2"; }   # $1=body, $2=http_code
+case "$mode" in
+  live)        emit "{\"found\":true,\"heartbeat_epoch\":$now}" 200 ;;
+  dead)        emit "{\"found\":true,\"heartbeat_epoch\":$((now-7200))}" 200 ;;
+  notfound)    emit "{\"found\":false}" 404 ;;
+  unreachable) exit 7 ;;   # curl: (7) Failed to connect
+esac
+exit 0
+EOF
+  chmod +x "$SHIM/curl"
 }
 
 # Run one tick (black-box). Extra args become leading `env VAR=val` pairs.

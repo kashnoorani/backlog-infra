@@ -56,14 +56,83 @@ setup() { _setup_repo; }
   [[ "$output" != *"unclaim"* ]]
 }
 
-# 6. Stale [~] claim + STARTUP_RECLAIM -> reclaim flips it back and records it.
+# 6. Stale [~] claim + STARTUP_RECLAIM -> reclaim flips it back and records it,
+#    WITHOUT any network probe (startup reclaims even when D1 is unreachable).
 @test "stale claim is reclaimed on startup" {
+  make_curl unreachable          # even with D1 down...
   write_backlog_open "- [~] orphaned by a dead daemon"
   git -C "$WORK" commit -qam "leave a stale claim"
   git -C "$WORK" push -q origin main
-  run_tick STARTUP_RECLAIM=1
+  run_tick STARTUP_RECLAIM=1     # ...startup path reclaims unconditionally
   [ "$status" -eq 0 ]
   [[ "$output" == *"reclaim"* ]]
+}
+
+# 6a. Live D1 heartbeat -> owning daemon alive -> [~] NOT reclaimed.
+@test "live D1 heartbeat does not reclaim a [~] claim" {
+  make_curl live
+  write_backlog_open "- [~] in-flight on a live daemon"
+  git -C "$WORK" commit -qam "claim"
+  git -C "$WORK" push -q origin main
+  run_tick                       # NOT startup
+  [ "$status" -eq 0 ]
+  open_has_marker '~'            # still claimed
+  [[ "$output" != *"reclaim"* ]]
+}
+
+# 6b. Dead heartbeat (>90m old) -> reclaim fires and logs the D1-heartbeat
+#     reason. (We assert on the reclaim log, not the final marker: the same
+#     tick immediately re-claims the freed item — the surviving daemon picking
+#     up the orphaned work — exactly as the startup-reclaim test above does.)
+@test "stale D1 heartbeat reclaims a [~] claim" {
+  make_curl dead
+  write_backlog_open "- [~] orphaned by a daemon that stopped beating"
+  git -C "$WORK" commit -qam "claim"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"reclaim"* ]]
+  [[ "$output" == *"no D1 heartbeat"* ]]
+}
+
+# 6c. D1 unreachable (curl exit 7) -> FAIL SAFE -> [~] NOT reclaimed (DECISION 1).
+@test "unreachable D1 does not reclaim (fail-safe)" {
+  make_curl unreachable
+  write_backlog_open "- [~] in-flight, dashboard is down"
+  git -C "$WORK" commit -qam "claim"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  open_has_marker '~'            # preserved — we must not reclaim mid-work
+  [[ "$output" != *"reclaim"* ]]
+}
+
+# 6d. 404 / found:false (no row for this project,host) -> also fail safe.
+@test "missing D1 row does not reclaim (fail-safe)" {
+  make_curl notfound
+  write_backlog_open "- [~] no telemetry row yet"
+  git -C "$WORK" commit -qam "claim"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  open_has_marker '~'
+  [[ "$output" != *"reclaim"* ]]
+}
+
+# 6e. No health-key present -> the bearer-auth array is empty. Under bash 3.2 +
+#     `set -u` a naive "${auth[@]}" would abort the tick with "unbound
+#     variable"; assert the tick survives, fails safe (no reclaim), and emits no
+#     such error. (Covers the keyless machine the other cases don't.)
+@test "missing health-key does not crash the reaper" {
+  make_curl live                 # would say "alive" — but no key to send
+  rm -f "$HOME/.config/backlog/health-key"
+  write_backlog_open "- [~] in-flight, this machine has no health key"
+  git -C "$WORK" commit -qam "claim"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  open_has_marker '~'            # live heartbeat still read -> no reclaim
+  [[ "$output" != *"unbound variable"* ]]
 }
 
 # 7. Diverged HEAD with a conflict -> reset --hard to origin (idempotent recovery).

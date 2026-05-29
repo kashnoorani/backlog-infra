@@ -478,30 +478,115 @@ auto_flip_blocked() {
   done < <(grep -nE '^(- )?\[\?\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }
 
+# --- D1 heartbeat liveness (docs/reaper-switch-design.md) ---
+# Derive the (project, host) keys EXACTLY as backlog-agent-status.mjs writes
+# them, so the heartbeat read hits the same health_status row the push updates.
+#   project: package.json .name if present, else basename of CWD
+#   host:    hostname with a trailing ".local" stripped (matches the mjs)
+_health_project() {
+  local name=""
+  if [[ -f "$PWD/package.json" ]]; then
+    # jq-free: first "name": "<value>" in package.json.
+    name="$(grep -oE '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$PWD/package.json" 2>/dev/null \
+            | head -n1 | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/' || true)"
+  fi
+  [[ -z "$name" ]] && name="$(basename "$PWD")"
+  printf '%s' "$name"
+}
+
+_health_host() {
+  hostname 2>/dev/null | sed -E 's/\.local$//' || echo "?"
+}
+
+# URL-encode the few characters that legitimately appear in a project/host:
+# space and the few punctuation chars. Project names are git-repo-safe in
+# practice (no `&`, `?`, `#`), so a minimal encoder is enough; spaces are the
+# realistic case. Keeps us curl-clean without pulling in a dependency.
+_urlencode() {
+  local s="$1" out="" c i
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:$i:1}"
+    case "$c" in
+      [a-zA-Z0-9._~-]) out+="$c" ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# Fetch heartbeat_epoch for THIS (project, host) from the D1 telemetry bus.
+# Echoes the integer epoch on success; echoes NOTHING on any failure
+# (unreachable, non-200, found:false, null heartbeat, malformed body).
+# Bearer auth is optional for the read endpoint, but we send it when the
+# health key is present so the endpoint can be locked down later w/o a client
+# change. Short -m timeout so a slow/unreachable dashboard never stalls a tick.
+_d1_heartbeat_epoch() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key"
+  local auth=() key
+  if [[ -f "$key_file" ]]; then
+    key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+    [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  fi
+  local project host url body http_code
+  project="$(_urlencode "$(_health_project)")"
+  host="$(_urlencode "$(_health_host)")"
+  url="https://kash-backlogs.pages.dev/api/heartbeat?project=${project}&host=${host}"
+
+  # -s silent, -m 5 hard cap, -w to capture the HTTP status separately so we can
+  # require a 200 before trusting the body. On curl failure $? != 0 -> empty.
+  # ${auth[@]+"${auth[@]}"} expands to nothing when auth is empty (no health
+  # key) — the plain "${auth[@]}" form is an "unbound variable" error under
+  # `set -u` in bash 3.2 (the daemon's interpreter), which would spew to the log
+  # on every keyless tick. This idiom is safe for both empty and filled arrays.
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$url" 2>/dev/null)" || return 0
+  http_code="$(printf '%s' "$body" | tail -n1)"
+  body="$(printf '%s' "$body" | sed '$d')"   # strip the trailing status line
+  [[ "$http_code" == "200" ]] || return 0
+  # Require found:true before reading the epoch (404 returns found:false).
+  printf '%s' "$body" | grep -q '"found"[[:space:]]*:[[:space:]]*true' || return 0
+  # jq-free integer extract, same idiom as cooldown_active.
+  local epoch
+  epoch="$(printf '%s' "$body" \
+           | grep -oE '"heartbeat_epoch"[[:space:]]*:[[:space:]]*[0-9]+' \
+           | grep -oE '[0-9]+$' | head -n1 || true)"
+  [[ -n "$epoch" ]] && printf '%s' "$epoch"
+  return 0
+}
+
 # Reclaim stale [~] items that were claimed but never completed.
-# After pulling origin, checks whether any daemon has pushed a status
-# commit recently. If the most recent status commit is older than
-# STALE_CLAIM_MINUTES (90 min = 1.5× the max plausible tick duration),
-# all [~] items are considered abandoned and flipped back to [ ] so
-# another tick (possibly on another machine) can pick them up.
+# Liveness is taken from the D1 telemetry heartbeat (`heartbeat_epoch`) for this
+# (project, host): if it is older than the stale threshold the owning daemon is
+# dead and its [~] items are flipped back to [ ] so another tick (possibly on
+# another machine) can pick them up. If D1 is unreachable / has no row / the
+# heartbeat is null, the reaper FAILS SAFE and does NOT reclaim (DECISION 1) —
+# a stuck claim is recoverable, a false reclaim mid-work is the costly incident.
 # Sets RECLAIMED_COUNT to the number of items flipped back.
 reclaim_stale_claims() {
   RECLAIMED_COUNT=0
-  local branch stale_secs=5400 now last_status_ts line line_num item_title
+  local stale_secs=5400 now hb_epoch age line line_num item_title
 
   now="$(date +%s)"
-  branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  [[ -z "$branch" ]] && return
+  # Plain "are we in a git repo?" guard — output discarded (no longer used for
+  # liveness; the heartbeat below is the liveness signal).
+  [[ -z "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" ]] && return
 
-  # On daemon startup (first tick), any [~] items are owned by a dead
-  # incarnation. Skip the stale-commit check and reclaim immediately.
+  # On daemon startup (first tick) any [~] items belong to a dead incarnation —
+  # reclaim immediately, no liveness probe (its predecessor is by definition
+  # gone, and we must not block startup on the dashboard being up).
   if [[ "${STARTUP_RECLAIM:-0}" != "1" ]]; then
-    last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" --grep="backlog-agent-status" -1 2>/dev/null || echo "")"
-    if [[ -z "$last_status_ts" ]]; then
-      last_status_ts="$(git -C "$PWD" log "origin/$branch" --format="%ct" -1 2>/dev/null || echo "")"
-    fi
-    [[ -z "$last_status_ts" ]] && return
-    (( now - last_status_ts <= stale_secs )) && return
+    # Liveness now comes from the D1 heartbeat, NOT git-commit recency.
+    hb_epoch="$(_d1_heartbeat_epoch)"
+
+    # DECISION 1 — fail safe. Empty heartbeat == D1 unreachable / no row / null /
+    # malformed. Treat unknown liveness as ALIVE and do NOT reclaim.
+    [[ -z "$hb_epoch" ]] && return
+
+    age=$(( now - hb_epoch ))
+    # Heartbeat fresh enough -> the owning daemon is alive -> do NOT reclaim.
+    (( age <= stale_secs )) && return
+    # else: heartbeat older than the stale threshold -> daemon is dead ->
+    # fall through and reclaim its [~] items.
   fi
   STARTUP_RECLAIM=0
 
@@ -509,7 +594,7 @@ reclaim_stale_claims() {
     line_num="$(echo "$line" | cut -d: -f1)"
     item_title="$(echo "$line" | cut -d: -f2- | sed -E 's/^(- )?\[~\] //')"
     sed -i '' "${line_num}s/\[~\]/[ ]/" "$BACKLOG_FILE"
-    echo "  [reclaim] stale [~] item '${item_title}' (no status commit in $(( (now - last_status_ts) / 60 ))m)" | tee -a "$LOG_FILE"
+    echo "  [reclaim] stale [~] item '${item_title}' (no D1 heartbeat in $(( (now - hb_epoch) / 60 ))m)" | tee -a "$LOG_FILE"
     RECLAIMED_COUNT=$((RECLAIMED_COUNT + 1))
   done < <(grep -nE '^(- )?\[~\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }

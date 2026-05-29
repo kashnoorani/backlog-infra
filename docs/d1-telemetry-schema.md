@@ -130,17 +130,17 @@ already solves). Revisit SSE only if we ever read history on the hot path.
 
 ## 5. Rollout (after decisions, sequenced; daemon stays DOWN until canary)
 
-1. **[CODE LANDED 2026-05-28]** `migrations/0001_telemetry.sql` in
-   **backlog-dashboard** — captures `health_status` (`IF NOT EXISTS`, no-op in
-   prod), ALTERs in `heartbeat_epoch` + `driver_sha`, creates indexed
-   `health_history`. Validated on sqlite for both fresh + already-exists DBs.
-   **NOT yet applied to live D1** — run: `npx wrangler d1 migrations apply
-   kash-backlogs-d1 --remote` (then deploy the worker).
-2. **[CODE LANDED 2026-05-28]** Ingest endpoint writes `heartbeat_epoch` +
-   `driver_sha` **defensively** (core upsert always works; new columns via a
-   best-effort `UPDATE` so an unmigrated DB still records core state). Status
-   hook now sends `heartbeat_epoch` every tick. `health_history` *writes* are
-   still deferred to the W2 efficiency-metrics consumer (table created, unused).
+1. **[DONE 2026-05-28]** `migrations/0001_telemetry.sql` in **backlog-dashboard**
+   — captures `health_status` (`IF NOT EXISTS`, no-op in prod), ALTERs in
+   `heartbeat_epoch` + `driver_sha`, creates indexed `health_history`. **Applied
+   to live D1** (`wrangler d1 migrations apply --remote`, 8 commands ✅; columns
+   + tables verified).
+2. **[DONE 2026-05-28]** Ingest endpoint writes `heartbeat_epoch` + `driver_sha`
+   **defensively** (core upsert always works; new columns via a best-effort
+   `UPDATE` so an unmigrated DB still records core state). Status hook sends
+   `heartbeat_epoch` every tick. **Deployed to Pages + round-trip verified live.**
+   `health_history` *writes* are still deferred to the W2 efficiency-metrics
+   consumer (table created, unused).
 3. Switch `reclaim_stale_claims` to the D1 heartbeat per **DECISION 1** (this is
    the correctness fix; gate behind the canary + version-skew per the operating
    rules before the fleet daemons come back up). **← next behavioral step, gated.**
@@ -156,8 +156,10 @@ records, so it's safe either way, just no heartbeat column until migrated).
 ## 6. Status
 
 Design **approved** (both decisions resolved, §4). **Additive groundwork (steps
-1–2) CODE-LANDED 2026-05-28** — migration + defensive heartbeat ingest committed,
-validated on sqlite; **not yet applied/deployed to live D1** (production action,
-awaiting go-ahead). Version-skew visibility shipped last. Remaining gate before
-the *reaper switch* (step 3) goes live: a **canary** (W3), with the fleet daemons
+1–2) DEPLOYED + VERIFIED LIVE 2026-05-28** — migration `0001` applied to the
+remote D1 (`heartbeat_epoch` + `driver_sha` columns + indexed `health_history`
+confirmed present), the new ingest deployed to Pages, and an end-to-end POST
+round-trip confirmed (throwaway row written with both new fields, read back,
+deleted). Version-skew visibility shipped before it. Remaining gate before the
+*reaper switch* (step 3) goes live: a **canary** (W3), with the fleet daemons
 DOWN until then (operating rules).

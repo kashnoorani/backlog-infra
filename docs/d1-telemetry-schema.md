@@ -130,21 +130,34 @@ already solves). Revisit SSE only if we ever read history on the hot path.
 
 ## 5. Rollout (after decisions, sequenced; daemon stays DOWN until canary)
 
-1. Land `0001_telemetry.sql` in **backlog-dashboard** (`wrangler d1 migrations`)
-   so the schema is reproducible; apply to the live DB (idempotent `IF NOT EXISTS`).
-2. Extend the ingest endpoint + status hook to write `heartbeat_epoch` (+ the new
-   columns) every tick, and to forward W0 events into `health_history`.
+1. **[CODE LANDED 2026-05-28]** `migrations/0001_telemetry.sql` in
+   **backlog-dashboard** — captures `health_status` (`IF NOT EXISTS`, no-op in
+   prod), ALTERs in `heartbeat_epoch` + `driver_sha`, creates indexed
+   `health_history`. Validated on sqlite for both fresh + already-exists DBs.
+   **NOT yet applied to live D1** — run: `npx wrangler d1 migrations apply
+   kash-backlogs-d1 --remote` (then deploy the worker).
+2. **[CODE LANDED 2026-05-28]** Ingest endpoint writes `heartbeat_epoch` +
+   `driver_sha` **defensively** (core upsert always works; new columns via a
+   best-effort `UPDATE` so an unmigrated DB still records core state). Status
+   hook now sends `heartbeat_epoch` every tick. `health_history` *writes* are
+   still deferred to the W2 efficiency-metrics consumer (table created, unused).
 3. Switch `reclaim_stale_claims` to the D1 heartbeat per **DECISION 1** (this is
    the correctness fix; gate behind the canary + version-skew per the operating
-   rules before the fleet daemons come back up).
-4. Dashboard read-path per **DECISION 2**.
+   rules before the fleet daemons come back up). **← next behavioral step, gated.**
+4. Dashboard read-path per **DECISION 2** (poll the indexed table; surface
+   `driver_sha`/`heartbeat` in the web UI).
 5. Retention/rollup job on `health_history` (prune raw rows past N days; keep
    daily rollups) — cheap insurance against storage/scan growth.
 
+**Deploy order matters:** apply the migration BEFORE deploying the new ingest,
+else the telemetry `UPDATE` no-ops (it's caught + logged — core state still
+records, so it's safe either way, just no heartbeat column until migrated).
+
 ## 6. Status
 
-Design **approved** (both decisions resolved, §4). Remaining gate before the
-*reaper switch* (step 3) goes live: **version-skew visibility + a canary** must
-land first, and the fleet daemons stay DOWN until then (operating rules). The
-**additive groundwork** (step 1 migration, step 2 heartbeat ingest) carries no
-behavioral risk and can land independently of that gate.
+Design **approved** (both decisions resolved, §4). **Additive groundwork (steps
+1–2) CODE-LANDED 2026-05-28** — migration + defensive heartbeat ingest committed,
+validated on sqlite; **not yet applied/deployed to live D1** (production action,
+awaiting go-ahead). Version-skew visibility shipped last. Remaining gate before
+the *reaper switch* (step 3) goes live: a **canary** (W3), with the fleet daemons
+DOWN until then (operating rules).

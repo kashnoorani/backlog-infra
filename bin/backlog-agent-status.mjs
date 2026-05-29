@@ -505,6 +505,10 @@ async function main() {
           last_tokens: statusObj.last_tokens,
           last_commit: statusObj.last_work_commit,
           driver_sha: statusObj.driver_sha,
+          // Liveness heartbeat (D1 telemetry bus): seconds since epoch, sent on
+          // EVERY tick incl. idle/cooldown — independent of any git commit, so
+          // the reaper can tell a live-but-not-committing daemon from a dead one.
+          heartbeat_epoch: Math.floor(Date.now() / 1000),
           cooldown_until_epoch: cdEpoch,
           cooldown_reason: cdReason,
         }),

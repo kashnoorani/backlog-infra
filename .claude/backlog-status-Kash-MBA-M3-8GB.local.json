@@ -1,17 +1,17 @@
 {
-  "last_tick_at": "2026-05-29T10:49:38.398Z",
+  "last_tick_at": "2026-05-29T10:54:54.662Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
   "last_item": "**(P2 · W0) Enforce the full ephemeral-`.claude/` gitignore set fleet-wide + in `doctor` + template.** Broadened 2026-05-29 from the events.jsonl-only case after a second instance of the same class. The bug class: a per-machine ephemeral `.claude/` runtime file that is either untracked-but-unignored (autostash `--include-untracked` grabs it, pop fails → orphan) or outright tracked (the daemon deletes/rewrites it each tick → that tracked change is autostashed and fails to pop → orphan). Concrete instances found: (i) `.claude/backlog-agent-events.jsonl` — gitignored in `backlog-infra` only, untracked elsewhere; fixed during bring-up (added + pushed to 6 repos, stashes dropped). (ii) `.claude/agent-cooldown.json` — **tracked** in dark-mode-safari + sacred-geography (deleted on cooldown-clear → one orphan stash per tick; dark-mode-safari hit 4, sacred-geography 7); fixed 2026-05-29 (untrack + gitignore + push; see Done). **Note `agent-cooldown.json` is missing from `templates/dev-project/.gitignore` entirely.** (iii) `.claude/backlog-agent-failcounts.json` — listed in the template but **untracked-unignored** in backlog-dashboard, dark-mode-safari, predictive-history, sacred-geography (latent autostash co-trigger); only sacred-geography fixed so far. Enforcement: (a) define the canonical ephemeral set in one place and have `doctor` assert every active repo ignores all of it (currently it checks only a subset) — hard-fail on a *tracked* ephemeral file, warn on untracked-unignored; (b) make `templates/dev-project/.gitignore` the superset (add `agent-cooldown.json`); (c) one-shot sweep the remaining repos for the failcounts line. → ties to the D1 telemetry bus (W1), which removes the deeper \"tracked status/history\" variant (see TaizMail item below).",
-  "last_exit_code": 143,
+  "last_exit_code": 1,
   "last_tokens": 84185,
   "last_work_commit": "08f0dfd",
-  "full_commit": "08f0dfdd93c010aff0cd1758c9051245b3992004",
+  "full_commit": "98de6d91dd68e033da017ccea34f24a072758c98",
   "repo_slug": "kashnoorani/backlog-infra",
   "completed": false,
   "completed_items": [],
-  "last_pull_count": 3,
-  "last_session_id": "2271687c-be8c-48f7-a855-50e4220fc029",
+  "last_pull_count": 0,
+  "last_session_id": "f6506fb0-39bf-439a-83e9-0db178b8d528",
   "driver_sha": "ddddc01",
   "rolling_7d_tokens": 636355,
   "backlog": {
@@ -24,27 +24,11 @@
   "artifacts": {
     "uncommitted": [
       {
-        "status": " M",
-        "path": ".gitignore"
-      },
-      {
-        "status": " M",
-        "path": "bin/_lib.sh"
-      },
-      {
-        "status": " M",
-        "path": "bin/backlog-agents"
-      },
-      {
-        "status": " M",
-        "path": "templates/dev-project/.gitignore"
-      },
-      {
-        "status": " M",
-        "path": "test/doctor.bats"
+        "status": "??",
+        "path": ".claude/agent-cooldown.json"
       }
     ],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-29T10:49:40.143Z"
+    "computed_at": "2026-05-29T10:54:56.363Z"
   }
 }

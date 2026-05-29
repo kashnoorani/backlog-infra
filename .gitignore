@@ -3,9 +3,12 @@ dist/
 .DS_Store
 .claude/backlog.log
 .claude/backlog.lock/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 .claude/backlog-agent.log
 .claude/backlog-agent-events.jsonl
 .claude/backlog-agent-failcounts.json
+.claude/agent-cooldown.json
 .claude/backlog-agent.lock/
 .claude/backlog-tick.inflight
 .claude/backlog-agent-tick.inflight

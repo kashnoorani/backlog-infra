@@ -15,12 +15,29 @@ setup() {
   printf '{ "projects": {} }\n' > "$HOME/.claude/backlog-budgets.json"
 }
 
-# Scaffold a well-formed project under the fake ACTIVE_ROOT.
+# Scaffold a well-formed project under the fake ACTIVE_ROOT. A REAL git repo,
+# because doctor's ephemeral-ignore check uses `git ls-files`/`git check-ignore`.
+# Its .gitignore carries the full canonical ephemeral set so the fixture is clean.
 mk_project() {
   local name="$1" root="$HOME/dev/projects/active/$1"
-  mkdir -p "$root/.git" "$root/docs" "$root/scripts" "$root/.claude"
+  mkdir -p "$root/docs" "$root/scripts" "$root/.claude"
+  git -C "$root" init -q
   printf '# b\n\n## Open\n' > "$root/docs/Backlog.md"
-  printf '.claude/backlog-agent.log\n.claude/backlog-agent.lock/\n.claude/backlog-status.json\n' > "$root/.gitignore"
+  cat > "$root/.gitignore" <<'EOF'
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/backlog-agent.log
+.claude/backlog-agent-events.jsonl
+.claude/backlog-agent-failcounts.json
+.claude/agent-cooldown.json
+.claude/backlog-agent.lock/
+.claude/backlog-agent.tick.lock/
+.claude/backlog-agent-tick.inflight
+.claude/watch-backlog.ping
+.claude/launchd-stdout.log
+.claude/launchd-stderr.log
+.claude/backlog-status.json
+EOF
   printf 'process.exit(0)\n' > "$root/scripts/backlog-agent-status.mjs"
 }
 
@@ -64,13 +81,26 @@ run_doctor() { run bash "$AGENTS_BIN" doctor; }
   [[ "$output" == *"orphan"* && "$output" == *"missing from the manifest"* ]]
 }
 
-# 5. Missing gitignore patterns → warn, exit 0.
-@test "missing gitignore patterns warn" {
+# 5. An unignored ephemeral path → warn, exit 0.
+@test "unignored ephemeral path warns" {
   mk_project tahoe; add_manifest tahoe
   printf 'node_modules/\n' > "$HOME/dev/projects/active/tahoe/.gitignore"  # drop the required patterns
   run_doctor
   [ "$status" -eq 0 ]
-  [[ "$output" == *"missing gitignore pattern"* ]]
+  [[ "$output" == *"ephemeral path(s) not gitignored"* ]]
+  [[ "$output" == *".claude/agent-cooldown.json"* ]]
+}
+
+# 5b. A TRACKED ephemeral file → hard fail (the orphaned-autostash-per-tick class).
+@test "tracked ephemeral file fails" {
+  mk_project tahoe; add_manifest tahoe
+  local root="$HOME/dev/projects/active/tahoe"
+  printf '{}\n' > "$root/.claude/agent-cooldown.json"
+  git -C "$root" add -f .claude/agent-cooldown.json   # force-track past the ignore
+  run_doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TRACKED ephemeral file"* ]]
+  [[ "$output" == *".claude/agent-cooldown.json"* ]]
 }
 
 # 6. A status hook with a syntax error → hard fail.

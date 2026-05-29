@@ -113,6 +113,36 @@ fi
 DOTFILES="$HOME/dotfiles"
 ACTIVE_ROOT="$HOME/dev/projects/active"
 
+# Canonical ephemeral .claude/ runtime set — the single source of truth for
+# which per-machine files the daemon writes every tick and that must therefore
+# be gitignored and NEVER tracked. The bug class this guards against:
+#   - tracked: the daemon deletes/rewrites the file each tick → that change is
+#     autostashed pre-rebase and fails to pop → orphaned stash every tick.
+#   - untracked-but-unignored: autostash `--include-untracked` sweeps it with
+#     the same pop-conflict → orphan.
+# `doctor` asserts every active repo ignores all of these (hard-fail on a
+# *tracked* one, warn on untracked-unignored). `templates/dev-project/.gitignore`
+# is kept a superset of this list. Deliberately EXCLUDES the per-host status
+# (`.claude/backlog-status-<host>.local.json`) and history
+# (`.claude/backlog-history.jsonl`) files, which are MEANT to be tracked — their
+# concurrent-write pop-conflicts are a separate class the D1 telemetry bus
+# addresses (see the TaizMail item in docs/Backlog.md).
+EPHEMERAL_CLAUDE_IGNORES=(
+  ".claude/settings.local.json"
+  ".claude/scheduled_tasks.lock"
+  ".claude/backlog-agent.log"
+  ".claude/backlog-agent-events.jsonl"
+  ".claude/backlog-agent-failcounts.json"
+  ".claude/agent-cooldown.json"
+  ".claude/backlog-agent.lock/"
+  ".claude/backlog-agent.tick.lock/"
+  ".claude/backlog-agent-tick.inflight"
+  ".claude/watch-backlog.ping"
+  ".claude/launchd-stdout.log"
+  ".claude/launchd-stderr.log"
+  ".claude/backlog-status.json"
+)
+
 command -v jq >/dev/null 2>&1 || { echo "backlog-agents: requires jq (brew install jq)" >&2; exit 1; }
 
 # ANSI
@@ -1752,26 +1782,39 @@ do_doctor() {
   (( checked > 0 )) && _d_pass "checked $checked canonical plist(s)" || _d_warn "no canonical plists found"
 
   # --- 4. per-project config hygiene (gitignore + status hook) ---
+  # Assert every active repo ignores the full canonical ephemeral set
+  # ($EPHEMERAL_CLAUDE_IGNORES). A *tracked* ephemeral file is a HARD failure —
+  # the daemon rewrites it each tick → orphaned autostash every tick. An
+  # untracked-but-unignored one is a WARN — it only orphans when autostash
+  # `--include-untracked` happens to sweep it. We test ignore-ness with
+  # `git check-ignore` (honours global + repo rules, dir patterns, the lot)
+  # rather than grepping the file, and tracked-ness with `git ls-files`.
   _d_head "Per-project config"
-  local req_ignores=(".claude/backlog-agent.log" ".claude/backlog-agent.lock/" ".claude/backlog-status.json")
-  local proj pn gi hook miss
+  local proj pn hook pat path tracked_eph unignored_eph
   for proj in "$ACTIVE_ROOT"/*/; do
     proj="${proj%/}"
     [[ -d "$proj" ]] || continue
     [[ -n "$(find_backlog_file "$proj")" ]] || continue
     pn="$(basename "$proj")"
-    # gitignore patterns
-    gi="$proj/.gitignore"
-    miss=""
-    if [[ -f "$gi" ]]; then
-      local pat
-      for pat in "${req_ignores[@]}"; do
-        grep -qF "$pat" "$gi" 2>/dev/null || miss="${miss}${pat} "
+    # Ephemeral .claude/ set: tracked → hard-fail, unignored → warn.
+    if [[ -d "$proj/.git" ]]; then
+      tracked_eph=""; unignored_eph=""
+      for pat in "${EPHEMERAL_CLAUDE_IGNORES[@]}"; do
+        path="${pat%/}"   # slash-stripped form for ls-files (no dir-as-file)
+        # ls-files matches any tracked file at/under the path (a tracked lock
+        # *dir* shows up via its contents); check-ignore keeps the original
+        # pattern so a dir-only `foo/` rule still matches `foo/`.
+        if git -C "$proj" ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+          tracked_eph="${tracked_eph}${path} "
+        elif ! git -C "$proj" check-ignore -q -- "$pat" 2>/dev/null; then
+          unignored_eph="${unignored_eph}${path} "
+        fi
       done
+      [[ -n "$tracked_eph" ]] && _d_fail "$pn: TRACKED ephemeral file(s) (untrack + gitignore): $tracked_eph"
+      [[ -n "$unignored_eph" ]] && _d_warn "$pn: ephemeral path(s) not gitignored: $unignored_eph"
     else
-      miss="(no .gitignore) "
+      _d_warn "$pn: not a git repo; skipped ephemeral-ignore check"
     fi
-    [[ -n "$miss" ]] && _d_warn "$pn: missing gitignore pattern(s): $miss"
     # status hook resolves (mirror the driver's resolution order)
     if   [[ -f "$proj/scripts/backlog-agent-status.mjs" ]]; then hook="$proj/scripts/backlog-agent-status.mjs"
     elif [[ -f "$proj/scripts/loop-status.mjs" ]];           then hook="$proj/scripts/loop-status.mjs"
@@ -1783,7 +1826,7 @@ do_doctor() {
       _d_fail "$pn: status hook has a syntax error ($hook)"
     fi
   done
-  (( fails == 0 )) && _d_pass "status hooks resolve; gitignore checked"
+  (( fails == 0 )) && _d_pass "status hooks resolve; ephemeral .claude/ set ignored & untracked"
 
   # --- 5. budgets file + required tools ---
   _d_head "Globals & tools"

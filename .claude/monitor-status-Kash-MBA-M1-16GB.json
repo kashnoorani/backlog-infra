@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-29T20:41:08Z",
+  "last_sweep_at": "2026-05-29T20:43:12Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 11,
+  "sweeps_total": 12,
   "fixed_total": 0,
-  "flagged_total": 11,
-  "recent_actions": [{"ts":"2026-05-29T20:20:22Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:22:26Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:24:31Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:26:35Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:28:39Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:30:44Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:32:48Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:34:53Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:36:56Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:39:01Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:41:05Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]
+  "flagged_total": 12,
+  "recent_actions": [{"ts":"2026-05-29T20:20:22Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:22:26Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:24:31Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:26:35Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:28:39Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:30:44Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:32:48Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:34:53Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:36:56Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:39:01Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:41:05Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:43:10Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]
 }

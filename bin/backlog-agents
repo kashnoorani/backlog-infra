@@ -8,10 +8,17 @@
 #                         /usage inside Claude Code — the transcript-derived
 #                         host totals previously shown here drifted from
 #                         /usage's numbers and were removed.
-#   backlog-agents sync         Pull dotfiles + every active project; restart every
+#   backlog-agents sync [--no-pull|--restart-only] [--no-gate] [--gate-only]
+#                         Pull dotfiles + every active project, then restart every
 #                         agent launchd daemon (both legacy
 #                         com.${USER}.*.backlog-loop and new
-#                         com.${USER}.*.backlog-agent labels).
+#                         com.${USER}.*.backlog-agent labels). The RESTART is gated
+#                         on canary + version-skew (see _sync_gate_check): it won't
+#                         restart agents onto a driver that hasn't passed `canary`
+#                         or that differs from origin/main's bin — blocked, the
+#                         daemons keep their last-validated driver. --no-gate is the
+#                         manual override; --gate-only just reports whether a restart
+#                         would be allowed (no pull/restart; exit 0=allowed, 1=blocked).
 #   backlog-agents list         Show installed agent labels + their state.
 #
 #   backlog-agents doctor       Preflight health check. Reports drift between the
@@ -44,6 +51,10 @@
 #                       Run `backlog-agents sync` in a loop, keeping all projects
 #                       pulled and agents healthy. Default interval is 86400s
 #                       (24h). --once runs a single sync and exits (testing).
+#                       Each cycle's RESTART is canary/skew-gated (see `sync`), so
+#                       the loop can pull a new driver but will refuse to push it
+#                       fleet-wide until `canary` validates it — agents keep the
+#                       last-good driver until then.
 #
 #   backlog-agents install-watchdog
 #                       Install a launchd plist that runs `daemon-sync` as a
@@ -813,15 +824,62 @@ snapshot() {
 
 # ---- subcommand: sync ----
 
+# ---- canary + version-skew gate for sync (W3) ----
+# Because bin/ is SHARED, `sync` restarting every agent is exactly how one bad
+# driver commit goes fleet-wide (the 2026-05-28 cooldown bug broke all 7 daemons
+# this way). Pulling is harmless — it only updates files; ACTIVATING the pulled
+# driver by restarting the daemons is the blast radius. So the gate sits in front
+# of the RESTART, not the pull: a blocked restart leaves every daemon running its
+# last-validated driver (still resident in the running process). Two conditions,
+# both fail-safe (any uncertainty → block):
+#   (1) no version-skew — the local bin SHA must equal origin/main's bin SHA, so
+#       we never restart onto a driver the pull failed to land or that diverged;
+#   (2) canary passed    — `canary --check` must be green for that SHA, so we
+#       never restart onto a driver the hermetic self-test hasn't validated.
+# Prints a one-line reason when it blocks (captured in the daemon-sync log).
+_sync_gate_check() {
+  local infra_dir="$ACTIVE_ROOT/backlog-infra"
+  local cur="" origin=""
+  if [[ -d "$infra_dir/.git" ]]; then
+    git -C "$infra_dir" fetch origin main -q 2>/dev/null || true
+    cur="$(git -C "$infra_dir" log -1 --format=%h -- bin 2>/dev/null || true)"
+    origin="$(git -C "$infra_dir" log -1 --format=%h origin/main -- bin 2>/dev/null || true)"
+  fi
+  if [[ -z "$cur" ]]; then
+    warn "sync gate: cannot determine the driver bin SHA (no backlog-infra git) — refusing to restart agents (fail-safe)"
+    return 1
+  fi
+  if [[ -n "$origin" && "$cur" != "$origin" ]]; then
+    warn "sync gate: version-skew — local bin ${cur} != origin/main bin ${origin} (pull blocked or diverged)."
+    warn "          NOT restarting; daemons keep their current driver. Resolve the pull, then re-run \`backlog-agents sync\`."
+    return 1
+  fi
+  if ! do_canary --check >/dev/null 2>&1; then
+    warn "sync gate: driver ${cur} has not passed canary — NOT restarting; daemons keep the last-validated driver."
+    warn "          Run \`backlog-agents canary\` to validate this driver, then \`backlog-agents sync\`."
+    return 1
+  fi
+  ok "sync gate: driver ${cur} — canary green, no skew; safe to restart"
+  return 0
+}
+
 do_sync() {
-  local NO_PULL=0 RESTART_ONLY=0
+  local NO_PULL=0 RESTART_ONLY=0 NO_GATE=0 GATE_ONLY=0
   for arg in "$@"; do
     case "$arg" in
       --no-pull)      NO_PULL=1 ;;
       --restart-only) NO_PULL=1; RESTART_ONLY=1 ;;
+      --no-gate)      NO_GATE=1 ;;
+      --gate-only)    GATE_ONLY=1 ;;
       *) echo "backlog-agents sync: unknown flag: $arg" >&2; exit 2 ;;
     esac
   done
+
+  # Read-only gate evaluation (no pull, no restart, no snapshot): exit 0 iff a
+  # restart would be allowed right now. Useful as a fleet-freeze input + for tests.
+  if (( GATE_ONLY )); then
+    if _sync_gate_check; then return 0; else return 1; fi
+  fi
 
   if (( NO_PULL == 0 )); then
     need_github_ssh "backlog-agents sync" || warn "SSH to GitHub is broken — pulls will fail"
@@ -851,7 +909,16 @@ do_sync() {
     fi
   fi
 
+  # ---- gate the restart on canary + version-skew (see _sync_gate_check) ----
+  local do_restart=1
+  if (( NO_GATE )); then
+    warn "sync: --no-gate set — bypassing the canary/skew gate (manual override)"
+  elif ! _sync_gate_check; then
+    do_restart=0
+  fi
+
   # Restart daemons — both legacy (.backlog-loop) and new (.backlog-agent) labels.
+  if (( do_restart )); then
   info "restarting agents"
   local restarted=0
   local plist label name repo
@@ -907,6 +974,7 @@ do_sync() {
     fi
   done
   ok "$restarted agent(s) restarted"
+  fi
 
   if (( RESTART_ONLY == 0 )); then
     echo

@@ -395,12 +395,25 @@ replay).
 | *(default)* | render the dashboard snapshot |
 | `sync` | pull dotfiles + every active project, restart every agent daemon, reprint |
 | `list` | show installed agent launchd labels + their state |
+| `doctor` | read-only preflight: report drift between the manifest, project dirs, and daemons + per-project config hygiene (see below) |
 | `daemon-sync [--interval N] [--once]` | run `sync` on a loop (default 24 h) |
 | `install-watchdog` / `uninstall-watchdog` | (un)install a launchd plist running `daemon-sync` |
 
 Dashboard flags: `--fetch` (git-fetch each repo first), `--watch` (refresh 10s),
 `--effort` (log-size column), `--day` (rebucket right column to today),
 `--compact`, `--artifacts` (uncommitted changes per host). Requires `jq`.
+
+**`backlog-agents doctor`** codifies the by-hand checks run when the fleet
+misbehaves into one read-only command, so "why is the fleet weird" is a 2-second
+read instead of manual archaeology. It checks five groups — manifest ↔
+project-dir drift (both directions); launchd daemons (double-daemons from old
+labels = hard fail, dangling plists, loaded count vs manifest); plists pointing
+at canonical de-symlinked paths; per-project config (required `.gitignore`
+patterns, status-hook resolves via `node --check`); and globals/tools (budgets
+file valid; `git`/`node`/`jq` required, `gawk`/`fswatch` warned — `gawk` avoids
+the BSD-awk `-i inplace` footgun). It mutates nothing and exits non-zero on any
+hard failure (warnings don't fail), so it's safe to run anytime and usable as a
+CI/pre-sync gate.
 
 ### `dev-projects` — repo lifecycle
 

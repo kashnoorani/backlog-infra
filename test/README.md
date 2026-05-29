@@ -64,6 +64,18 @@ consumers:
 5. titles with quotes/backslashes stay valid JSON (escaping)
 6. every line carries the envelope (`ts`, `event`, `project`, `host`, `pid`)
 
+`doctor.bats` — `backlog-agents doctor` preflight (W1), run against a fake
+`$HOME` so `ACTIVE_ROOT`/`DOTFILES`/`LaunchAgents` relocate into scratch (doctor
+is read-only — never touches the real fleet):
+
+1. clean in-manifest project → exit 0, "no hard failures"
+2. missing manifest → hard fail
+3. manifest entry without a dir → hard fail
+4. project with a backlog missing from the manifest → warn, exit 0
+5. missing gitignore patterns → warn
+6. status hook with a syntax error → hard fail (`node --check`)
+7. invalid budgets JSON → hard fail
+
 ## TODO
 
 - **Concurrent claim-race** (two daemons push the same `claim:` → one wins,

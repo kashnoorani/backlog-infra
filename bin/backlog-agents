@@ -14,6 +14,14 @@
 #                         com.${USER}.*.backlog-agent labels).
 #   backlog-agents list         Show installed agent labels + their state.
 #
+#   backlog-agents doctor       Preflight health check. Reports drift between the
+#                         manifest (~/dotfiles/active-projects.txt), the project
+#                         dirs, and the installed launchd daemons — plus per-project
+#                         config hygiene (gitignore patterns, status-hook resolves,
+#                         plists pointing at canonical de-symlinked paths, budgets
+#                         file present, required tools). Read-only; never changes
+#                         state. Exits non-zero if any hard check FAILs.
+#
 #   backlog-agents daemon-sync [--interval <seconds>] [--once]
 #                       Run `backlog-agents sync` in a loop, keeping all projects
 #                       pulled and agents healthy. Default interval is 86400s
@@ -1470,6 +1478,209 @@ JSON
   fi
 }
 
+# ---- subcommand: doctor ----
+# Preflight health check. Codifies the by-hand checks we run when the fleet
+# misbehaves so "why is the fleet weird" becomes a 2-second read. Strictly
+# read-only — it reports drift and never mutates state. Exit status: 0 if clean
+# (warnings allowed), 1 if any hard check FAILs.
+do_doctor() {
+  local fails=0 warns=0
+  local P="${GN}✓${RS}" F="${RD}✗${RS}" W="${YL}!${RS}"
+  _d_pass() { printf '    %s %s\n' "$P" "$1"; }
+  _d_warn() { printf '    %s %s\n' "$W" "$1"; warns=$((warns + 1)); }
+  _d_fail() { printf '    %s %s\n' "$F" "$1"; fails=$((fails + 1)); }
+  _d_head() { printf '\n  %s%s%s\n' "$B" "$1" "$RS"; }
+
+  local manifest="$DOTFILES/active-projects.txt"
+  local uid; uid="$(id -u)"
+  local this_host; this_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+  printf '%sbacklog-agents doctor%s  (%s)\n' "$B" "$RS" "$this_host"
+
+  # Parse the manifest into a `|`-delimited set of project names (field 1 is a
+  # path under ACTIVE_ROOT; we key on its basename). bash 3.2 compatible.
+  local manifest_set='|' manifest_count=0
+  if [[ -f "$manifest" ]]; then
+    local mline rel mname
+    while IFS= read -r mline || [[ -n "$mline" ]]; do
+      [[ -z "$mline" || "$mline" == \#* ]] && continue
+      rel="${mline%%$'\t'*}"; rel="${rel%% *}"
+      [[ -z "$rel" ]] && continue
+      mname="$(basename "$rel")"
+      manifest_set="${manifest_set}${mname}|"
+      manifest_count=$((manifest_count + 1))
+    done < "$manifest"
+  fi
+
+  # --- 1. manifest <-> project dirs ---
+  _d_head "Manifest ↔ project dirs"
+  if [[ ! -f "$manifest" ]]; then
+    _d_fail "no manifest at $manifest (run \`dev-projects sync\`)"
+  else
+    _d_pass "manifest present ($manifest_count project(s))"
+    local nm
+    local IFS='|'
+    for nm in $manifest_set; do
+      [[ -z "$nm" ]] && continue
+      if [[ ! -d "$ACTIVE_ROOT/$nm" ]]; then
+        _d_fail "manifest lists '$nm' but $ACTIVE_ROOT/$nm does not exist"
+      elif [[ ! -d "$ACTIVE_ROOT/$nm/.git" ]]; then
+        _d_warn "'$nm' exists but is not a git repo"
+      fi
+    done
+    unset IFS
+    # Reverse drift: a project with a backlog that the manifest omits.
+    local pd pn
+    for pd in "$ACTIVE_ROOT"/*/; do
+      [[ -d "$pd" ]] || continue
+      pn="$(basename "$pd")"
+      [[ -n "$(find_backlog_file "${pd%/}")" ]] || continue
+      case "$manifest_set" in
+        *"|$pn|"*) : ;;
+        *) _d_warn "'$pn' has a backlog but is missing from the manifest" ;;
+      esac
+    done
+  fi
+
+  # --- 2. daemons: count, double-daemons, dangling plists ---
+  _d_head "launchd daemons"
+  local pl label dn loaded_canonical=0
+  # Track which projects have a loaded daemon, and which carry a legacy label.
+  local loaded_set='|' legacy_loaded_set='|'
+  for pl in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist \
+            "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog.plist \
+            "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-loop.plist; do
+    [[ -f "$pl" ]] || continue
+    label="$(basename "$pl" .plist)"
+    dn="${label#com.${USER}.}"
+    dn="${dn%.backlog-agent}"; dn="${dn%.backlog}"; dn="${dn%.backlog-loop}"
+    local is_loaded=0
+    launchctl print "gui/$uid/$label" >/dev/null 2>&1 && is_loaded=1
+    # Dangling: plist points at a project dir that no longer exists.
+    if [[ ! -d "$ACTIVE_ROOT/$dn" ]]; then
+      _d_fail "$label points at $ACTIVE_ROOT/$dn which does not exist"
+    fi
+    if [[ "$pl" == *backlog-agent.plist ]]; then
+      (( is_loaded )) && { loaded_canonical=$((loaded_canonical + 1)); loaded_set="${loaded_set}${dn}|"; }
+    else
+      (( is_loaded )) && legacy_loaded_set="${legacy_loaded_set}${dn}|"
+    fi
+  done
+  # Double-daemons: a project running BOTH a canonical and a legacy-label daemon.
+  local dd_found=0 ln
+  local IFS='|'
+  for ln in $legacy_loaded_set; do
+    [[ -z "$ln" ]] && continue
+    case "$loaded_set" in
+      *"|$ln|"*) _d_fail "double-daemon: '$ln' runs both a canonical AND a legacy-label daemon"; dd_found=1 ;;
+      *) _d_warn "'$ln' runs only a legacy-label daemon (migrate via \`backlog-agent install-daemon\`)" ;;
+    esac
+  done
+  unset IFS
+  (( dd_found == 0 )) && _d_pass "no double-daemons"
+  _d_pass "$loaded_canonical canonical daemon(s) loaded"
+  # Manifest projects with no loaded daemon.
+  local mn
+  local IFS='|'
+  for mn in $manifest_set; do
+    [[ -z "$mn" ]] && continue
+    case "$loaded_set" in
+      *"|$mn|"*) : ;;
+      *) _d_warn "manifest project '$mn' has no loaded canonical daemon" ;;
+    esac
+  done
+  unset IFS
+
+  # --- 3. plists point at canonical (de-symlinked) paths ---
+  _d_head "Plist paths canonical"
+  local canon_bin=""
+  if [[ -f "$ACTIVE_ROOT/backlog-infra/bin/backlog-agent" ]]; then
+    canon_bin="$(cd "$ACTIVE_ROOT/backlog-infra/bin" 2>/dev/null && pwd -P)/backlog-agent"
+  fi
+  local checked=0
+  for pl in "$HOME"/Library/LaunchAgents/com."${USER}".*.backlog-agent.plist; do
+    [[ -f "$pl" ]] || continue
+    label="$(basename "$pl" .plist)"
+    local prog wdir
+    prog="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$pl" 2>/dev/null || true)"
+    wdir="$(/usr/libexec/PlistBuddy -c 'Print :WorkingDirectory' "$pl" 2>/dev/null || true)"
+    checked=$((checked + 1))
+    if [[ -n "$prog" && -n "$canon_bin" && "$prog" != "$canon_bin" ]]; then
+      _d_warn "$label: driver path '$prog' != canonical '$canon_bin'"
+    fi
+    if [[ -n "$wdir" ]]; then
+      local wdir_real; wdir_real="$(cd "$wdir" 2>/dev/null && pwd -P || true)"
+      if [[ -z "$wdir_real" ]]; then
+        _d_fail "$label: WorkingDirectory '$wdir' does not resolve"
+      elif [[ "$wdir_real" != "$wdir" ]]; then
+        _d_warn "$label: WorkingDirectory '$wdir' is a symlink → '$wdir_real' (re-install to canonicalize)"
+      fi
+    fi
+  done
+  (( checked > 0 )) && _d_pass "checked $checked canonical plist(s)" || _d_warn "no canonical plists found"
+
+  # --- 4. per-project config hygiene (gitignore + status hook) ---
+  _d_head "Per-project config"
+  local req_ignores=(".claude/backlog-agent.log" ".claude/backlog-agent.lock/" ".claude/backlog-status.json")
+  local proj pn gi hook miss
+  for proj in "$ACTIVE_ROOT"/*/; do
+    proj="${proj%/}"
+    [[ -d "$proj" ]] || continue
+    [[ -n "$(find_backlog_file "$proj")" ]] || continue
+    pn="$(basename "$proj")"
+    # gitignore patterns
+    gi="$proj/.gitignore"
+    miss=""
+    if [[ -f "$gi" ]]; then
+      local pat
+      for pat in "${req_ignores[@]}"; do
+        grep -qF "$pat" "$gi" 2>/dev/null || miss="${miss}${pat} "
+      done
+    else
+      miss="(no .gitignore) "
+    fi
+    [[ -n "$miss" ]] && _d_warn "$pn: missing gitignore pattern(s): $miss"
+    # status hook resolves (mirror the driver's resolution order)
+    if   [[ -f "$proj/scripts/backlog-agent-status.mjs" ]]; then hook="$proj/scripts/backlog-agent-status.mjs"
+    elif [[ -f "$proj/scripts/loop-status.mjs" ]];           then hook="$proj/scripts/loop-status.mjs"
+    elif [[ -f "$ACTIVE_ROOT/backlog-infra/bin/backlog-agent-status.mjs" ]]; then hook="$ACTIVE_ROOT/backlog-infra/bin/backlog-agent-status.mjs"
+    else hook=""; fi
+    if [[ -z "$hook" ]]; then
+      _d_fail "$pn: no status hook resolves (and shared fallback missing)"
+    elif command -v node >/dev/null 2>&1 && ! node --check "$hook" >/dev/null 2>&1; then
+      _d_fail "$pn: status hook has a syntax error ($hook)"
+    fi
+  done
+  (( fails == 0 )) && _d_pass "status hooks resolve; gitignore checked"
+
+  # --- 5. budgets file + required tools ---
+  _d_head "Globals & tools"
+  local budgets="$HOME/.claude/backlog-budgets.json"
+  if [[ ! -e "$budgets" ]]; then
+    _d_warn "no budgets file at $budgets (dashboard budget bars disabled)"
+  elif ! jq -e . "$budgets" >/dev/null 2>&1; then
+    _d_fail "budgets file is not valid JSON ($budgets)"
+  else
+    _d_pass "budgets file present and valid"
+  fi
+  local tool
+  for tool in git node jq; do
+    command -v "$tool" >/dev/null 2>&1 && _d_pass "$tool present" || _d_fail "$tool MISSING (required)"
+  done
+  for tool in gawk fswatch; do
+    command -v "$tool" >/dev/null 2>&1 && _d_pass "$tool present" \
+      || _d_warn "$tool not found (gawk avoids the BSD-awk inplace footgun; fswatch enables event-driven ticks)"
+  done
+
+  # --- summary ---
+  printf '\n  %s—%s %d fail, %d warn\n' "$DIM" "$RS" "$fails" "$warns"
+  if (( fails > 0 )); then
+    printf '  %s✗ doctor: %d hard failure(s)%s\n' "$RD" "$fails" "$RS"
+    return 1
+  fi
+  printf '  %s✓ doctor: no hard failures%s\n' "$GN" "$RS"
+  return 0
+}
+
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
@@ -1479,6 +1690,7 @@ cmd="${1:-}"
 case "$cmd" in
   sync) shift; do_sync "$@" ;;
   list) shift; do_list "$@" ;;
+  doctor) shift; do_doctor "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
   uninstall-watchdog) do_uninstall_watchdog ;;
@@ -1487,7 +1699,7 @@ case "$cmd" in
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
-    sed -n '2,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     # Default: snapshot. Parse flags here so they're scoped to this path.

@@ -37,6 +37,17 @@
 #                         the reaper-restart / fleet-freeze consult it so a daemon
 #                         never comes back up on an unvalidated driver.
 #
+#   backlog-agents freeze [--reason R] | --status | --check | --eval
+#   backlog-agents unfreeze
+#                         Fleet-freeze flag (docs/fleet-freeze.md). `freeze` holds
+#                         every NON-exempt daemon to heartbeat-only while a fleet-
+#                         affecting driver change is in flight; backlog-infra's own
+#                         daemon is EXEMPT (it lands + verifies the fix). Auto-clears
+#                         once version-skew is zero across live hosts AND the driver
+#                         is canary-green (`--eval`, run by the exempt daemon each
+#                         tick); `unfreeze` is the manual override. --status prints
+#                         the current state; --check exits 0 iff frozen.
+#
 #   backlog-agents metrics [--json]
 #                         Efficiency metrics from each project's per-tick ledger
 #                         (.claude/backlog-history.jsonl). Per-project table plus a
@@ -1918,6 +1929,177 @@ do_canary() {
   return 0
 }
 
+# ---- subcommand: freeze / unfreeze (W3, docs/fleet-freeze.md) ----
+# The fleet-freeze flag lives as a single fleet-wide row in the D1 telemetry bus
+# (GET/POST /api/fleet-control). The per-tick READ is in the driver
+# (`backlog-agent` _d1_freeze_get, jq-free, fail-open); the WRITES + the fleet-
+# wide clear EVALUATION live here because this CLI already speaks jq + computes
+# version-skew. Arm holds every NON-exempt daemon to heartbeat-only; the exempt
+# (backlog-infra) daemon keeps ticking and runs `freeze --eval` each tick.
+#
+#   backlog-agents freeze [--reason R]          manual arm (armed_by=manual)
+#   backlog-agents freeze --arm --sha S --by H  auto-arm (called by the driver)
+#   backlog-agents freeze --status              human-readable current state
+#   backlog-agents freeze --check               exit 0 iff currently frozen
+#   backlog-agents freeze --eval                auto-clear iff skew-zero + canary
+#   backlog-agents unfreeze                     manual override clear
+#
+# Overrides (testing): FREEZE_URL, HEALTH_URL, FREEZE_LIVENESS_SECS.
+FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
+HEALTH_URL="${HEALTH_URL:-https://kash-backlogs.pages.dev/api/health}"
+# DECISION B liveness window: a host whose heartbeat is older than this is not
+# counted toward skew-zero (a powered-off laptop must not pin the freeze). 90m,
+# mirroring the reaper's stale-claim threshold.
+FREEZE_LIVENESS_SECS="${FREEZE_LIVENESS_SECS:-5400}"
+
+_health_key() {
+  local f="$HOME/.config/backlog/health-key"
+  [[ -f "$f" ]] && tr -d '[:space:]' < "$f" 2>/dev/null || true
+}
+
+# Reference driver SHA = origin/main's last bin commit (short). Empty if no repo.
+_driver_ref_sha() {
+  local infra_dir="$ACTIVE_ROOT/backlog-infra" r=""
+  if [[ -d "$infra_dir/.git" ]]; then
+    git -C "$infra_dir" fetch origin main -q 2>/dev/null || true
+    r="$(git -C "$infra_dir" log -1 --format=%h origin/main -- bin 2>/dev/null || true)"
+    [[ -z "$r" ]] && r="$(git -C "$infra_dir" log -1 --format=%h -- bin 2>/dev/null || true)"
+  fi
+  printf '%s' "$r"
+}
+
+# GET the freeze row; echoes the raw JSON body. Returns non-zero on any failure
+# (no curl, network, non-200) so callers can decide (fail-open at the gate;
+# stay-frozen at the eval — see do_freeze).
+_fleet_control_get() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local key auth=() body code
+  key="$(_health_key)"; [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$FREEZE_URL" 2>/dev/null)" || return 1
+  code="$(printf '%s' "$body" | tail -n1)"; body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$code" == "200" ]] || return 1
+  printf '%s' "$body"
+}
+
+# POST arm/clear. $1=frozen(0/1) $2=reason $3=armed_by $4=arming_sha.
+# Needs the bearer key (writes are privileged). Returns non-zero on any failure.
+_fleet_control_post() {
+  command -v curl >/dev/null 2>&1 || { warn "freeze: curl not available"; return 1; }
+  local key; key="$(_health_key)"
+  [[ -z "$key" ]] && { warn "freeze: no health key at ~/.config/backlog/health-key — cannot write the flag"; return 1; }
+  local payload
+  payload="$(jq -cn --argjson frozen "${1:-0}" --arg reason "${2:-}" --arg by "${3:-}" --arg sha "${4:-}" \
+    '{frozen:$frozen,
+      reason:(if $reason=="" then null else $reason end),
+      armed_by:(if $by=="" then null else $by end),
+      arming_sha:(if $sha=="" then null else $sha end)}')" || { warn "freeze: failed to build payload"; return 1; }
+  local body code
+  body="$(curl -s -m 8 -X POST -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+          -d "$payload" -w $'\n%{http_code}' "$FREEZE_URL" 2>/dev/null)" || { warn "freeze: POST failed (network)"; return 1; }
+  code="$(printf '%s' "$body" | tail -n1)"
+  [[ "$code" == "200" ]] || { warn "freeze: POST returned HTTP ${code:-?}"; return 1; }
+  return 0
+}
+
+# True (0) iff every LIVE host (fresh heartbeat) reporting a driver_sha is on the
+# reference SHA — i.e. the in-flight change has PROPAGATED everywhere. Conservative
+# for the CLEAR direction: any fresh host on a different SHA, an unreadable
+# /api/health, or no reference ⇒ non-zero (stay frozen). Hosts with a null
+# driver_sha aren't counted (can't judge; likely non-daemon/loop rows).
+_fleet_skew_zero() {
+  local ref; ref="$(_driver_ref_sha)"
+  [[ -z "$ref" ]] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  local body code
+  body="$(curl -s -m 8 -w $'\n%{http_code}' "$HEALTH_URL" 2>/dev/null)" || return 1
+  code="$(printf '%s' "$body" | tail -n1)"; body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$code" == "200" ]] || return 1
+  local skewed
+  skewed="$(printf '%s' "$body" | jq -r --arg ref "$ref" --argjson win "$FREEZE_LIVENESS_SECS" '
+    [ (.projects // {}) | to_entries[].value
+      | select(.driver_sha != null and (.age_sec // 999999) < $win)
+      | select(.driver_sha != $ref) ] | length' 2>/dev/null || echo "")"
+  [[ "$skewed" == "0" ]]
+}
+
+do_freeze() {
+  local ARM=0 STATUS=0 CHECK=0 EVAL=0 reason="" sha="" by="manual"
+  while (( $# )); do
+    case "$1" in
+      --arm)    ARM=1 ;;
+      --status) STATUS=1 ;;
+      --check)  CHECK=1 ;;
+      --eval)   EVAL=1 ;;
+      --reason) shift; reason="${1:-}" ;;
+      --sha)    shift; sha="${1:-}" ;;
+      --by)     shift; by="${1:-}" ;;
+      *) echo "backlog-agents freeze: unknown flag: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  # --status / --check: read current state (no write).
+  if (( STATUS || CHECK )); then
+    local body frozen
+    if ! body="$(_fleet_control_get)"; then
+      (( CHECK )) && return 1
+      warn "freeze: cannot read flag (D1 unreachable)"; return 1
+    fi
+    frozen="$(printf '%s' "$body" | jq -r '.frozen // 0' 2>/dev/null || echo 0)"
+    if (( STATUS )); then
+      if [[ "$frozen" == "1" ]]; then
+        warn "fleet is FROZEN — armed_by=$(printf '%s' "$body" | jq -r '.armed_by // "—"') \
+sha=$(printf '%s' "$body" | jq -r '.arming_sha // "—"') reason: $(printf '%s' "$body" | jq -r '.reason // "—"')"
+      else
+        ok "fleet is thawed (not frozen)"
+      fi
+    fi
+    [[ "$frozen" == "1" ]]   # --check: exit 0 iff frozen
+    return
+  fi
+
+  # --eval: auto-clear iff the change has propagated (skew zero across live
+  # hosts) AND validated (canary green locally, via _sync_gate_check). Both must
+  # hold; any uncertainty ⇒ stay frozen (the safe CLEAR direction).
+  if (( EVAL )); then
+    local body frozen
+    if ! body="$(_fleet_control_get)"; then
+      warn "freeze --eval: cannot read flag (D1 unreachable); leaving as-is"; return 1
+    fi
+    frozen="$(printf '%s' "$body" | jq -r '.frozen // 0' 2>/dev/null || echo 0)"
+    [[ "$frozen" != "1" ]] && { ok "freeze --eval: not frozen, nothing to clear"; return 0; }
+    if ! _sync_gate_check >/dev/null 2>&1; then
+      info "freeze --eval: local driver not yet validated (version-skew or canary) — staying frozen"; return 1
+    fi
+    if ! _fleet_skew_zero; then
+      info "freeze --eval: version-skew across live hosts is not zero (fix not propagated) — staying frozen"; return 1
+    fi
+    if _fleet_control_post 0 "auto-clear: skew zero + canary green" "$(hostname 2>/dev/null | sed -E 's/\.local$//')" ""; then
+      ok "freeze --eval: clear condition met — fleet THAWED"; return 0
+    fi
+    return 1
+  fi
+
+  # Default / --arm: arm the freeze.
+  [[ -z "$reason" ]] && reason="manual freeze"
+  local arm_sha="$sha"
+  [[ -z "$arm_sha" ]] && arm_sha="$(_driver_ref_sha)"
+  if _fleet_control_post 1 "$reason" "$by" "$arm_sha"; then
+    ok "fleet FROZEN (armed_by=${by}, sha=${arm_sha:-—}) — reason: ${reason}"
+    ok "non-exempt daemons hold to heartbeat-only; clears on skew-zero + canary, or \`backlog-agents unfreeze\`"
+    return 0
+  fi
+  return 1
+}
+
+do_unfreeze() {
+  if _fleet_control_post 0 "manual unfreeze" "manual" ""; then
+    ok "fleet THAWED (manual override) — daemons resume on their next tick"
+    return 0
+  fi
+  return 1
+}
+
 # ---- subcommand: metrics ----
 # Efficiency metrics from each project's per-tick ledger
 # (.claude/backlog-history.jsonl, polyglot fallback effort-log.jsonl). Reads
@@ -2106,6 +2288,8 @@ case "$cmd" in
   list) shift; do_list "$@" ;;
   doctor) shift; do_doctor "$@" ;;
   canary) shift; do_canary "$@" ;;
+  freeze) shift; do_freeze "$@" ;;
+  unfreeze) shift; do_unfreeze "$@" ;;
   metrics) shift; do_metrics "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
@@ -2115,7 +2299,7 @@ case "$cmd" in
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
-    sed -n '2,78p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     # Default: snapshot. Parse flags here so they're scoped to this path.

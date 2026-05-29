@@ -1,12 +1,32 @@
 # Fleet freeze on in-flight driver changes — design
 
-**Status: DRAFT (W3), 2026-05-28.** Backlog item: *(P2 · W3) Fleet freeze on
+**Status: SHIPPED (W3), 2026-05-29.** Backlog item: *(P2 · W3) Fleet freeze on
 in-flight driver changes (infra = highest priority)* — pause-primitive consumer,
 `scope=fleet`. This is a **composite** that wires together pieces already built
 in W1/W3: the D1 telemetry bus + `heartbeat_epoch` (W1, live), the `driver_sha`
 version-skew signal (W1, shipped), and `backlog-agents canary --check` (W3 gate,
 shipped). This doc specifies the freeze flag itself — where it lives, who reads
 it, the state machine, and the exempt-daemon gotcha that prevents deadlock.
+
+> **What shipped (2026-05-29).** D1 `fleet_control` single-row table
+> (backlog-dashboard `migrations/0002_fleet_control.sql`) + `GET/POST
+> /api/fleet-control`. Driver (`bin/backlog-agent`): top-of-tick `_d1_freeze_get`
+> (jq-free, **fail-open**) → non-exempt daemon heartbeat-only (`TICK_OUTCOME=freeze`);
+> `freeze_exempt` carve-out runs `backlog-agents freeze --eval` then keeps ticking;
+> auto-arm on a `bin/` work-commit. CLI (`bin/backlog-agents`): `freeze
+> [--arm|--reason|--status|--check|--eval]` + `unfreeze`; `--eval` clears only on
+> `_sync_gate_check` (canary + local skew) **AND** `_fleet_skew_zero` (every live
+> host on the ref SHA, 90-min window). Tests: `test/fleet-freeze.bats` (14).
+> **DECISIONS resolved:** A = auto-arm on any `bin/` commit; B = 90-min liveness
+> window; C = **fail-open** at the per-tick gate (but the *clear* eval fails toward
+> staying-frozen); E = a dedicated endpoint (the driver reads at top-of-tick,
+> *before* the status-hook POSTs, so it can't ride the ingest response); F = one
+> `fleet_control` table keyed by `key` (the pause/stop sibling adds rows later).
+> **Still open:** D — when the exempt infra daemon is *down*, the freeze can't
+> auto-clear; manual `unfreeze` is the backstop (a watchdog-evaluator is a
+> follow-up). **Known gap:** `backlog-agents sync`'s `do_sync` restart loop
+> re-bootstraps the infra daemon, which un-holds it — the freeze exemption needs a
+> matching exclusion in `do_sync` (separate backlog item).
 
 Read alongside `architecture.md` §5 (coordination), §7 (`canary` + `doctor`),
 §8 (the launchd daemon model), and `d1-telemetry-schema.md` (the D1 schema and

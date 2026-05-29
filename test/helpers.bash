@@ -22,6 +22,12 @@ _setup_repo() {
   export HOME="$BATS_TEST_TMPDIR/home"
   mkdir -p "$HOME"
 
+  # Keep the suite hermetic: the driver reads the fleet-freeze flag at
+  # top-of-tick via a real `curl` GET (bin/backlog-agent _d1_freeze_get). Disable
+  # that read by default so ordinary tick tests never reach the network;
+  # fleet-freeze.bats re-enables it (FREEZE_DISABLE=0) behind a curl stub.
+  export FREEZE_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

@@ -157,6 +157,30 @@ DIFF_SIZE_MAX_LINES=400
 # machinery or release/ignore config. Space-separated repo-relative paths.
 PROTECTED_PATHS="bin/backlog-agent bin/backlog-agent-status.mjs release.mjs CLAUDE.md .gitignore"
 
+# Fleet-freeze (W3, docs/fleet-freeze.md). Because bin/ is SHARED, a
+# fleet-affecting infra change in flight should hold the REST of the fleet to
+# heartbeat-only rather than have it work on mid-flight / unverified machinery.
+# The flag is a single fleet-wide row in the D1 telemetry bus, read at
+# top-of-tick (the same structural slot as cooldown_active). Reads are
+# DEPENDENCY-LIGHT + FAIL-OPEN: D1 unreachable ⇒ treat as not frozen (a control-
+# plane outage must not become a fleet-wide stall; manual pause is the backstop).
+#   - FREEZE_PROJECT: the project whose OWN daemon is EXEMPT from the freeze (it
+#     must keep ticking to land + verify the fix, else the freeze never clears →
+#     deadlock). For the exempt daemon the flag means "evaluate the clear".
+#   - FREEZE_CACHE: last-seen state, written on every successful read. Purely
+#     observational (surfaced by `backlog-agents`); the gate itself fail-opens.
+#   - FLEET_AFFECTING_PREFIX: a committed path under here (the shared driver dir)
+#     arms the freeze when the EXEMPT daemon commits it (auto-arm).
+# Arm/clear WRITES + the fleet-wide clear EVALUATION live in `backlog-agents`
+# (it already speaks jq + computes version-skew); the driver only does the cheap
+# jq-free read here and delegates the rest.
+FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
+FREEZE_PROJECT="${FREEZE_PROJECT:-backlog-infra}"
+FREEZE_CACHE="${STATE_DIR}/fleet-freeze.cache"
+FLEET_AFFECTING_PREFIX="bin/"
+# Set to 1 in tests / to hard-disable the freeze read (skips the D1 GET).
+FREEZE_DISABLE="${FREEZE_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -595,6 +619,48 @@ _d1_heartbeat_epoch() {
            | grep -oE '[0-9]+$' | head -n1 || true)"
   [[ -n "$epoch" ]] && printf '%s' "$epoch"
   return 0
+}
+
+# --- Fleet-freeze flag read (docs/fleet-freeze.md §3) ---
+# Read the single fleet-wide freeze row from the D1 telemetry bus. Echoes
+# "<frozen>\t<reason>" where <frozen> is 0/1; echoes NOTHING on any failure
+# (unreachable, non-200, malformed) — FAIL-OPEN: the caller treats "no answer"
+# as not-frozen, so a control-plane outage never stalls the fleet. Same curl
+# idiom + bash-3.2-safe auth expansion as _d1_heartbeat_epoch. On a successful
+# read it refreshes FREEZE_CACHE (observational only; the gate fail-opens).
+_d1_freeze_get() {
+  [[ "$FREEZE_DISABLE" == "1" ]] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key"
+  local auth=() key
+  if [[ -f "$key_file" ]]; then
+    key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+    [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  fi
+  local body http_code frozen reason
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$FREEZE_URL" 2>/dev/null)" || return 0
+  http_code="$(printf '%s' "$body" | tail -n1)"
+  body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$http_code" == "200" ]] || return 0
+  # jq-free integer extract (same idiom as cooldown_active / heartbeat).
+  frozen="$(printf '%s' "$body" \
+            | grep -oE '"frozen"[[:space:]]*:[[:space:]]*[0-9]+' \
+            | grep -oE '[0-9]+$' | head -n1 || true)"
+  [[ -z "$frozen" ]] && return 0
+  reason="$(printf '%s' "$body" \
+            | grep -oE '"reason"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  # Refresh the observational cache (best-effort; never blocks the gate).
+  printf '%s\t%s\n' "$frozen" "$reason" > "$FREEZE_CACHE" 2>/dev/null || true
+  printf '%s\t%s' "$frozen" "$reason"
+  return 0
+}
+
+# True (0) iff THIS project's daemon is the freeze-exempt one (backlog-infra's
+# own daemon). The exempt daemon must keep ticking while frozen to land + verify
+# the fix — for it the flag is a signal to EVALUATE the clear, never to stop.
+freeze_exempt() {
+  [[ "$(_health_project)" == "$FREEZE_PROJECT" ]]
 }
 
 # Reclaim stale [~] items that were claimed but never completed.
@@ -1096,6 +1162,36 @@ tick_once() {
     fi  # end fallback-unavailable (Layer 2 idle) branch
   fi
 
+  # --- Fleet-freeze short-circuit (docs/fleet-freeze.md) ---
+  # When a fleet-affecting infra change is in flight, the D1 freeze flag holds
+  # the rest of the fleet to heartbeat-only rather than working on stale /
+  # unverified shared machinery. Structural twin of the cooldown short-circuit
+  # above. backlog-infra's OWN daemon is EXEMPT: for it the flag is a signal to
+  # EVALUATE the clear condition (delegated to `backlog-agents freeze --eval`),
+  # then keep ticking normally so the fix can land + the fleet can thaw.
+  local _freeze; _freeze="$(_d1_freeze_get)"
+  if [[ "${_freeze%%$'\t'*}" == "1" ]]; then
+    if freeze_exempt; then
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet-freeze active — exempt daemon (${FREEZE_PROJECT}); evaluating clear, continuing to tick" | tee -a "$LOG_FILE"
+      # Best-effort: try to clear (skew zero across live hosts AND canary green).
+      # Never blocks this tick — the exempt daemon always proceeds to work.
+      if command -v backlog-agents >/dev/null 2>&1; then
+        backlog-agents freeze --eval >>"$LOG_FILE" 2>&1 || true
+      fi
+      # fall through to the normal claim + work flow
+    else
+      local _fz_reason="${_freeze#*$'\t'}"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet-freeze active (${_fz_reason:-in-flight infra change}); heartbeat only (skipping claude until the fleet thaws)" | tee -a "$LOG_FILE"
+      pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+      _run_status_hook "" 0 loop "$pre_head" 0
+      _post_tick_cleanup
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (fleet-freeze)" | tee -a "$LOG_FILE"
+      log_event tick_done outcome freeze reason "${_fz_reason:-}" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+      TICK_OUTCOME=freeze
+      return 0
+    fi
+  fi
+
   # Pull before reading the backlog — catches cross-machine changes from
   # other computers that pushed to origin. Best-effort: no upstream is fine,
   # network failure is fine, dirty working tree is fine (leave it alone).
@@ -1474,6 +1570,29 @@ tick_once() {
           echo "  [WARNING] protected-path guardrail: '${item_title}' modified protected file(s): ${protected_hit} — review this tick" | tee -a "$LOG_FILE"
           log_event protected_path_touched item "$item_title" paths "$protected_hit"
         fi
+
+        # --- Fleet-freeze auto-arm (docs/fleet-freeze.md §2) ---
+        # Only the EXEMPT (backlog-infra) daemon arms: when its own work commit
+        # touches the SHARED driver dir (FLEET_AFFECTING_PREFIX = bin/), a
+        # fleet-affecting change is in flight — hold the rest of the fleet to
+        # heartbeat-only until it propagates (skew zero) + validates (canary).
+        # Distinct from PROTECTED_PATHS above (per-project review signal; that
+        # set also covers CLAUDE.md/.gitignore, which are NOT fleet-affecting).
+        # The clear is fast + automatic, so arming on every bin/ commit is cheap.
+        if freeze_exempt && command -v backlog-agents >/dev/null 2>&1; then
+          local fleet_hit=""
+          while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            if [[ "$f" == "$FLEET_AFFECTING_PREFIX"* ]]; then fleet_hit+="${f} "; fi
+          done < <(git -C "$PWD" diff --name-only "$work_base" "$work_head" 2>/dev/null || true)
+          if [[ -n "$fleet_hit" ]]; then
+            fleet_hit="${fleet_hit% }"
+            echo "  [fleet-freeze] arming: fleet-affecting change committed (${fleet_hit}) — holding the fleet until propagated + canary-green" | tee -a "$LOG_FILE"
+            log_event fleet_freeze_armed item "$item_title" sha "$work_head" paths "$fleet_hit"
+            backlog-agents freeze --arm --sha "$work_head" --by "$(_health_host)" \
+              --reason "in-flight infra change: ${item_title}" >>"$LOG_FILE" 2>&1 || true
+          fi
+        fi
       fi
     fi
   fi
@@ -1639,6 +1758,12 @@ do_run() {
         else
           sleep_sec="$HEARTBEAT_SECONDS"
         fi ;;
+      freeze)
+        # Fleet-freeze hold: heartbeat-only at the normal heartbeat cadence so
+        # the fleet view sees the daemon alive (just frozen), and the daemon
+        # re-checks the flag promptly once the rollout thaws.
+        idle_streak=0
+        sleep_sec="$HEARTBEAT_SECONDS" ;;
       *) sleep_sec="$FAST_SECONDS" ;;
     esac
     [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"
@@ -1688,6 +1813,12 @@ do_watch() {
         else
           sleep_sec="$HEARTBEAT_SECONDS"
         fi ;;
+      freeze)
+        # Fleet-freeze hold: heartbeat-only at the normal heartbeat cadence so
+        # the fleet view sees the daemon alive (just frozen), and the daemon
+        # re-checks the flag promptly once the rollout thaws.
+        idle_streak=0
+        sleep_sec="$HEARTBEAT_SECONDS" ;;
       *) sleep_sec="$FAST_SECONDS" ;;
     esac
     [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"

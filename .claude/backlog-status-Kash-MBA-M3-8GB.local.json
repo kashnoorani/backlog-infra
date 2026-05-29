@@ -1,24 +1,29 @@
 {
-  "last_tick_at": "2026-05-28T22:24:57.673Z",
+  "last_tick_at": "2026-05-29T09:35:31.277Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
-  "last_item": "",
+  "last_item": "Implement Layer 3: opt-in `~/.claude/agent-fallback.json`, OpenCode invocation, status-hook extension to log `agent=` in the trailer.",
   "last_exit_code": 0,
-  "last_tokens": 15592,
-  "last_work_commit": null,
-  "last_pull_count": 2,
-  "last_session_id": "e03da41a-3782-4b2a-92d1-4785ce437cd4",
-  "rolling_7d_tokens": 430233,
+  "last_tokens": 121937,
+  "last_work_commit": "ddddc01",
+  "full_commit": "ddddc018fc7bc3cc960195d18594dd3b45132348",
+  "repo_slug": "kashnoorani/backlog-infra",
+  "completed": false,
+  "completed_items": [],
+  "last_pull_count": 0,
+  "last_session_id": "07de53da-d249-4633-9644-94a1aa58bb29",
+  "driver_sha": "ddddc01",
+  "rolling_7d_tokens": 552170,
   "backlog": {
-    "thinking": 0,
-    "open": 0,
-    "in_progress": 1,
-    "blocked": 1,
-    "done": 0
+    "thinking": 30,
+    "open": 3,
+    "in_progress": 0,
+    "blocked": 0,
+    "done": 1
   },
   "artifacts": {
     "uncommitted": [],
-    "unpushed_commits": 0,
-    "computed_at": "2026-05-28T22:24:59.586Z"
+    "unpushed_commits": 1,
+    "computed_at": "2026-05-29T09:35:32.812Z"
   }
 }

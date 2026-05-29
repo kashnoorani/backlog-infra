@@ -113,6 +113,29 @@ COOLDOWN_FILE="${STATE_DIR}/agent-cooldown.json"
 # and/or email alert. Absent file / empty keys → silent no-op.
 NOTIFY_CONFIG="${HOME}/.claude/agent-notify.json"
 
+# Per-item circuit breaker (W2). Track consecutive failures per item title in
+# a JSON state file. After CIRCUIT_BREAKER_THRESHOLD consecutive failed ticks
+# for the SAME item (claude exit != 0 → unclaimed), stop re-claiming it: flip
+# it [ ]/[!] → [?] with an inline note and let the user weigh in. The counter
+# resets when the item completes ([x]) or a tick succeeds. Per-host ephemeral
+# state, gitignored like the event log.
+CIRCUIT_BREAKER_THRESHOLD=3
+FAILCOUNTS_FILE="${STATE_DIR}/backlog-agent-failcounts.json"
+
+# Diff-size guardrail (W2). After a work tick, inspect the commit(s) claude
+# pushed. If a single tick touched more than DIFF_SIZE_MAX_FILES files or
+# DIFF_SIZE_MAX_LINES changed lines, it's likely a runaway edit — log_event
+# diff_oversize and emit a loud warning so the user can review. We do NOT
+# auto-revert; the commit stands, we just flag it.
+DIFF_SIZE_MAX_FILES=20
+DIFF_SIZE_MAX_LINES=400
+
+# Protected-path guardrail (W2). If a tick's changes touch any of these
+# load-bearing infra files, log_event protected_path_touched and flag for
+# review. Belt-and-suspenders against an automated tick rewriting its own
+# machinery or release/ignore config. Space-separated repo-relative paths.
+PROTECTED_PATHS="bin/backlog-agent bin/backlog-agent-status.mjs release.mjs CLAUDE.md .gitignore"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -269,6 +292,63 @@ log_event() {
   done
   line+="}"
   printf '%s\n' "$line" >> "$EVENT_LOG_FILE" 2>/dev/null || true
+}
+
+# --- per-item circuit breaker (W2) ---
+# A flat JSON object { "<item title>": <consecutive-fail-count>, ... } in
+# $FAILCOUNTS_FILE. Keyed by the exact item title (same string log_event
+# carries), so quotes/backslashes in titles must round-trip safely — hence
+# node for parse/serialize rather than grep/sed. node is already a hard
+# dependency (the status hook and compactor are .mjs). Best-effort: a missing
+# file or write failure is a silent no-op so the breaker can never abort a tick.
+
+# Echo the current consecutive-failure count for an item title (0 if absent or
+# the file is missing/unreadable/malformed).
+failcount_get() {
+  local item="$1"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && { echo 0; return 0; }
+  [[ -f "$FAILCOUNTS_FILE" ]] || { echo 0; return 0; }
+  node -e '
+    const fs = require("fs");
+    const [file, item] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    const n = Number.isInteger(obj[item]) ? obj[item] : 0;
+    process.stdout.write(String(n));
+  ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || echo 0
+}
+
+# Increment the consecutive-failure count for an item title; echoes the new
+# count. Creates the file on first failure.
+failcount_bump() {
+  local item="$1"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && { echo 0; return 0; }
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  node -e '
+    const fs = require("fs");
+    const [file, item] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    const n = (Number.isInteger(obj[item]) ? obj[item] : 0) + 1;
+    obj[item] = n;
+    try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
+    process.stdout.write(String(n));
+  ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || echo 0
+}
+
+# Drop an item from the failcount map (called when it completes or a tick
+# succeeds). Silent no-op if there's no file or no such key.
+failcount_reset() {
+  local item="$1"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && return 0
+  [[ -f "$FAILCOUNTS_FILE" ]] || return 0
+  node -e '
+    const fs = require("fs");
+    const [file, item] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    if (item in obj) { delete obj[item]; try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {} }
+  ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || true
 }
 
 # --- helpers ---
@@ -460,7 +540,11 @@ _post_tick_cleanup() {
 
   # Auto-compact — archive Done items when they pile up.
   local done_count
-  done_count="$(grep -cE '^(- )?\[x\] ' "$BACKLOG_FILE" 2>/dev/null || echo 0)"
+  # grep -c prints "0" AND exits 1 on no matches; `|| echo 0` would then append a
+  # SECOND "0", yielding "0\n0" and a `[[: 0 0: syntax error`. Use `|| true` to
+  # keep grep's own count and normalize empty (missing file) to 0.
+  done_count="$(grep -cE '^(- )?\[x\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
+  done_count="${done_count:-0}"
   if [[ "$done_count" -gt 20 ]] && [[ -f "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Done section has ${done_count} items; auto-compacting..." | tee -a "$LOG_FILE"
     node "$HOME/dev/projects/active/backlog-infra/bin/backlog-agent-compact.mjs" >> "$LOG_FILE" 2>&1 || true
@@ -882,6 +966,47 @@ tick_once() {
     return 0
   fi
 
+  # --- Guard 1 (W2): per-item circuit breaker ---
+  # If this exact item has already failed CIRCUIT_BREAKER_THRESHOLD ticks in a
+  # row, stop re-claiming it. Flip it [ ]/[!] → [?] in place with an inline
+  # note, commit+push just that markup (same unclaim commit+push pattern as
+  # below), and skip claude entirely so the user can weigh in. The per-item
+  # counter is reset only when the item completes or a tick succeeds.
+  local item_fails; item_fails="$(failcount_get "$item_title")"
+  if (( item_fails >= CIRCUIT_BREAKER_THRESHOLD )); then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] circuit breaker: '${item_title}' failed ${item_fails}x consecutively — auto-blocking [?] and skipping claude" | tee -a "$LOG_FILE"
+    # Flip the first eligible [ ]/[!] item in ## Open to [?] and append the
+    # auto-block note. Scoped to ## Open like the claim flip; matches only
+    # the first item so we never touch a later one.
+    _local_awk_inplace "$BACKLOG_FILE" '
+      BEGIN { in_open=0; done=0 }
+      /^## Open/       { in_open=1; print; next }
+      /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+      in_open && !done && /^(- )?\[[ !]\] / {
+        sub(/\[[ !]\]/, "[?]")
+        $0 = $0 " — [circuit-breaker] auto-blocked after '"$CIRCUIT_BREAKER_THRESHOLD"' failed attempts"
+        done=1
+      }
+      { print }
+    ' 2>/dev/null || true
+    if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+      git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+      git -C "$PWD" commit -m "circuit-breaker: auto-block ${item_title}" >/dev/null 2>&1
+      git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+      echo "  [circuit-breaker] auto-blocked ${item_title}" | tee -a "$LOG_FILE"
+    fi
+    log_event circuit_tripped item "$item_title" fails "$item_fails"
+    # The item is no longer open; drop its counter so a later retry starts fresh.
+    failcount_reset "$item_title"
+    _run_status_hook "" 0 loop "$pre_head" "$pulled"
+    _post_tick_cleanup
+    [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (circuit-breaker)" | tee -a "$LOG_FILE"
+    log_event tick_done outcome circuit_breaker item "$item_title" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+    TICK_OUTCOME=idle
+    return 0
+  fi
+
   # Flip the selected item from [ ] → [~] so other machines on the same
   # project skip it. Commit+push the marker change before claude runs.
   # If claude fails, flip it back. If the daemon crashes mid-tick the [~]
@@ -963,6 +1088,10 @@ tick_once() {
   # reports claude's exit rather than tee's.
   local capture_file
   capture_file="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.claude-out.$$")"
+  # Snapshot HEAD immediately before claude runs so Guards 2/3 can scope their
+  # diff to exactly the commit(s) claude pushed this tick (excluding the
+  # daemon's own reclaim/claim commits, which only touch the backlog file).
+  local work_base; work_base="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
   claude_exit=0
   { claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE" "$capture_file"; } \
     || claude_exit=${PIPESTATUS[0]}
@@ -1001,11 +1130,60 @@ tick_once() {
         git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
         git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
         echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
+        # Guard 1 (W2): record this consecutive failure. Once the count reaches
+        # CIRCUIT_BREAKER_THRESHOLD the next tick auto-blocks the item ([?]) up
+        # front instead of re-claiming and re-failing.
+        local new_fails; new_fails="$(failcount_bump "$item_title")"
+        log_event item_failed item "$item_title" fails "$new_fails"
       fi
     fi
   else
     if [[ "$claimed" == "true" ]]; then
       _maybe_auto_complete "$item_title" >/dev/null 2>&1 || true
+    fi
+    # Guard 1 (W2): a clean tick clears the item's consecutive-failure streak.
+    failcount_reset "$item_title"
+
+    # --- Guards 2 & 3 (W2): inspect what claude actually committed this tick ---
+    # Both scope their diff to work_base..HEAD — the commit(s) claude pushed,
+    # excluding the daemon's own reclaim/claim markup commits. Neither
+    # auto-reverts: the commit stands and we flag it for the user to review.
+    if [[ -n "$work_base" ]]; then
+      local work_head; work_head="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
+      if [[ -n "$work_head" && "$work_head" != "$work_base" ]]; then
+        local changed_files changed_lines
+        changed_files="$(git -C "$PWD" diff --name-only "$work_base" "$work_head" 2>/dev/null | grep -c . || true)"
+        changed_files="${changed_files:-0}"
+        # Sum insertions+deletions across the range (numstat: <add>\t<del>\t<path>).
+        changed_lines="$(git -C "$PWD" diff --numstat "$work_base" "$work_head" 2>/dev/null \
+          | awk '{ a=($1=="-"?0:$1); d=($2=="-"?0:$2); sum+=a+d } END { print sum+0 }' || true)"
+        changed_lines="${changed_lines:-0}"
+
+        # Guard 2: diff-size guardrail.
+        if (( changed_files > DIFF_SIZE_MAX_FILES || changed_lines > DIFF_SIZE_MAX_LINES )); then
+          echo "  [WARNING] diff-size guardrail: '${item_title}' touched ${changed_files} file(s) / ${changed_lines} line(s) (limits: ${DIFF_SIZE_MAX_FILES} files, ${DIFF_SIZE_MAX_LINES} lines) — review this tick" | tee -a "$LOG_FILE"
+          log_event diff_oversize item "$item_title" files "$changed_files" lines "$changed_lines" max_files "$DIFF_SIZE_MAX_FILES" max_lines "$DIFF_SIZE_MAX_LINES"
+        fi
+
+        # Guard 3: protected-path guardrail. Flag if any committed file matches
+        # a protected path. Exact path match against the repo-relative names.
+        local protected_hit="" f p
+        while IFS= read -r f; do
+          [[ -z "$f" ]] && continue
+          for p in $PROTECTED_PATHS; do
+            if [[ "$f" == "$p" ]]; then
+              protected_hit+="${f} "
+              break
+            fi
+          done
+        done < <(git -C "$PWD" diff --name-only "$work_base" "$work_head" 2>/dev/null || true)
+        if [[ -n "$protected_hit" ]]; then
+          # Trim trailing space.
+          protected_hit="${protected_hit% }"
+          echo "  [WARNING] protected-path guardrail: '${item_title}' modified protected file(s): ${protected_hit} — review this tick" | tee -a "$LOG_FILE"
+          log_event protected_path_touched item "$item_title" paths "$protected_hit"
+        fi
+      fi
     fi
   fi
   rm -f "$capture_file" 2>/dev/null || true

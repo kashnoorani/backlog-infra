@@ -5,6 +5,7 @@ dist/
 .claude/backlog.lock/
 .claude/backlog-agent.log
 .claude/backlog-agent-events.jsonl
+.claude/backlog-agent-failcounts.json
 .claude/backlog-agent.lock/
 .claude/backlog-tick.inflight
 .claude/backlog-agent-tick.inflight

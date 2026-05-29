@@ -1,0 +1,28 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Lint the shell driver. Starts non-blocking (continue-on-error) because the
+  # ~1400-line driver has not been shellcheck-cleaned yet — this surfaces the
+  # quoting / unset-var / pipefail class without blocking work. Flip to
+  # blocking (remove continue-on-error) once the existing warnings are cleared.
+  shellcheck:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck -e SC1091 -S warning bin/backlog-agent bin/_lib.sh
+
+  # Behavioral tests run on macOS — the driver uses BSD-isms (sed -i '',
+  # date -r) and is macOS-targeted (the fleet runs on Macs).
+  bats:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install bats-core
+      - run: bats test/*.bats

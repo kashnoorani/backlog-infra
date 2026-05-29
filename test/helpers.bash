@@ -28,6 +28,12 @@ _setup_repo() {
   # fleet-freeze.bats re-enables it (FREEZE_DISABLE=0) behind a curl stub.
   export FREEZE_DISABLE=1
 
+  # Same for the account-cooldown read/publish (bin/backlog-agent
+  # _d1_account_cooldown_epoch / _d1_publish_cooldown): disabled by default so
+  # ordinary tick tests never reach the network; account-cooldown.bats re-enables
+  # it (ACCOUNT_COOLDOWN_DISABLE=0) behind a curl stub.
+  export ACCOUNT_COOLDOWN_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

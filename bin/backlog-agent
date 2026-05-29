@@ -186,6 +186,24 @@ FLEET_AFFECTING_PREFIX="bin/"
 # Set to 1 in tests / to hard-disable the freeze read (skips the D1 GET).
 FREEZE_DISABLE="${FREEZE_DISABLE:-0}"
 
+# Account-level shared cooldown (W2, scope=fleet; rides the D1 bus). The Anthropic
+# plan limit is PER-ACCOUNT — shared across every machine + project — but
+# start_cooldown arms a LOCAL per-project cooldown file. So when one daemon hits
+# the cap, the other 11 daemon×project combos (6 projects × 2 machines) each have
+# to independently fail a claude call before arming their own cooldown — a
+# fleet-wide burst of wasted failing calls every time the cap is hit. The fix is a
+# single account-level cooldown signal on D1 (a dedicated /api/cooldown row
+# carrying the reset `until_epoch`) that every tick consults FIRST, so the WHOLE
+# FLEET stands down at once the moment ANY daemon detects the limit — and resumes
+# together at the reset. The read is jq-free + FAIL-OPEN (D1 unreachable ⇒ fall
+# back to the local per-project cooldown, never a fleet stall); the local Layer-2/3
+# cooldown stays intact as that fallback. The signal AUTO-EXPIRES at until_epoch
+# (no manual clear needed — the first daemon past the reset proceeds and it
+# lapses). docs/account-cooldown.md.
+COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
+# Set to 1 in tests / to hard-disable the account-cooldown read + publish.
+ACCOUNT_COOLDOWN_DISABLE="${ACCOUNT_COOLDOWN_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -681,6 +699,41 @@ _d1_control_get() {
   return 0
 }
 
+# --- Account-level cooldown read (W2; docs/account-cooldown.md) ---
+# Echo the account cooldown's `until_epoch` from the D1 bus (dedicated
+# /api/cooldown row), or NOTHING on any failure / when no cooldown is active —
+# FAIL-OPEN: the caller treats "no answer" as "no account cooldown" and falls back
+# to the local per-project cooldown, so a control-plane outage never stalls the
+# fleet. The endpoint already gates `active` server-side (until_epoch present AND
+# in the future), but we ALSO re-check now<until_epoch with the LOCAL clock (same
+# idiom as cooldown_active) so edge clock-skew can't pin the fleet. Same curl + the
+# bash-3.2-safe auth expansion as _d1_heartbeat_epoch / _d1_control_get.
+_d1_account_cooldown_epoch() {
+  [[ "$ACCOUNT_COOLDOWN_DISABLE" == "1" ]] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key"
+  local auth=() key
+  if [[ -f "$key_file" ]]; then
+    key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+    [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  fi
+  local body http_code epoch now
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$COOLDOWN_URL" 2>/dev/null)" || return 0
+  http_code="$(printf '%s' "$body" | tail -n1)"
+  body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$http_code" == "200" ]] || return 0
+  # jq-free integer extract, same idiom as cooldown_active / heartbeat. A null /
+  # absent until_epoch finds nothing -> empty -> fail-open (no account cooldown).
+  epoch="$(printf '%s' "$body" \
+           | grep -oE '"until_epoch"[[:space:]]*:[[:space:]]*[0-9]+' \
+           | grep -oE '[0-9]+$' | head -n1 || true)"
+  [[ -n "$epoch" ]] || return 0
+  now="$(date +%s)"
+  (( now < epoch )) || return 0   # expired ⇒ no account cooldown (auto-expiry)
+  printf '%s' "$epoch"
+  return 0
+}
+
 # True (0) iff THIS project's daemon is the freeze-exempt one (backlog-infra's
 # own daemon). The exempt daemon must keep ticking while frozen to land + verify
 # the fix — for it the flag is a signal to EVALUATE the clear, never to stop.
@@ -822,6 +875,36 @@ cooldown_until_str() {
     | sed -E 's/.*"([^"]*)"$/\1/' | head -n1 || true
 }
 
+# --- Account-level cooldown publish (W2; docs/account-cooldown.md) ---
+# When THIS daemon arms a local cooldown (plan-limit detected), ALSO publish the
+# reset to the D1 bus so the WHOLE FLEET stands down at once instead of every
+# other daemon×project failing its own claude call first. jq-free hand-built
+# payload (the driver avoids a jq dependency); bearer-auth (writes are privileged,
+# same key as the reads). Best-effort + backgrounded with a short timeout (like
+# notify_cooldown) so a slow / unreachable D1 can never stall or abort the tick.
+# The endpoint keeps the LATER until_epoch (max) across concurrent writers, so a
+# daemon that couldn't parse the reset (and fell back to a shorter window) can't
+# truncate a correctly-parsed longer cooldown. No-op without a health key or curl
+# (the local cooldown still holds for this project).
+_d1_publish_cooldown() {
+  [[ "$ACCOUNT_COOLDOWN_DISABLE" == "1" ]] && return 0
+  local until_epoch="${1:-}"
+  [[ "$until_epoch" =~ ^[0-9]+$ ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key" key=""
+  [[ -f "$key_file" ]] && key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+  [[ -n "$key" ]] || return 0   # no key ⇒ can't write; local cooldown still holds
+  local host payload
+  host="$(_health_host)"
+  # Hand-built JSON (jq-free). Values are an integer + a constant + a hostname —
+  # no untrusted interpolation.
+  payload="$(printf '{"until_epoch":%s,"reason":"anthropic-plan-limit","armed_by":"%s"}' "$until_epoch" "$host")"
+  ( curl -s -m 8 -X POST \
+      -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+      -d "$payload" "$COOLDOWN_URL" >/dev/null 2>&1 || true ) &
+  return 0
+}
+
 # Arm a cooldown: write COOLDOWN_FILE. If $1 is a numeric epoch (parsed
 # from claude's "resets X:XXpm" message), use it directly; otherwise fall
 # back to COOLDOWN_SECONDS from now.
@@ -858,6 +941,10 @@ JSON
   echo "  [cooldown] plan/session limit detected — pausing claude ticks ${wait_info} (rm ${COOLDOWN_FILE} to clear)" | tee -a "$LOG_FILE"
   log_event cooldown_armed until "$until_iso" until_epoch "$until_epoch" reason "$reason" parsed_from_reset "$parsed_from"
   notify_cooldown "$until_iso"
+  # Publish the per-account reset to the D1 bus so the whole fleet stands down at
+  # once (account-cooldown, W2). Best-effort + fail-open: a failed publish only
+  # means the other daemons fall back to detecting the limit themselves.
+  _d1_publish_cooldown "$until_epoch"
 }
 
 # Fire an opt-in Slack/email alert that this project's daemon just entered a
@@ -1147,20 +1234,29 @@ tick_once() {
   } | tee -a "$LOG_FILE"
   log_event tick_start
 
-  # --- Layer 2: plan-limit cooldown short-circuit ---
+  # --- Layer 2: plan-limit cooldown short-circuit (local + account-wide) ---
   # A prior tick may have hit the Anthropic plan/session cap and armed a
   # cooldown (docs/multi-agent-design.md). While it's active, skip the claude
   # invocation entirely — it would just fail again in ~1s and burn a
   # fail-loop. Heartbeat the status file so the fleet view shows the daemon
   # alive (not STALE), then return without claiming any item.
-  if cooldown_active; then
+  #
+  # The cooldown is the UNION of THIS project's LOCAL cooldown and the FLEET-WIDE
+  # account cooldown published to D1 by whichever daemon FIRST hit the per-account
+  # plan limit (account-cooldown, W2). Consulting the account signal FIRST means
+  # the whole fleet stands down at once — the other daemons no longer each have to
+  # fail their own claude call to discover the cap. The account read FAILS OPEN
+  # (D1 unreachable ⇒ empty), so it degrades cleanly to the existing local-only
+  # behaviour — never a regression to the per-project cooldown.
+  local acct_cd_epoch; acct_cd_epoch="$(_d1_account_cooldown_epoch)"
+  if cooldown_active || [[ -n "$acct_cd_epoch" ]]; then
     # --- Layer 3: alternative-agent fallback ---
     # Rather than idling through the whole cooldown, if an opt-in fallback agent
     # (e.g. OpenCode/DeepSeek) is configured and available, fall THROUGH to the
-    # normal claim+work path with that agent driving the tick. The Claude plan
-    # limit is per-account; a different provider isn't affected, so simple items
-    # can still make progress. If no fallback is available, keep the Layer 2
-    # heartbeat-only behavior below.
+    # normal claim+work path with that agent driving the tick. The Anthropic plan
+    # limit (local OR account) is per-account; a different provider isn't capped,
+    # so simple items can still make progress. If no fallback is available, keep
+    # the Layer 2 heartbeat-only behavior below.
     if fallback_agent_available; then
       use_fallback=1
       agent_name="$(fallback_agent_name)"
@@ -1168,20 +1264,35 @@ tick_once() {
       log_event fallback_agent agent "$agent_name"
       # fall through — do NOT short-circuit.
     else
-    local cd_until; cd_until="$(cooldown_until_str)"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-limit cooldown active until ${cd_until:-?}; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
+    # Effective reset = the LATER of the local + account until_epoch (whichever is
+    # active) so the daemon loop sleeps until the fleet actually resumes.
+    local local_cd_epoch eff_epoch cd_source cd_until
+    local_cd_epoch="$(grep -oE '"until_epoch"[[:space:]]*:[[:space:]]*[0-9]+' "$COOLDOWN_FILE" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || true)"
+    eff_epoch="$acct_cd_epoch"
+    if [[ -n "$local_cd_epoch" ]]; then
+      if [[ -z "$eff_epoch" ]] || (( local_cd_epoch > eff_epoch )); then eff_epoch="$local_cd_epoch"; fi
+    fi
+    if [[ -n "$acct_cd_epoch" ]]; then
+      cd_source="account"; [[ -n "$local_cd_epoch" ]] && cd_source="local+account"
+    else
+      cd_source="local"
+    fi
+    cd_until=""
+    if [[ -n "$eff_epoch" ]]; then
+      cd_until="$(date -u -r "$eff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$eff_epoch" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '')"
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-limit cooldown active (${cd_source}) until ${cd_until:-?}; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
     pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
     _run_status_hook "" 0 loop "$pre_head" 0
     _post_tick_cleanup
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (cooldown)" | tee -a "$LOG_FILE"
     # Communicate exact wait time to the caller so the daemon loop can
     # sleep precisely until the reset moment instead of polling.
-    local cooldown_epoch; cooldown_epoch="$(grep -oE '"until_epoch"[[:space:]]*:[[:space:]]*[0-9]+' "$COOLDOWN_FILE" 2>/dev/null | grep -oE '[0-9]+$' | head -n1 || echo '')"
-    if [[ -n "$cooldown_epoch" ]]; then
+    if [[ -n "$eff_epoch" ]]; then
       local now_ep; now_ep="$(date +%s)"
-      COOLDOWN_WAIT_SECONDS=$(( cooldown_epoch - now_ep > 0 ? cooldown_epoch - now_ep : 0 ))
+      COOLDOWN_WAIT_SECONDS=$(( eff_epoch - now_ep > 0 ? eff_epoch - now_ep : 0 ))
     fi
-    log_event tick_done outcome cooldown duration_s "$(( $(date +%s) - tick_start_epoch ))"
+    log_event tick_done outcome cooldown source "$cd_source" duration_s "$(( $(date +%s) - tick_start_epoch ))"
     TICK_OUTCOME=cooldown
     return 0
     fi  # end fallback-unavailable (Layer 2 idle) branch

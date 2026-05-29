@@ -63,6 +63,17 @@
 #                         `launchctl bootout`. Cross-machine + uniform; reads
 #                         fail-OPEN. Append `--status`/`--check` to inspect a control.
 #
+#   backlog-agents cooldown [--status] | --check | --clear
+#                         Account-level shared cooldown (W2, docs/account-cooldown.md).
+#                         The Anthropic plan limit is per-ACCOUNT; when any daemon hits
+#                         it, the driver publishes ONE D1 cooldown the whole fleet
+#                         honors at top-of-tick — so the fleet stands down together
+#                         instead of each daemon×project failing its own claude call.
+#                         AUTO-EXPIRES at the reset (no clear needed); `--clear`
+#                         manually lapses a bad signal. --status (default) prints the
+#                         state; --check exits 0 iff active. Reads fail-OPEN (D1 down
+#                         ⇒ the local per-project cooldown still governs).
+#
 #   backlog-agents metrics [--json]
 #                         Efficiency metrics from each project's per-tick ledger
 #                         (.claude/backlog-history.jsonl). Per-project table plus a
@@ -632,6 +643,27 @@ snapshot() {
       printf '  control: %s%s%s  by %s%s' "$_ctl_color" "$_ctl_word" "$RS" "$_ctl_by" \
         "$([[ -n "$_ctl_reason" ]] && printf '  %s%s%s' "$DIM" "$_ctl_reason" "$RS")"
       printf '\n'
+    fi
+  fi
+
+  # ---- account-level shared cooldown (W2, docs/account-cooldown.md) ----
+  # The Anthropic plan limit is per-ACCOUNT; when any daemon hits it, it publishes
+  # a single D1 cooldown the whole fleet honors at once. Surface it (like the
+  # control line) only while active. Best-effort; an outage just omits the line.
+  local _cd_body _cd_active
+  _cd_body="$(_cooldown_get 2>/dev/null || true)"
+  if [[ -n "$_cd_body" ]]; then
+    _cd_active="$(printf '%s' "$_cd_body" | jq -r '.active // 0' 2>/dev/null || echo 0)"
+    if [[ "$_cd_active" == "1" || "$_cd_active" == "true" ]]; then
+      local _cd_until _cd_by _cd_now _cd_remain _cd_remain_str
+      _cd_until="$(printf '%s' "$_cd_body" | jq -r '.until_epoch // 0' 2>/dev/null || echo 0)"
+      _cd_by="$(printf '%s' "$_cd_body" | jq -r '.armed_by // "—"' 2>/dev/null || echo '—')"
+      _cd_now="$(date +%s)"; _cd_remain=$(( _cd_until - _cd_now ))
+      (( _cd_remain < 0 )) && _cd_remain=0
+      _cd_remain_str="$(( _cd_remain / 60 ))m"
+      (( _cd_remain >= 3600 )) && _cd_remain_str="$(( _cd_remain / 3600 ))h$(( (_cd_remain % 3600) / 60 ))m"
+      printf '  cooldown: %sACCOUNT-WIDE%s  by %s  %sresumes in %s%s\n' \
+        "$YL" "$RS" "$_cd_by" "$DIM" "$_cd_remain_str" "$RS"
     fi
   fi
 
@@ -2009,6 +2041,7 @@ do_canary() {
 # Overrides (testing): FREEZE_URL, HEALTH_URL, FREEZE_LIVENESS_SECS.
 FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
 HEALTH_URL="${HEALTH_URL:-https://kash-backlogs.pages.dev/api/health}"
+COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
 # DECISION B liveness window: a host whose heartbeat is older than this is not
 # counted toward skew-zero (a powered-off laptop must not pin the freeze). 90m,
 # mirroring the reaper's stale-claim threshold.
@@ -2250,6 +2283,91 @@ do_resume() { _do_control pause clear "$@"; }
 do_stop()   { _do_control stop  arm   "$@"; }
 do_start()  { _do_control stop  clear "$@"; }
 
+# ---- subcommand: cooldown (W2, account-level shared cooldown) ----------------
+# The Anthropic plan limit is per-ACCOUNT, shared across every machine + project.
+# When any daemon hits it, start_cooldown (bin/backlog-agent) publishes a single
+# cooldown to the D1 bus (a dedicated /api/cooldown row carrying the reset
+# until_epoch), and every daemon's top-of-tick consults it FIRST — so the whole
+# fleet stands down at once instead of each daemon×project failing its own claude
+# call. It AUTO-EXPIRES at until_epoch (no manual clear needed). This subcommand
+# is the read + manual-override surface, mirroring freeze/unfreeze:
+#   backlog-agents cooldown [--status]   human-readable state (default)
+#   backlog-agents cooldown --check      exit 0 iff an account cooldown is active
+#   backlog-agents cooldown --clear      manually lapse the signal (e.g. a bad
+#                                        reset-time parse) — the fleet resumes next tick
+
+# GET the cooldown row; echo the raw JSON. Non-zero on any failure (no curl,
+# network, non-200) so callers decide.
+_cooldown_get() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local key auth=() body code
+  key="$(_health_key)"; [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$COOLDOWN_URL" 2>/dev/null)" || return 1
+  code="$(printf '%s' "$body" | tail -n1)"; body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$code" == "200" ]] || return 1
+  printf '%s' "$body"
+}
+
+# POST to /api/cooldown. $1=until_epoch (integer; 0/empty ⇒ a CLEAR). Bearer-auth.
+_cooldown_post() {
+  command -v curl >/dev/null 2>&1 || { warn "cooldown: curl not available"; return 1; }
+  local key; key="$(_health_key)"
+  [[ -z "$key" ]] && { warn "cooldown: no health key at ~/.config/backlog/health-key — cannot write"; return 1; }
+  local until_epoch="${1:-0}" by payload
+  by="$(hostname 2>/dev/null | sed -E 's/\.local$//')"; [[ -z "$by" ]] && by="manual"
+  payload="$(jq -cn --argjson ue "${until_epoch:-0}" --arg by "$by" \
+    '{until_epoch: (if $ue==0 then null else $ue end), reason:"manual override", armed_by:$by, clear: ($ue==0)}')" \
+    || { warn "cooldown: failed to build payload"; return 1; }
+  local body code
+  body="$(curl -s -m 8 -X POST -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+          -d "$payload" -w $'\n%{http_code}' "$COOLDOWN_URL" 2>/dev/null)" || { warn "cooldown: POST failed (network)"; return 1; }
+  code="$(printf '%s' "$body" | tail -n1)"
+  [[ "$code" == "200" ]] || { warn "cooldown: POST returned HTTP ${code:-?}"; return 1; }
+  return 0
+}
+
+do_cooldown() {
+  local STATUS=0 CHECK=0 CLEAR=0
+  while (( $# )); do
+    case "$1" in
+      --status) STATUS=1 ;;
+      --check)  CHECK=1 ;;
+      --clear)  CLEAR=1 ;;
+      *) echo "backlog-agents cooldown: unknown flag: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  # --clear: manually lapse the D1 signal (writes until_epoch=null).
+  if (( CLEAR )); then
+    if _cooldown_post 0; then
+      ok "account cooldown CLEARED — the fleet resumes on each daemon's next tick"
+      return 0
+    fi
+    return 1
+  fi
+
+  # default / --status / --check: read the current state.
+  local body active until_epoch by now remain
+  if ! body="$(_cooldown_get)"; then
+    (( CHECK )) && return 1
+    warn "cooldown: cannot read signal (D1 unreachable)"; return 1
+  fi
+  active="$(printf '%s' "$body" | jq -r 'if (.active==true or .active==1) then 1 else 0 end' 2>/dev/null || echo 0)"
+  if [[ "$active" == "1" ]]; then
+    until_epoch="$(printf '%s' "$body" | jq -r '.until_epoch // 0' 2>/dev/null || echo 0)"
+    by="$(printf '%s' "$body" | jq -r '.armed_by // "—"' 2>/dev/null || echo '—')"
+    now="$(date +%s)"; remain=$(( until_epoch - now )); (( remain < 0 )) && remain=0
+    (( STATUS || (! CHECK) )) && warn "account cooldown is ACTIVE — armed_by=${by}, resumes in $(( remain / 60 ))m (until_epoch=${until_epoch})"
+  else
+    (( STATUS || (! CHECK) )) && ok "account cooldown is clear (no fleet-wide plan-limit signal)"
+  fi
+  # Only --check reflects the active bit in its exit code; --status / the bare
+  # command are informational and exit 0 regardless.
+  if (( CHECK )); then [[ "$active" == "1" ]]; return; fi
+  return 0
+}
+
 # ---- subcommand: metrics ----
 # Efficiency metrics from each project's per-tick ledger
 # (.claude/backlog-history.jsonl, polyglot fallback effort-log.jsonl). Reads
@@ -2444,6 +2562,7 @@ case "$cmd" in
   resume) shift; do_resume "$@" ;;
   stop) shift; do_stop "$@" ;;
   start) shift; do_start "$@" ;;
+  cooldown) shift; do_cooldown "$@" ;;
   metrics) shift; do_metrics "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;

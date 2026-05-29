@@ -127,6 +127,17 @@ makes the daemon idle gracefully instead of burning fail-loops.
 
 ### Layer 3 (opt-in): alternative-agent invocation
 
+**[2026-05-29] IMPLEMENTED** — `bin/backlog-agent`: `fallback_agent_available`
+/ `fallback_agent_name` / `build_fallback_cmd` helpers + `AGENT_FALLBACK_FILE`
+config; the Layer 2 cooldown short-circuit in `tick_once` now falls THROUGH to
+the normal claim+work path on the fallback agent when one is available (else
+keeps heartbeat-only idle). Plan-limit cooldown re-arming is skipped on fallback
+ticks. `backlog-agent-status.mjs` gained `--agent`; a non-claude agent writes
+`Claude-Effort: agent=<name>, exit=N` (key kept for grep-based consumers).
+Config supports an optional `name` field (defaults to basename of command[0]).
+Requires `jq`; absent file / no jq / `available_when` non-zero / empty command
+→ no fallback. Tested in `test/tick.bats` (+3) and `test/status-hook.bats` (+2).
+
 Introduce a tiny config at `~/.claude/agent-fallback.json`:
 
 ```json

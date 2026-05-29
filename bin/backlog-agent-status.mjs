@@ -63,7 +63,7 @@ function findBacklogFile() {
 // ---------- arg parsing ----------
 function parseArgs() {
   const argv = process.argv.slice(2);
-  const opts = { item: "", exitCode: 0, mode: "loop", preHead: null, pulled: 0, driverSha: "" };
+  const opts = { item: "", exitCode: 0, mode: "loop", preHead: null, pulled: 0, driverSha: "", agent: "claude" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--item") opts.item = argv[++i] ?? "";
@@ -74,6 +74,7 @@ function parseArgs() {
     else if (a === "--pulled")
       opts.pulled = Number.parseInt(argv[++i] ?? "0", 10);
     else if (a === "--driver-sha") opts.driverSha = argv[++i] ?? "";
+    else if (a === "--agent") opts.agent = argv[++i] || "claude";
   }
   if (!opts.preHead) {
     try {
@@ -718,7 +719,15 @@ async function main() {
     const pct = (headline / cap) * 100;
     tokSegment += ` (${pct.toFixed(1)}% of 5h)`;
   }
-  const trailer = `Claude-Effort: ${durStr}, ${tokSegment}, ${usage.num_turns} turns, exit=${opts.exitCode}`;
+  // Layer 3 (docs/multi-agent-design.md): when a non-Claude fallback agent ran
+  // this tick, there's no Claude transcript at the Claude path, so token/turn
+  // counts are meaningless (0). Record `agent=<name>` instead of the usage
+  // segment; keep the `Claude-Effort:` trailer key so downstream grep-based
+  // consumers (dashboard, efficiency metrics) still match.
+  const trailer =
+    opts.agent && opts.agent !== "claude"
+      ? `Claude-Effort: agent=${opts.agent}, exit=${opts.exitCode}`
+      : `Claude-Effort: ${durStr}, ${tokSegment}, ${usage.num_turns} turns, exit=${opts.exitCode}`;
 
   const commit = spawnSync("git", ["commit", "-m", subject, "-m", trailer], {
     cwd: REPO_ROOT,

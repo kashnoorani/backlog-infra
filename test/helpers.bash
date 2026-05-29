@@ -164,6 +164,57 @@ EOF
   chmod +x "$SHIM/curl"
 }
 
+# --- Layer 3: alternative-agent fallback fixtures ---
+# Generate a fake fallback agent on PATH (default name "fakeagent"). It records
+# its invocation to $FALLBACK_CALLED and emulates a successful tick (real file
+# change + flip the first [~]→[x] + scoped commit), so a fallback tick lands a
+# completion exactly like the `complete` claude stub. The tick prompt is passed
+# as the agent's final arg by build_fallback_cmd; the stub ignores it.
+#   $1 = agent command name (default "fakeagent")
+make_fallback_agent() {
+  local name="${1:-fakeagent}"
+  FALLBACK_CALLED="$BATS_TEST_TMPDIR/fallback_called"
+  export FALLBACK_CALLED
+  cat > "$SHIM/$name" <<EOF
+#!/usr/bin/env bash
+touch "\${FALLBACK_CALLED:-/dev/null}"
+EOF
+  cat >> "$SHIM/$name" <<'EOF'
+awk '
+  BEGIN{in_open=0; done=0}
+  /^## Open/{in_open=1; print; next}
+  /^## [A-Z]/{in_open=0; print; next}
+  in_open && !done && /^(- )?\[~\] /{ sub(/\[~\]/,"[x]"); done=1 }
+  {print}
+' docs/Backlog.md > docs/Backlog.md.tmp && mv docs/Backlog.md.tmp docs/Backlog.md
+echo "fallback work" > fallback.txt
+git add fallback.txt docs/Backlog.md
+git commit -qm "work: fallback did the thing"
+exit 0
+EOF
+  chmod +x "$SHIM/$name"
+}
+
+# Write ~/.claude/agent-fallback.json (HOME is the per-test scratch dir). The
+# command runs the given agent name on the prompt; `available_when` defaults to
+# a passing test ("true") but can be overridden (e.g. "false") to exercise the
+# gate.
+#   $1 = agent command name (default "fakeagent")
+#   $2 = available_when shell test (default "true")
+write_fallback_config() {
+  local name="${1:-fakeagent}" guard="${2:-true}"
+  mkdir -p "$HOME/.claude"
+  cat > "$HOME/.claude/agent-fallback.json" <<EOF
+{ "fallback": {
+    "command": ["$name", "run", "{prompt}"],
+    "available_when": "$guard",
+    "name": "$name" } }
+EOF
+}
+
+# True if the fallback agent was invoked during the last tick.
+fallback_was_called() { [ -f "${FALLBACK_CALLED:-/nonexistent}" ]; }
+
 # Run one tick (black-box). Extra args become leading `env VAR=val` pairs.
 #   run_tick                 -> backlog-agent tick
 #   run_tick STARTUP_RECLAIM=1 -> env STARTUP_RECLAIM=1 backlog-agent tick

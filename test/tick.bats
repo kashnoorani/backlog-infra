@@ -301,3 +301,56 @@ EOF
   # until ISO must carry minute 08 (HH:08:00Z); the octal bug produced HH:00:00Z.
   grep -qE 'T[0-9][0-9]:08:00Z' "$WORK/.claude/agent-cooldown.json"
 }
+
+# --- Layer 3: alternative-agent fallback (docs/multi-agent-design.md) ---
+
+# Cooldown active + an available fallback agent -> the tick runs via the
+# fallback (NOT claude), claims the item, and lands the completion.
+@test "active cooldown runs the fallback agent when one is available" {
+  printf '{ "until_epoch": %s }\n' "$(( $(date +%s) + 3600 ))" > "$WORK/.claude/agent-cooldown.json"
+  make_fallback_agent fakeagent
+  write_fallback_config fakeagent
+  run_tick
+  [ "$status" -eq 0 ]
+  fallback_was_called
+  ! claude_was_called           # cooldown still blocks claude
+  open_has_marker 'x'           # fallback landed the completion
+  [[ "$output" == *"fallback agent 'fakeagent'"* ]]
+}
+
+# Cooldown active + a fallback config whose available_when test FAILS -> no
+# fallback; the daemon keeps the Layer 2 heartbeat-only idle behavior.
+@test "active cooldown idles when the fallback gate is not satisfied" {
+  printf '{ "until_epoch": %s }\n' "$(( $(date +%s) + 3600 ))" > "$WORK/.claude/agent-cooldown.json"
+  make_fallback_agent fakeagent
+  write_fallback_config fakeagent false   # available_when -> false
+  run_tick
+  [ "$status" -eq 0 ]
+  ! fallback_was_called
+  ! claude_was_called
+  [[ "$output" == *"cooldown"* ]]
+  open_has_marker ' '           # item untouched (never claimed)
+}
+
+# A fallback failure under cooldown must NOT re-arm/extend the cooldown via the
+# Claude plan-limit regex (different provider; cooldown already active).
+@test "fallback failure does not re-arm cooldown on a plan-limit signature" {
+  printf '{ "until_epoch": %s }\n' "$(( $(date +%s) + 3600 ))" > "$WORK/.claude/agent-cooldown.json"
+  # A fallback agent that prints the Claude plan-limit signature and fails.
+  cat > "$SHIM/fakeagent" <<'EOF'
+#!/usr/bin/env bash
+touch "${FALLBACK_CALLED:-/dev/null}"
+echo "You've hit your usage limit. resets 5:30pm" >&2
+exit 1
+EOF
+  chmod +x "$SHIM/fakeagent"
+  FALLBACK_CALLED="$BATS_TEST_TMPDIR/fallback_called"; export FALLBACK_CALLED
+  write_fallback_config fakeagent
+  local before; before="$(cat "$WORK/.claude/agent-cooldown.json")"
+  run_tick
+  [ "$status" -eq 0 ]
+  fallback_was_called
+  # Cooldown file unchanged (not re-armed by the fallback's output).
+  [ "$(cat "$WORK/.claude/agent-cooldown.json")" = "$before" ]
+  open_has_marker ' '           # item unclaimed on failure
+}

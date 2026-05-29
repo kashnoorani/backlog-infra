@@ -60,6 +60,28 @@ setup() { _setup_status_repo; }
   [ "$(jq -r .driver_sha "$WORK/.claude/backlog-status.json")" = "null" ]
 }
 
+# Layer 3 (docs/multi-agent-design.md): when a non-Claude fallback agent ran
+# the tick, the trailer records `agent=<name>` in place of the token/turn usage
+# (there's no Claude transcript to count), while keeping the `Claude-Effort:`
+# key so grep-based consumers still match.
+@test "non-claude --agent records agent= in the commit trailer" {
+  run_hook --agent opencode
+  [ "$status" -eq 0 ]
+  local msg; msg="$(git -C "$WORK" log -1 --format=%B HEAD)"
+  [[ "$msg" == *"Claude-Effort: agent=opencode, exit=0"* ]]
+  [[ "$msg" != *"turns"* ]]
+}
+
+# Default agent (claude) keeps the usual token/turn trailer.
+@test "default claude agent keeps the token/turn trailer" {
+  run_hook
+  [ "$status" -eq 0 ]
+  local msg; msg="$(git -C "$WORK" log -1 --format=%B HEAD)"
+  [[ "$msg" == *"Claude-Effort:"* ]]
+  [[ "$msg" == *"turns, exit=0"* ]]
+  [[ "$msg" != *"agent="* ]]
+}
+
 # REGRESSION GUARD for the untrack interaction: now that the SHARED
 # backlog-status.json is gitignored, the hook must STILL commit the per-host
 # file + history (they are tracked). It must not treat "the shared file is

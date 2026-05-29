@@ -119,6 +119,21 @@ COOLDOWN_FILE="${STATE_DIR}/agent-cooldown.json"
 # and/or email alert. Absent file / empty keys → silent no-op.
 NOTIFY_CONFIG="${HOME}/.claude/agent-notify.json"
 
+# Layer 3 (docs/multi-agent-design.md): opt-in alternative-agent fallback.
+# When a plan-limit cooldown is active (Layer 2) the daemon would normally
+# idle. If this opt-in config is present AND the configured agent is
+# available, the daemon instead runs the SAME prompt through a non-Claude
+# coding agent (e.g. OpenCode driving DeepSeek) so simple items keep making
+# progress during the cooldown. Shape:
+#   { "fallback": {
+#       "command": ["opencode","run","--yolo","--model","...","{prompt}"],
+#       "available_when": "command -v opencode >/dev/null && [[ -n \"${OPENROUTER_API_KEY:-}\" ]]",
+#       "name": "opencode" } }
+# `{prompt}` is substituted with the tick prompt; `name` is optional
+# (defaults to the basename of command[0]). Requires jq. Absent file / no jq /
+# `available_when` non-zero / empty command → no fallback, Layer 2 idle.
+AGENT_FALLBACK_FILE="${HOME}/.claude/agent-fallback.json"
+
 # Per-item circuit breaker (W2). Track consecutive failures per item title in
 # a JSON state file. After CIRCUIT_BREAKER_THRESHOLD consecutive failed ticks
 # for the SAME item (claude exit != 0 → unclaimed), stop re-claiming it: flip
@@ -785,6 +800,57 @@ notify_cooldown() {
   return 0
 }
 
+# --- Layer 3: alternative-agent fallback (docs/multi-agent-design.md) ---
+
+# Returns 0 (true) iff the opt-in fallback agent is configured AND usable right
+# now: AGENT_FALLBACK_FILE exists, jq is present, `.fallback.command` is a
+# non-empty array, and the optional `.fallback.available_when` shell test (if
+# set) exits 0. Any failure → 1, so the caller falls back to Layer 2 idle.
+# Deliberately conservative: a malformed config never breaks the daemon.
+fallback_agent_available() {
+  [[ -f "$AGENT_FALLBACK_FILE" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # Must have at least one command element.
+  local n; n="$(jq -r '(.fallback.command | length) // 0' "$AGENT_FALLBACK_FILE" 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] || return 1
+  # available_when gate (optional). Eval in a subshell so it can't mutate our
+  # state; treat a missing/empty test as "always available".
+  local guard; guard="$(jq -r '.fallback.available_when // empty' "$AGENT_FALLBACK_FILE" 2>/dev/null || true)"
+  if [[ -n "$guard" ]]; then
+    ( eval "$guard" ) >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# Echo the fallback agent's display name: explicit `.fallback.name`, else the
+# basename of command[0] (e.g. "opencode"). Used for the status-hook --agent
+# flag and event logging.
+fallback_agent_name() {
+  local name
+  name="$(jq -r '.fallback.name // empty' "$AGENT_FALLBACK_FILE" 2>/dev/null || true)"
+  if [[ -z "$name" ]]; then
+    name="$(jq -r '.fallback.command[0] // empty' "$AGENT_FALLBACK_FILE" 2>/dev/null || true)"
+    name="$(basename "${name:-agent}")"
+  fi
+  printf '%s' "${name:-agent}"
+}
+
+# Populate the global array FALLBACK_CMD with the fallback invocation, with
+# every `{prompt}` token in the configured command replaced by $1 (the tick
+# prompt). Returns 1 (leaving FALLBACK_CMD unset/empty) if the command can't be
+# read — callers only invoke this after fallback_agent_available, so that's a
+# defensive guard, not the normal path.
+build_fallback_cmd() {
+  local prompt="$1"
+  FALLBACK_CMD=()
+  local el
+  while IFS= read -r el; do
+    FALLBACK_CMD+=( "${el//\{prompt\}/$prompt}" )
+  done < <(jq -r '.fallback.command[]' "$AGENT_FALLBACK_FILE" 2>/dev/null || true)
+  [[ ${#FALLBACK_CMD[@]} -gt 0 ]] || return 1
+  return 0
+}
+
 # ---- helpers: parse claude's "resets X:XXpm" into an epoch ----
 
 # Convert "3:45pm" or "12:00am" to "HH:MM:SS" (24h).
@@ -878,7 +944,7 @@ _parse_reset_to_epoch() {
 }
 
 _run_status_hook() {
-  local item="$1" exit_code="${2:-0}" mode="${3:-loop}" pre_head="$4" pulled="${5:-0}"
+  local item="$1" exit_code="${2:-0}" mode="${3:-loop}" pre_head="$4" pulled="${5:-0}" agent="${6:-claude}"
   # Driver version-skew (W1): stamp the tick with the git SHA of the *shared
   # driver* this daemon is actually running — the last commit touching the bin
   # dir ($LIB_DIR), so it only changes when the machinery changes, not on every
@@ -893,7 +959,7 @@ _run_status_hook() {
     # so a stalled network here would wedge even a heartbeat tick. Background +
     # SIGTERM-after-timeout bounds it; a killed hook yields a non-zero hook_rc
     # (logged status_fail) and the tick proceeds. No coreutils `timeout` needed.
-    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" --driver-sha "$driver_sha" >> "$LOG_FILE" 2>&1 &
+    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" --driver-sha "$driver_sha" --agent "$agent" >> "$LOG_FILE" 2>&1 &
     hook_pid=$!
     # Watchdog fds -> /dev/null so an orphaned sleep can't hold our pipe open.
     ( sleep "$HOOK_TIMEOUT_SECS"; kill -TERM "$hook_pid" 2>/dev/null ) >/dev/null 2>&1 &
@@ -962,6 +1028,9 @@ _maybe_auto_complete() {
 
 tick_once() {
   local ts pre_head item_title claude_exit
+  # Layer 3: which agent runs this tick. "claude" normally; set to the fallback
+  # agent's name when a cooldown is active and a fallback is configured/available.
+  local agent_name="claude" use_fallback=""
 
   # Per-tick mutex. do_run runs the polling loop AND an fswatch subshell that
   # fires whenever BACKLOG_FILE changes — including the daemon's OWN claim /
@@ -994,6 +1063,20 @@ tick_once() {
   # fail-loop. Heartbeat the status file so the fleet view shows the daemon
   # alive (not STALE), then return without claiming any item.
   if cooldown_active; then
+    # --- Layer 3: alternative-agent fallback ---
+    # Rather than idling through the whole cooldown, if an opt-in fallback agent
+    # (e.g. OpenCode/DeepSeek) is configured and available, fall THROUGH to the
+    # normal claim+work path with that agent driving the tick. The Claude plan
+    # limit is per-account; a different provider isn't affected, so simple items
+    # can still make progress. If no fallback is available, keep the Layer 2
+    # heartbeat-only behavior below.
+    if fallback_agent_available; then
+      use_fallback=1
+      agent_name="$(fallback_agent_name)"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-limit cooldown active; running this tick via fallback agent '${agent_name}' (Layer 3)" | tee -a "$LOG_FILE"
+      log_event fallback_agent agent "$agent_name"
+      # fall through — do NOT short-circuit.
+    else
     local cd_until; cd_until="$(cooldown_until_str)"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] plan-limit cooldown active until ${cd_until:-?}; heartbeat only (skipping claude)" | tee -a "$LOG_FILE"
     pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
@@ -1010,6 +1093,7 @@ tick_once() {
     log_event tick_done outcome cooldown duration_s "$(( $(date +%s) - tick_start_epoch ))"
     TICK_OUTCOME=cooldown
     return 0
+    fi  # end fallback-unavailable (Layer 2 idle) branch
   fi
 
   # Pull before reading the backlog — catches cross-machine changes from
@@ -1272,8 +1356,20 @@ tick_once() {
   # and makes the plan-limit grep race-free since claude has fully exited. Output
   # reaches the log after the call returns rather than live — fine for a headless
   # tick. A hung claude would otherwise hold the tick lock with no heartbeat.
+  # Layer 3: pick the agent command. Normally `claude -p`; under an active
+  # cooldown with an available fallback (use_fallback set above), run the
+  # configured fallback agent on the SAME prompt instead. If the fallback
+  # command can't be built (defensive — availability was already checked),
+  # fall back to claude so the tick isn't lost.
+  local -a agent_cmd
+  if [[ -n "$use_fallback" ]] && build_fallback_cmd "$prompt"; then
+    agent_cmd=( "${FALLBACK_CMD[@]}" )
+  else
+    use_fallback=""; agent_name="claude"
+    agent_cmd=( claude -p --fallback-model claude-haiku-4-5 "$prompt" )
+  fi
   local claude_pid wd_pid
-  claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null > "$capture_file" 2>&1 &
+  "${agent_cmd[@]}" < /dev/null > "$capture_file" 2>&1 &
   claude_pid=$!
   # Watchdog fds -> /dev/null: otherwise its `sleep` child inherits the tick's
   # stdout/stderr and, if orphaned, keeps them open and stalls anything reading
@@ -1287,13 +1383,16 @@ tick_once() {
   kill -TERM "$wd_pid" 2>/dev/null || true
   wait "$wd_pid" 2>/dev/null || true
   cat "$capture_file" >> "$LOG_FILE" 2>/dev/null || true
-  log_event claude_exit item "$item_title" exit_code "$claude_exit"
+  log_event claude_exit item "$item_title" exit_code "$claude_exit" agent "$agent_name"
   if [[ $claude_exit -ne 0 ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (${agent_name} exit=$claude_exit)" | tee -a "$LOG_FILE"
     # Layer 2: if the failure was a plan/session-limit rejection, arm a
     # cooldown so subsequent ticks idle gracefully instead of re-failing
-    # every heartbeat until the rolling window resets.
-    if grep -qiE "$PLAN_LIMIT_REGEX" "$capture_file" 2>/dev/null; then
+    # every heartbeat until the rolling window resets. Skip when running the
+    # Layer 3 fallback agent: a cooldown is already active (that's why we're on
+    # the fallback), the fallback uses a different provider so the Claude
+    # plan-limit regex is irrelevant, and re-arming would just extend the idle.
+    if [[ -z "$use_fallback" ]] && grep -qiE "$PLAN_LIMIT_REGEX" "$capture_file" 2>/dev/null; then
       local parsed_epoch; parsed_epoch="$(_parse_reset_to_epoch "$capture_file")"
       if [[ -n "$parsed_epoch" ]]; then
         start_cooldown "$parsed_epoch"
@@ -1380,12 +1479,12 @@ tick_once() {
   fi
   rm -f "$capture_file" 2>/dev/null || true
 
-  _run_status_hook "$item_title" "$claude_exit" loop "$pre_head" "$pulled"
+  _run_status_hook "$item_title" "$claude_exit" loop "$pre_head" "$pulled" "$agent_name"
 
   _post_tick_cleanup
   [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done" | tee -a "$LOG_FILE"
-  log_event tick_done outcome work item "$item_title" exit_code "$claude_exit" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+  log_event tick_done outcome work item "$item_title" exit_code "$claude_exit" agent "$agent_name" duration_s "$(( $(date +%s) - tick_start_epoch ))"
   TICK_OUTCOME=work
 }
 

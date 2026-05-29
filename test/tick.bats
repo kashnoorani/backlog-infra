@@ -66,6 +66,10 @@ setup() { _setup_repo; }
   run_tick STARTUP_RECLAIM=1     # ...startup path reclaims unconditionally
   [ "$status" -eq 0 ]
   [[ "$output" == *"reclaim"* ]]
+  # No probe ran on startup, so the message must NOT print a bogus age computed
+  # from an empty hb_epoch ("(now - 0)/60" ≈ a 7+ digit minute count).
+  [[ "$output" == *"startup reclaim of orphaned claim"* ]]
+  [[ ! "$output" =~ [0-9]{7,}m ]]
 }
 
 # 6a. Live D1 heartbeat -> owning daemon alive -> [~] NOT reclaimed.
@@ -154,4 +158,51 @@ setup() { _setup_repo; }
   # Local-only commit is gone; HEAD matches origin.
   [ "$(git -C "$WORK" rev-parse HEAD)" = "$(git -C "$WORK" rev-parse origin/main)" ]
   ! grep -q "LOCAL ONLY" "$WORK/docs/Backlog.md"
+}
+
+# --- audit fixes: §2 timeouts ---
+
+# 8. A hung claude is killed by the wall-clock watchdog and treated as a failed
+#    tick (item unclaimed), instead of wedging the daemon forever holding the
+#    tick lock with no heartbeat.
+@test "hung claude is killed by the timeout watchdog and the item is unclaimed" {
+  make_claude hang               # exec sleep 30 — far longer than the cap below
+  run_tick CLAUDE_TIMEOUT_SECS=2 # watchdog SIGTERMs claude at ~2s
+  [ "$status" -eq 0 ]
+  claude_was_called
+  open_has_marker ' '            # claimed then unclaimed on the (kill) failure
+  ! open_has_marker '~'
+  [ ! -f "$WORK/.claude/agent-cooldown.json" ]   # a kill is not a plan-limit
+}
+
+# 9. A hung status hook is killed by its watchdog so even an idle heartbeat tick
+#    can't wedge on a stalled network git op.
+@test "hung status hook is killed by the timeout watchdog" {
+  write_backlog_open             # idle: no open items, but the hook still runs
+  printf 'setInterval(() => {}, 1e9)\n' > "$WORK/scripts/backlog-agent-status.mjs"
+  run_tick HOOK_TIMEOUT_SECS=1   # watchdog SIGTERMs node at ~1s
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"tick done (idle)"* ]]   # tick completed; did not hang
+}
+
+# --- audit fixes: §1 set-e / parsing ---
+
+# 10. `status` must not abort on a truncated/corrupt status JSON (jq parse error
+#     under set -e). Default subcommand — has to degrade, not crash.
+@test "status degrades gracefully on malformed status JSON" {
+  printf '{bad json, not closed\n' > "$WORK/.claude/backlog-status.json"
+  run env bash "$AGENT_BIN" status
+  [ "$status" -eq 0 ]
+}
+
+# 11. Plan-limit reset at a leading-zero minute (":08") must parse to minute 08,
+#     not be misread as invalid octal and zeroed. TZ=UTC makes the parsed local
+#     time map to a known UTC minute deterministically across machines.
+@test "cooldown reset parses leading-zero minutes correctly (no octal zeroing)" {
+  make_claude fail_limit "9:08pm"
+  run_tick TZ=UTC
+  claude_was_called
+  [ -f "$WORK/.claude/agent-cooldown.json" ]
+  # until ISO must carry minute 08 (HH:08:00Z); the octal bug produced HH:00:00Z.
+  grep -qE 'T[0-9][0-9]:08:00Z' "$WORK/.claude/agent-cooldown.json"
 }

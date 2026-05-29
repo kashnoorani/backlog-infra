@@ -485,10 +485,12 @@ async function main() {
     );
     stashed = stashR.status === 0 && !stashR.stdout.includes("No local changes");
 
-    // Fetch first (always safe, no-op on failure).
+    // Fetch first (always safe, no-op on failure). `timeout` bounds a stalled
+    // network so the hook can't hang indefinitely; a killed fetch reports a
+    // non-zero/null status and is tolerated below.
     const fetchR = spawnSync(
       "git", ["fetch", "origin"],
-      { cwd: REPO_ROOT, encoding: "utf8" },
+      { cwd: REPO_ROOT, encoding: "utf8", timeout: 60000 },
     );
     if (fetchR.status !== 0) {
       console.error(`[backlog-agent-status] git fetch failed (continuing):\n${fetchR.stderr}`);
@@ -735,6 +737,7 @@ async function main() {
     const r = spawnSync("git", ["push", "origin", branch], {
       cwd: REPO_ROOT,
       encoding: "utf8",
+      timeout: 60000,   // bound a stalled push; a timeout is retried by this loop
     });
     if (r.status === 0) {
       console.log("[backlog-agent-status] ok");

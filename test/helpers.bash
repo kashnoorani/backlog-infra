@@ -80,17 +80,24 @@ write_backlog_open() { write_backlog_open_in "$WORK" "$@"; }
 #   complete  — record, make a real change, flip first [~]→[x], commit, exit 0
 #   fail_limit— record, print an Anthropic plan-limit signature, exit 1
 #   fail_other— record, print an unrelated error, exit 1
+#   hang      — record, then exec `sleep` far longer than any test timeout so
+#               the driver's wall-clock watchdog (CLAUDE_TIMEOUT_SECS) must kill
+#               it; `exec` makes the sleep claude's own PID so the kill is clean.
+# $2 (fail_limit only) overrides the reset time in the plan-limit signature
+# (default "5:30pm") so tests can exercise the time parser.
 make_claude() {
-  local mode="$1"
+  local mode="$1" reset="${2:-5:30pm}"
   cat > "$SHIM/claude" <<EOF
 #!/usr/bin/env bash
 # Records invocation so tests can assert claude was / was not called.
 touch "\${CLAUDE_CALLED:-/dev/null}"
 mode="$mode"
+reset="$reset"
 EOF
   cat >> "$SHIM/claude" <<'EOF'
 case "$mode" in
   noop) exit 0 ;;
+  hang) exec sleep 30 ;;
   complete)
     # Emulate a successful tick: a real file change + move the claimed item to
     # done (flip the first [~] in ## Open to [x]), then commit (scoped add).
@@ -106,7 +113,7 @@ case "$mode" in
     git commit -qm "work: did the thing"
     exit 0 ;;
   fail_limit)
-    echo "Error: You've hit your usage limit. resets 5:30pm" >&2
+    echo "Error: You've hit your usage limit. resets $reset" >&2
     exit 1 ;;
   fail_other)
     echo "Error: something unrelated broke" >&2

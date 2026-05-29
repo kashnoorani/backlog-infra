@@ -92,6 +92,12 @@ HEARTBEAT_SECONDS=1800
 FAST_TICKS=4
 FAST_SECONDS=300
 DEBOUNCE_SECONDS=2
+# Wall-clock caps so a hung external call can't wedge a tick. A tick holds the
+# tick lock; if it wedges there's no heartbeat (STALE-while-alive) and the reaper
+# fail-safes rather than reclaiming it. Enforced by pure-bash watchdogs (no
+# coreutils `timeout` dependency) at the claude + status-hook call sites.
+CLAUDE_TIMEOUT_SECS="${CLAUDE_TIMEOUT_SECS:-3600}"
+HOOK_TIMEOUT_SECS="${HOOK_TIMEOUT_SECS:-120}"
 # Escalating idle sleep: when tick_once finds no open items, the daemon
 # progressively backs off. Resets to fast-start as soon as work appears.
 # Format: space-separated seconds at each streak level (1st idle, 2nd, …).
@@ -473,7 +479,9 @@ auto_flip_blocked() {
       END { exit found ? 0 : 1 }
     ' "$BACKLOG_FILE" 2>/dev/null || has_user=0
     if (( has_user )); then
-      sed -i '' "${line_num}s/\[?\]/[!]/" "$BACKLOG_FILE"
+      # Best-effort: a transiently unwritable backlog must not abort the daemon
+      # (set -e). The flip is retried on the next tick if this write is lost.
+      sed -i '' "${line_num}s/\[?\]/[!]/" "$BACKLOG_FILE" || true
     fi
   done < <(grep -nE '^(- )?\[\?\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }
@@ -564,7 +572,7 @@ _d1_heartbeat_epoch() {
 # Sets RECLAIMED_COUNT to the number of items flipped back.
 reclaim_stale_claims() {
   RECLAIMED_COUNT=0
-  local stale_secs=5400 now hb_epoch age line line_num item_title
+  local stale_secs=5400 now hb_epoch age line line_num item_title reason
 
   now="$(date +%s)"
   # Plain "are we in a git repo?" guard — output discarded (no longer used for
@@ -593,8 +601,17 @@ reclaim_stale_claims() {
   while IFS= read -r line; do
     line_num="$(echo "$line" | cut -d: -f1)"
     item_title="$(echo "$line" | cut -d: -f2- | sed -E 's/^(- )?\[~\] //')"
-    sed -i '' "${line_num}s/\[~\]/[ ]/" "$BACKLOG_FILE"
-    echo "  [reclaim] stale [~] item '${item_title}' (no D1 heartbeat in $(( (now - hb_epoch) / 60 ))m)" | tee -a "$LOG_FILE"
+    # Best-effort: a transiently read-only backlog / unwritable log must not
+    # abort the daemon mid-reclaim (set -e); the item is re-reclaimed next tick.
+    sed -i '' "${line_num}s/\[~\]/[ ]/" "$BACKLOG_FILE" || true
+    # On the startup path hb_epoch was never probed (empty) — report the orphan
+    # reclaim plainly instead of the bogus "(now - 0)/60" age the math would give.
+    if [[ -n "$hb_epoch" ]]; then
+      reason="no D1 heartbeat in $(( (now - hb_epoch) / 60 ))m"
+    else
+      reason="startup reclaim of orphaned claim"
+    fi
+    echo "  [reclaim] stale [~] item '${item_title}' (${reason})" | tee -a "$LOG_FILE" || true
     RECLAIMED_COUNT=$((RECLAIMED_COUNT + 1))
   done < <(grep -nE '^(- )?\[~\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }
@@ -755,6 +772,10 @@ __time_to_24h() {
   min="${rest%%[apAP ]*}"
   ampm="$(echo "$rest" | tr '[:upper:]' '[:lower:]' | grep -o '[ap]m' || true)"
   hour="${hour// /}"; min="${min// /}"
+  # Force base-10 so leading-zero values ("08"/"09") aren't misread as invalid
+  # octal by the arithmetic and printf below (in bash, 08 is not a valid number),
+  # which would otherwise zero the field and mis-time the cooldown.
+  hour=$((10#${hour:-0})); min=$((10#${min:-0}))
   if [[ "$ampm" == "pm" ]]; then
     if [[ "$hour" != "12" ]]; then hour=$(( hour + 12 )); fi
   else
@@ -841,8 +862,22 @@ _run_status_hook() {
   local driver_sha
   driver_sha="$(git -C "$LIB_DIR" log -1 --format=%h -- "$LIB_DIR" 2>/dev/null || true)"
   if [[ -n "$HOOK" && -f "$HOOK" ]]; then
-    local hook_rc=0
-    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" --driver-sha "$driver_sha" >> "$LOG_FILE" 2>&1 || hook_rc=$?
+    local hook_rc=0 hook_pid hook_wd_pid
+    # Wall-clock cap (HOOK_TIMEOUT_SECS) via a pure-bash watchdog. The hook runs
+    # network git ops (fetch/push) and fires on EVERY tick outcome (incl. idle),
+    # so a stalled network here would wedge even a heartbeat tick. Background +
+    # SIGTERM-after-timeout bounds it; a killed hook yields a non-zero hook_rc
+    # (logged status_fail) and the tick proceeds. No coreutils `timeout` needed.
+    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" --driver-sha "$driver_sha" >> "$LOG_FILE" 2>&1 &
+    hook_pid=$!
+    # Watchdog fds -> /dev/null so an orphaned sleep can't hold our pipe open.
+    ( sleep "$HOOK_TIMEOUT_SECS"; kill -TERM "$hook_pid" 2>/dev/null ) >/dev/null 2>&1 &
+    hook_wd_pid=$!
+    if wait "$hook_pid"; then hook_rc=0; else hook_rc=$?; fi
+    # Tear down the watchdog + its sleep child (pkill -P before the parent dies).
+    pkill -P "$hook_wd_pid" 2>/dev/null || true
+    kill -TERM "$hook_wd_pid" 2>/dev/null || true
+    wait "$hook_wd_pid" 2>/dev/null || true
     if [[ $hook_rc -eq 0 ]]; then
       log_event status_ok item "$item"
     else
@@ -1123,7 +1158,10 @@ tick_once() {
           # merge conflict occurs (someone else claimed the same item),
           # abort the rebase and reset so the next tick proceeds cleanly.
           local branch
-          branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+          # `|| true`: a non-zero rev-parse (unborn / transiently-locked HEAD on
+          # this race-recovery path) must not trip set -e and kill the daemon —
+          # matches the guarded rev-parse siblings elsewhere in the file.
+          branch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
           git -C "$PWD" fetch origin "$branch" 2>/dev/null || true
           if git -C "$PWD" pull --rebase origin "$branch" 2>/dev/null; then
             if git -C "$PWD" push origin "$branch" 2>/dev/null; then
@@ -1167,10 +1205,8 @@ tick_once() {
   # model (Layer 1 of docs/multi-agent-design.md). It does not help with
   # plan-limit exhaustion — haiku counts against the same plan — that's
   # Layer 2's cooldown.
-  # Capture claude's output to a temp file alongside the live tee so we can
-  # pattern-match the plan-limit signature after a failure. The pipeline
-  # must stay direct (no command-substitution wrapper) so ${PIPESTATUS[0]}
-  # reports claude's exit rather than tee's.
+  # Capture claude's output to a temp file so we can pattern-match the plan-limit
+  # signature after a failure, then flush it to the log.
   local capture_file
   capture_file="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.claude-out.$$")"
   # Snapshot HEAD immediately before claude runs so Guards 2/3 can scope their
@@ -1178,8 +1214,30 @@ tick_once() {
   # daemon's own reclaim/claim commits, which only touch the backlog file).
   local work_base; work_base="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
   claude_exit=0
-  { claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE" "$capture_file"; } \
-    || claude_exit=${PIPESTATUS[0]}
+  # Wall-clock cap (CLAUDE_TIMEOUT_SECS) via a pure-bash watchdog — no coreutils
+  # `timeout` dependency. claude runs in the background writing to the capture
+  # file; a watchdog SIGTERMs it if it overruns. `wait` then yields claude's REAL
+  # exit (or 143 if the watchdog killed it — handled as a normal failure below,
+  # so the item is unclaimed/reopened rather than wedged). Running it detached
+  # (not in a `| tee` pipeline) gives the true exit without ${PIPESTATUS} games
+  # and makes the plan-limit grep race-free since claude has fully exited. Output
+  # reaches the log after the call returns rather than live — fine for a headless
+  # tick. A hung claude would otherwise hold the tick lock with no heartbeat.
+  local claude_pid wd_pid
+  claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null > "$capture_file" 2>&1 &
+  claude_pid=$!
+  # Watchdog fds -> /dev/null: otherwise its `sleep` child inherits the tick's
+  # stdout/stderr and, if orphaned, keeps them open and stalls anything reading
+  # our output until the sleep expires.
+  ( sleep "$CLAUDE_TIMEOUT_SECS"; kill -TERM "$claude_pid" 2>/dev/null ) >/dev/null 2>&1 &
+  wd_pid=$!
+  if wait "$claude_pid"; then claude_exit=0; else claude_exit=$?; fi
+  # Tear down the watchdog AND its sleep child (killing only the subshell would
+  # orphan the sleep) — pkill -P first, while the parent still owns the sleep.
+  pkill -P "$wd_pid" 2>/dev/null || true
+  kill -TERM "$wd_pid" 2>/dev/null || true
+  wait "$wd_pid" 2>/dev/null || true
+  cat "$capture_file" >> "$LOG_FILE" 2>/dev/null || true
   log_event claude_exit item "$item_title" exit_code "$claude_exit"
   if [[ $claude_exit -ne 0 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
@@ -1346,9 +1404,13 @@ do_status() {
   fi
   if [[ -n "$status_file" ]] && command -v jq >/dev/null 2>&1; then
     local last_tick last_item last_exit
-    last_tick="$(jq -r '.last_tick_at // empty' "$status_file")"
-    last_item="$(jq -r '.last_item // ""' "$status_file")"
-    last_exit="$(jq -r '.last_exit_code // 0' "$status_file")"
+    # `// empty`/`// 0` only apply once the JSON parses; a truncated/corrupt
+    # status file (mid-write crash, conflicted cross-machine merge) makes jq exit
+    # non-zero BEFORE the filter, which under set -e would abort `status` — the
+    # default subcommand. Guard each read so a bad file degrades to empty/default.
+    last_tick="$(jq -r '.last_tick_at // empty' "$status_file" 2>/dev/null || true)"
+    last_item="$(jq -r '.last_item // ""' "$status_file" 2>/dev/null || true)"
+    last_exit="$(jq -r '.last_exit_code // 0' "$status_file" 2>/dev/null || echo 0)"
     if [[ -n "$last_tick" ]]; then
       local clean tick_epoch now age age_str state label
       clean="${last_tick%.*Z}"

@@ -1,9 +1,11 @@
 # D1 telemetry bus — schema & liveness-decoupling design
 
-**Status: DRAFT for review (W1).** Captures the D1 schema as code and the plan to
-decouple liveness from git commits. The two **[DECISION]** points below gate the
-behavioral changes (reaper + dashboard), which are **held** until ruled on — only
-the DDL and this design are in scope right now.
+**Status: design APPROVED (W1), 2026-05-28.** Captures the D1 schema as code and
+the plan to decouple liveness from git commits. Both decisions are now **RESOLVED**
+(see §4): **DECISION 1 = fail-safe, do NOT reclaim when D1 is unreachable**;
+**DECISION 2 = poll the indexed current-state table (raise to ~30s + ETag),
+defer SSE.** The reaper switch remains gated on version-skew + a canary per the
+operating rules (the daemon stays DOWN until those land).
 
 ## 1. Current state (Path B is ~50% built)
 
@@ -112,21 +114,19 @@ reclaim_stale_claims:
   if D1 UNREACHABLE: ??? (see DECISION 1)
 ```
 
-**[DECISION 1] D1-unreachable fail-safe bias.** When the daemon can't reach D1,
-should the reaper (a) **fail-safe = do NOT reclaim** (treat unknown as alive —
-risks a genuinely-dead daemon's `[~]` items staying stuck until D1 returns), or
-(b) fall back to the current git-log heuristic? **Recommended: (a) fail-safe.**
+**[DECISION 1 — RESOLVED: fail-safe, do NOT reclaim.]** When the daemon can't
+reach D1, the reaper treats unknown liveness as alive and does **not** reclaim.
 A stuck `[~]` is recoverable (startup reclaim, manual unclaim) and visible; a
 false reclaim mid-work is the costly incident we're eliminating. The git-log
-fallback re-introduces the exact coupling we're removing.
+fallback was rejected because it re-introduces the exact coupling we're removing.
+So the `D1 UNREACHABLE` branch above = **return (no reclaim).**
 
-**[DECISION 2] Dashboard read pattern.** The item proposes SSE/WebSocket push to
-kill polling. But with the `health_status` design above, a poll hits a **tiny,
-fully-indexed current-state table** (tens of rows), so even a 15s poll is far
-under the 5M-reads/day ceiling. **Recommended: keep polling for now** (raise the
-interval to ~30s + add an ETag/`updated_at` short-circuit), and **defer SSE** to
-a later item — it's real Worker complexity for a problem the schema already
-solves. SSE only becomes worth it if we later read history on the hot path.
+**[DECISION 2 — RESOLVED: poll the indexed table, defer SSE.]** With the
+`health_status` design above, a poll hits a **tiny, fully-indexed current-state
+table** (tens of rows), far under the 5M-reads/day ceiling. So: **keep polling**,
+raise the interval to ~30s and add an ETag/`updated_at` short-circuit; **defer
+SSE** to a later item (it's real Worker complexity for a problem the schema
+already solves). Revisit SSE only if we ever read history on the hot path.
 
 ## 5. Rollout (after decisions, sequenced; daemon stays DOWN until canary)
 
@@ -141,9 +141,10 @@ solves. SSE only becomes worth it if we later read history on the hot path.
 5. Retention/rollup job on `health_history` (prune raw rows past N days; keep
    daily rollups) — cheap insurance against storage/scan growth.
 
-## 6. What's blocked on you
+## 6. Status
 
-Nothing here changes runtime behavior yet. To proceed past the DDL I need rulings
-on **DECISION 1** (reaper fail-safe bias) and **DECISION 2** (poll vs SSE). My
-recommendations: **(1) fail-safe no-reclaim**, **(2) keep polling an indexed
-current-state table, defer SSE.**
+Design **approved** (both decisions resolved, §4). Remaining gate before the
+*reaper switch* (step 3) goes live: **version-skew visibility + a canary** must
+land first, and the fleet daemons stay DOWN until then (operating rules). The
+**additive groundwork** (step 1 migration, step 2 heartbeat ingest) carries no
+behavioral risk and can land independently of that gate.

@@ -8,11 +8,14 @@
 #                         /usage inside Claude Code — the transcript-derived
 #                         host totals previously shown here drifted from
 #                         /usage's numbers and were removed.
-#   backlog-agents sync [--no-pull|--restart-only] [--no-gate] [--gate-only]
+#   backlog-agents sync [--no-pull|--restart-only] [--no-gate] [--gate-only] [--include-infra]
 #                         Pull dotfiles + every active project, then restart every
 #                         agent launchd daemon (both legacy
 #                         com.${USER}.*.backlog-loop and new
-#                         com.${USER}.*.backlog-agent labels). The RESTART is gated
+#                         com.${USER}.*.backlog-agent labels) — EXCEPT the infra
+#                         daemon, which self-modifies the shared bin/ and is held
+#                         for interactive operation (--include-infra to override).
+#                         The RESTART is gated
 #                         on canary + version-skew (see _sync_gate_check): it won't
 #                         restart agents onto a driver that hasn't passed `canary`
 #                         or that differs from origin/main's bin — blocked, the
@@ -101,6 +104,8 @@
 # Sync flags:
 #   --no-pull         skip dotfiles + project pulls (just restart agents)
 #   --restart-only    same as --no-pull, also skip the final dashboard print
+#   --include-infra   also restart the infra daemon (excluded by default — it
+#                     self-modifies the shared bin/ and is operated interactively)
 #
 # Per-project state lookup is polyglot during the migration:
 #   status file:    .claude/backlog-status.json (new) or .claude/loop-status.json (legacy)
@@ -123,6 +128,13 @@ else
 fi
 DOTFILES="$HOME/dotfiles"
 ACTIVE_ROOT="$HOME/dev/projects/active"
+# The project whose daemon self-modifies the SHARED driver (bin/) and is
+# therefore operated INTERACTIVELY, not by the fleet. `do_sync`'s restart loop
+# excludes it by default (see _is_infra_project) — else syncing the fleet
+# re-bootstraps + un-holds the very daemon that mutates bin/ out from under an
+# interactive session. Matches the fleet-freeze exemption (backlog-agent
+# freeze_exempt). Override per-invocation with `sync --include-infra`.
+INFRA_PROJECT="${INFRA_PROJECT:-backlog-infra}"
 
 # Canonical ephemeral .claude/ runtime set — the single source of truth for
 # which per-machine files the daemon writes every tick and that must therefore
@@ -904,14 +916,19 @@ _sync_gate_check() {
   return 0
 }
 
+# True (0) iff the given project name is the infra project (whose daemon
+# self-modifies the shared driver and is operated interactively).
+_is_infra_project() { [[ "$1" == "$INFRA_PROJECT" ]]; }
+
 do_sync() {
-  local NO_PULL=0 RESTART_ONLY=0 NO_GATE=0 GATE_ONLY=0
+  local NO_PULL=0 RESTART_ONLY=0 NO_GATE=0 GATE_ONLY=0 INCLUDE_INFRA=0
   for arg in "$@"; do
     case "$arg" in
-      --no-pull)      NO_PULL=1 ;;
-      --restart-only) NO_PULL=1; RESTART_ONLY=1 ;;
-      --no-gate)      NO_GATE=1 ;;
-      --gate-only)    GATE_ONLY=1 ;;
+      --no-pull)       NO_PULL=1 ;;
+      --restart-only)  NO_PULL=1; RESTART_ONLY=1 ;;
+      --no-gate)       NO_GATE=1 ;;
+      --gate-only)     GATE_ONLY=1 ;;
+      --include-infra) INCLUDE_INFRA=1 ;;
       *) echo "backlog-agents sync: unknown flag: $arg" >&2; exit 2 ;;
     esac
   done
@@ -972,6 +989,15 @@ do_sync() {
     name="${name%.backlog-agent}"
     name="${name%.backlog}"
     name="${name%.backlog-loop}"
+    # Never auto-restart the infra daemon (it self-modifies the shared bin/ and
+    # is operated interactively) unless --include-infra. Without this, every
+    # sync re-bootstraps + un-holds it — the gap that let it overwrite an
+    # interactive session's in-flight edits. Pairs with the fleet-freeze
+    # exemption (backlog-agent freeze_exempt).
+    if _is_infra_project "$name" && (( INCLUDE_INFRA == 0 )); then
+      warn "$name: skipping auto-restart (infra daemon is operated interactively; pass --include-infra to override)"
+      continue
+    fi
     repo="$ACTIVE_ROOT/$name"
     if [[ ! -d "$repo" ]]; then
       warn "$label points to $repo which doesn't exist; skipping (run \`dev-projects sync\`)"
@@ -2299,7 +2325,7 @@ case "$cmd" in
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
-    sed -n '2,110p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,115p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     # Default: snapshot. Parse flags here so they're scoped to this path.

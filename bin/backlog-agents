@@ -30,6 +30,16 @@
 #                         the reaper-restart / fleet-freeze consult it so a daemon
 #                         never comes back up on an unvalidated driver.
 #
+#   backlog-agents metrics [--json]
+#                         Efficiency metrics from each project's per-tick ledger
+#                         (.claude/backlog-history.jsonl). Per-project table plus a
+#                         fleet summary of: total ticks, completed items,
+#                         tokens-per-completion, success rate (exit_code==0 / total),
+#                         and retry rate (ticks per completed item). NOTE: history
+#                         has no explicit "completed" flag yet, so a completion is
+#                         APPROXIMATED as a tick with exit_code==0 AND a non-empty
+#                         work_commit. --json emits a machine-readable object.
+#
 #   backlog-agents daemon-sync [--interval <seconds>] [--once]
 #                       Run `backlog-agents sync` in a loop, keeping all projects
 #                       pulled and agents healthy. Default interval is 86400s
@@ -1796,6 +1806,183 @@ do_canary() {
   return 0
 }
 
+# ---- subcommand: metrics ----
+# Efficiency metrics from each project's per-tick ledger
+# (.claude/backlog-history.jsonl, polyglot fallback effort-log.jsonl). Reads
+# every project under PROJECTS_ROOTS the same way snapshot() does (dedupe by
+# realpath) and prints a per-project table plus a fleet summary of:
+#   - total ticks            count of history records
+#   - completed items        ticks APPROXIMATED as completions (see note)
+#   - tokens/completion      sum(tokens) / completed  (efficiency)
+#   - success rate           ticks with exit_code==0 / total ticks
+#   - retry rate             total ticks / completed  (ticks burned per completion)
+#
+# NOTE: the history schema has no explicit "completed" flag yet, so a completion
+# is APPROXIMATED as a tick with exit_code==0 AND a non-empty work_commit (a
+# committed unit of work). This over/under-counts when a tick commits without
+# finishing an item, or finishes without a commit. Footnoted in the output and
+# revisable once the ledger grows a real completion field.
+#
+#   backlog-agents metrics          per-project table + fleet summary
+#   --json                          machine-readable {projects:[...], fleet:{...}}
+do_metrics() {
+  local json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json) json=1 ;;
+      *) echo "backlog-agents metrics: unknown flag: $a" >&2; exit 2 ;;
+    esac
+  done
+
+  # Discover projects exactly like snapshot(): walk roots, dedupe by realpath.
+  local -a candidates=()
+  local root proj_dir
+  for root in "${PROJECTS_ROOTS[@]}"; do
+    [[ -d "$root" ]] || continue
+    for proj_dir in "$root"/*/; do
+      [[ -d "$proj_dir" ]] || continue
+      candidates+=("${proj_dir%/}")
+    done
+  done
+  local seen='|'
+  local -a unique=()
+  for proj_dir in "${candidates[@]:-}"; do
+    [[ -n "$proj_dir" ]] || continue
+    local real
+    real="$(cd "$proj_dir" 2>/dev/null && pwd -P)" || continue
+    case "$seen" in *"|$real|"*) continue ;; esac
+    seen="${seen}${real}|"
+    unique+=("$real")
+  done
+
+  # Per-project parallel arrays (bash 3.2: no associative arrays).
+  local -a m_name=() m_ticks=() m_done=() m_tokens=() m_ok=()
+  # Fleet accumulators.
+  local f_ticks=0 f_done=0 f_tokens=0 f_ok=0
+
+  # Single jq pass per history file. A "completion" is exit_code==0 AND a
+  # non-empty (non-null) work_commit — the documented approximation. Emits four
+  # whitespace-separated integers: ticks done tokens ok.
+  local jq_prog='
+    [ .[] ] as $rs
+    | ($rs | length) as $ticks
+    | ([$rs[] | select((.exit_code // 1) == 0)] | length) as $ok
+    | ([$rs[] | select((.exit_code // 1) == 0
+                       and ((.work_commit // "") | tostring) != ""
+                       and ((.work_commit // "") | tostring) != "null")] | length) as $done
+    | ([$rs[] | .tokens // 0] | add // 0) as $tokens
+    | "\($ticks) \($done) \($tokens) \($ok)"
+  '
+
+  for proj_dir in "${unique[@]:-}"; do
+    [[ -n "$proj_dir" ]] || continue
+    local hist; hist="$(find_history_file "$proj_dir")"
+    [[ -n "$hist" ]] || continue
+    local out ticks done_ tokens ok
+    out="$(jq -s -r "$jq_prog" "$hist" 2>/dev/null || echo "0 0 0 0")"
+    read -r ticks done_ tokens ok <<< "$out"
+    [[ "$ticks" =~ ^[0-9]+$ ]] || ticks=0
+    [[ "$done_" =~ ^[0-9]+$ ]] || done_=0
+    [[ "$tokens" =~ ^[0-9]+$ ]] || tokens=0
+    [[ "$ok" =~ ^[0-9]+$ ]] || ok=0
+    (( ticks == 0 )) && continue   # no recorded ticks: nothing to report
+    m_name+=("$(basename "$proj_dir")")
+    m_ticks+=("$ticks"); m_done+=("$done_"); m_tokens+=("$tokens"); m_ok+=("$ok")
+    f_ticks=$(( f_ticks + ticks ))
+    f_done=$(( f_done + done_ ))
+    f_tokens=$(( f_tokens + tokens ))
+    f_ok=$(( f_ok + ok ))
+  done
+
+  # Integer-only helpers (bash has no float). Rates are scaled to keep precision.
+  # _pct: ok/total as a percentage (one decimal).  _per: a/b as N.N (one decimal).
+  _pct() { # numerator denominator -> "NN.N%"
+    local n="$1" d="$2"
+    (( d == 0 )) && { printf '%s' "—"; return; }
+    printf '%d.%d%%' $(( n * 100 / d )) $(( (n * 1000 / d) % 10 ))
+  }
+  _per() { # numerator denominator -> "N.N"
+    local n="$1" d="$2"
+    (( d == 0 )) && { printf '%s' "—"; return; }
+    printf '%d.%d' $(( n / d )) $(( (n * 10 / d) % 10 ))
+  }
+  _tpc() { # tokens completed -> integer tokens/completion (or —)
+    local t="$1" c="$2"
+    (( c == 0 )) && { printf '%s' "—"; return; }
+    printf '%d' $(( t / c ))
+  }
+
+  if (( json )); then
+    # Build the projects array with jq from the parallel arrays.
+    local proj_json="[]" i
+    if (( ${#m_name[@]} )); then
+    for i in "${!m_name[@]}"; do
+      proj_json="$(jq -c \
+        --arg name "${m_name[$i]}" \
+        --argjson ticks "${m_ticks[$i]}" \
+        --argjson completed "${m_done[$i]}" \
+        --argjson tokens "${m_tokens[$i]}" \
+        --argjson ok "${m_ok[$i]}" \
+        '. + [{
+           project: $name,
+           ticks: $ticks,
+           completed: $completed,
+           tokens: $tokens,
+           tokens_per_completion: (if $completed > 0 then ($tokens / $completed) else null end),
+           success_rate: (if $ticks > 0 then ($ok / $ticks) else null end),
+           retry_rate: (if $completed > 0 then ($ticks / $completed) else null end)
+         }]' <<< "$proj_json")"
+    done
+    fi
+    jq -n \
+      --argjson projects "$proj_json" \
+      --argjson ticks "$f_ticks" \
+      --argjson completed "$f_done" \
+      --argjson tokens "$f_tokens" \
+      --argjson ok "$f_ok" \
+      '{
+         note: "completion APPROXIMATED as exit_code==0 AND non-empty work_commit (history has no explicit completed flag yet)",
+         projects: $projects,
+         fleet: {
+           ticks: $ticks,
+           completed: $completed,
+           tokens: $tokens,
+           tokens_per_completion: (if $completed > 0 then ($tokens / $completed) else null end),
+           success_rate: (if $ticks > 0 then ($ok / $ticks) else null end),
+           retry_rate: (if $completed > 0 then ($ticks / $completed) else null end)
+         }
+       }'
+    return 0
+  fi
+
+  printf '%sMETRICS%s  %sper-tick ledger efficiency%s\n' "${B}${CY}" "${RS}" "$DIM" "$RS"
+  if (( ${#m_name[@]} == 0 )); then
+    printf '\n  %sNo project history (.claude/backlog-history.jsonl) under: %s%s\n' \
+      "$DIM" "${PROJECTS_ROOTS[*]}" "$RS"
+    return 0
+  fi
+  echo
+  printf '  %s%-18s %-7s %-6s %-12s %-9s %-7s%s\n' \
+    "$DIM" "PROJECT" "TICKS" "DONE" "TOK/DONE" "SUCCESS" "RETRY" "$RS"
+  local i
+  for i in "${!m_name[@]}"; do
+    printf '  %-18s %-7s %-6s %-12s %-9s %-7s\n' \
+      "${m_name[$i]}" "${m_ticks[$i]}" "${m_done[$i]}" \
+      "$(_tpc "${m_tokens[$i]}" "${m_done[$i]}")" \
+      "$(_pct "${m_ok[$i]}" "${m_ticks[$i]}")" \
+      "$(_per "${m_ticks[$i]}" "${m_done[$i]}")"
+  done
+  printf '  %s%-18s %-7s %-6s %-12s %-9s %-7s%s\n' \
+    "$B" "FLEET" "$f_ticks" "$f_done" \
+    "$(_tpc "$f_tokens" "$f_done")" \
+    "$(_pct "$f_ok" "$f_ticks")" \
+    "$(_per "$f_ticks" "$f_done")" "$RS"
+  echo
+  printf '  %s* completion APPROXIMATED as exit_code==0 AND a non-empty work_commit\n' "$DIM"
+  printf '    (history has no explicit completed flag yet); RETRY = ticks per completion.%s\n' "$RS"
+  return 0
+}
+
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
@@ -1807,6 +1994,7 @@ case "$cmd" in
   list) shift; do_list "$@" ;;
   doctor) shift; do_doctor "$@" ;;
   canary) shift; do_canary "$@" ;;
+  metrics) shift; do_metrics "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
   uninstall-watchdog) do_uninstall_watchdog ;;

@@ -1,34 +1,29 @@
 {
-  "last_tick_at": "2026-05-29T13:31:41.736Z",
+  "last_tick_at": "2026-05-29T14:16:36.960Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
-  "last_item": "Extend `bin/backlog-agent-status.mjs` to record per tick: (a) a `completed` / marker-transition flag (did this tick move a backlog item to Done / `[x]`?, since today's stream only logs the item *worked on* + whether a `work_commit` was produced, and `exit_code` does not indicate completion), and (b) `repo_slug` (e.g. `owner/repo`, derived from `git remote`) + the FULL commit SHA (currently only a short 7-char SHA is stored). Goal: let downstream dashboards list genuinely-completed items per usage window with working `github.com/<owner>/<repo>/commit/<sha>` links, without after-the-fact reconstruction. **Prereq for backlog-dashboard \"Away/Recap\" view** (see backlog-dashboard `docs/Backlog.md`, Thinking). [W0 foundation — prereq for efficiency metrics + fleet digest.]",
+  "last_item": "**(P2 · W0) Enforce the full ephemeral-`.claude/` gitignore set fleet-wide + in `doctor` + template.** Broadened 2026-05-29 from the events.jsonl-only case after a second instance of the same class. The bug class: a per-machine ephemeral `.claude/` runtime file that is either untracked-but-unignored (autostash `--include-untracked` grabs it, pop fails → orphan) or outright tracked (the daemon deletes/rewrites it each tick → that tracked change is autostashed and fails to pop → orphan). Concrete instances found: (i) `.claude/backlog-agent-events.jsonl` — gitignored in `backlog-infra` only, untracked elsewhere; fixed during bring-up (added + pushed to 6 repos, stashes dropped). (ii) `.claude/agent-cooldown.json` — **tracked** in dark-mode-safari + sacred-geography (deleted on cooldown-clear → one orphan stash per tick; dark-mode-safari hit 4, sacred-geography 7); fixed 2026-05-29 (untrack + gitignore + push; see Done). **Note `agent-cooldown.json` is missing from `templates/dev-project/.gitignore` entirely.** (iii) `.claude/backlog-agent-failcounts.json` — listed in the template but **untracked-unignored** in backlog-dashboard, dark-mode-safari, predictive-history, sacred-geography (latent autostash co-trigger); only sacred-geography fixed so far. Enforcement: (a) define the canonical ephemeral set in one place and have `doctor` assert every active repo ignores all of it (currently it checks only a subset) — hard-fail on a *tracked* ephemeral file, warn on untracked-unignored; (b) make `templates/dev-project/.gitignore` the superset (add `agent-cooldown.json`); (c) one-shot sweep the remaining repos for the failcounts line. → ties to the D1 telemetry bus (W1), which removes the deeper \"tracked status/history\" variant (see TaizMail item below).",
   "last_exit_code": 0,
-  "last_tokens": 46377,
-  "last_work_commit": "252a686",
-  "full_commit": "252a68690926c50ad488e6a4eb5319531ee22dcc",
+  "last_tokens": 97907,
+  "last_work_commit": "bd1195a",
+  "full_commit": "bd1195a8d831c580e7a7edfdcb549808f7d438b3",
   "repo_slug": "kashnoorani/backlog-infra",
   "completed": false,
   "completed_items": [],
   "last_pull_count": 0,
-  "last_session_id": "54497b91-a896-492d-86b8-d4589f72cf60",
-  "driver_sha": "ddddc01",
-  "rolling_7d_tokens": 682732,
+  "last_session_id": "ed761a00-3f22-47c7-af0e-e1a0ae5e0cd4",
+  "driver_sha": "bd1195a",
+  "rolling_7d_tokens": 780639,
   "backlog": {
     "thinking": 30,
-    "open": 2,
+    "open": 1,
     "in_progress": 0,
     "blocked": 0,
     "done": 1
   },
   "artifacts": {
-    "uncommitted": [
-      {
-        "status": " D",
-        "path": ".claude/agent-cooldown.json"
-      }
-    ],
+    "uncommitted": [],
     "unpushed_commits": 1,
-    "computed_at": "2026-05-29T13:31:43.299Z"
+    "computed_at": "2026-05-29T14:16:38.388Z"
   }
 }

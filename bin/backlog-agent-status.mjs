@@ -230,6 +230,102 @@ function countBacklogMarkers() {
   return counts;
 }
 
+// ---------- completion detection ----------
+// Detect items that transitioned to the done marker [x] in docs/Backlog.md
+// across preHead..HEAD. Conservative: returns { completed:false, items:[] } on
+// idle/no-op ticks, on any git failure, or when there is no backlog file.
+//
+// How it works: we diff ONLY the backlog file between the work-item's pre-tick
+// HEAD and the current HEAD. In the unified diff we look at the ADDED side
+// (lines starting "+") for task lines that are now done — i.e. they newly match
+// the done marker `^(- )?\[x\] `. We also require that the SAME title appeared
+// on the REMOVED side ("-") with a non-done marker ([ ]/[~]/[!]/[?]) so we count
+// a genuine marker *transition* rather than a brand-new line that arrived
+// already-checked (e.g. a whole done block moved/added). This pairing keeps the
+// signal tight: one tick that flips "[~] Foo" → "[x] Foo" yields ["Foo"].
+function stripTaskTitle(line) {
+  // Drop the leading diff sign, optional "- " bullet, the [marker], and any
+  // surrounding whitespace, leaving just the human title for pairing/reporting.
+  return line
+    .replace(/^[+-]/, "")
+    .replace(/^\s*(- )?\[[ x~!?]\]\s*/, "")
+    .trim();
+}
+
+function detectCompletion(preHead, head) {
+  const result = { completed: false, items: [] };
+  if (!preHead || !head || preHead === head) return result; // idle/no-op tick
+  const backlogFile = findBacklogFile();
+  if (!backlogFile) return result;
+  // Path relative to REPO_ROOT for the diff pathspec (git() runs with cwd=REPO_ROOT).
+  const rel = backlogFile.startsWith(REPO_ROOT)
+    ? backlogFile.slice(REPO_ROOT.length).replace(/^\//, "")
+    : backlogFile;
+  let diff;
+  try {
+    const r = git(["diff", `${preHead}..${head}`, "--", rel], { allowFail: true });
+    if (r.status !== 0) return result;
+    diff = r.stdout || "";
+  } catch {
+    return result;
+  }
+  // Collect non-done titles that were REMOVED, and titles newly marked [x].
+  const removedNonDone = new Set();
+  const addedDone = [];
+  for (const line of diff.split("\n")) {
+    // Skip diff headers ("+++", "---") which also start with +/-.
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("-") && /^-\s*(- )?\[[ ~!?]\] /.test(line)) {
+      removedNonDone.add(stripTaskTitle(line));
+    } else if (line.startsWith("+") && /^\+\s*(- )?\[x\] /.test(line)) {
+      addedDone.push(stripTaskTitle(line));
+    }
+  }
+  // A completion is an added [x] line whose title was previously present as a
+  // non-done item (genuine transition). De-dup titles defensively.
+  const seen = new Set();
+  for (const title of addedDone) {
+    if (!title) continue;
+    if (!removedNonDone.has(title)) continue; // not a transition — skip
+    if (seen.has(title)) continue;
+    seen.add(title);
+    result.items.push(title);
+  }
+  result.completed = result.items.length > 0;
+  return result;
+}
+
+// ---------- repo slug ----------
+// Derive "owner/repo" from the origin remote URL. Handles SSH
+// (git@github.com:owner/repo.git), scp-like, and https
+// (https://github.com/owner/repo.git) forms. Returns null on any failure.
+function deriveRepoSlug() {
+  let url;
+  try {
+    const r = git(["remote", "get-url", "origin"], { allowFail: true });
+    if (r.status !== 0) return null;
+    url = (r.stdout || "").trim();
+  } catch {
+    return null;
+  }
+  if (!url) return null;
+  // Strip trailing ".git".
+  let s = url.replace(/\.git$/, "");
+  // SSH/scp form: git@host:owner/repo  → take after the first ":".
+  const sshMatch = s.match(/^[^/]+@[^:]+:(.+)$/);
+  if (sshMatch) s = sshMatch[1];
+  else {
+    // URL form: scheme://host/owner/repo → take the path after the host.
+    const urlMatch = s.match(/^[a-z]+:\/\/[^/]+\/(.+)$/i);
+    if (urlMatch) s = urlMatch[1];
+  }
+  // Now s should be "owner/repo" (possibly with extra leading path segments for
+  // self-hosted instances). Keep the last two segments.
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  return `${parts[parts.length - 2]}/${parts[parts.length - 1]}`;
+}
+
 // ---------- local artefacts (files not pushed to origin) ----------
 // Captures what exists in the working tree but not on origin so the web
 // dashboard can surface it: uncommitted changes (untracked / modified /
@@ -352,6 +448,18 @@ async function main() {
     currentHead && opts.preHead && currentHead !== opts.preHead
       ? currentHead.slice(0, 7)
       : null;
+  // FULL 40-char work-commit SHA (alongside the existing short form above).
+  const fullCommit =
+    currentHead && opts.preHead && currentHead !== opts.preHead
+      ? currentHead
+      : null;
+
+  // repo_slug ("owner/repo" from origin) and completion detection. Computed
+  // BEFORE the pull --rebase below so the diff is against the original work
+  // HEAD; both are by-ref/by-remote so they're stable across the rebase, but
+  // computing here keeps the inputs unambiguous.
+  const repoSlug = deriveRepoSlug();
+  const completion = detectCompletion(opts.preHead, currentHead);
 
   // Pull --rebase BEFORE writing local artefacts so origin is current.
   // Uses explicit fetch + rebase origin/<branch> instead of `git pull
@@ -456,6 +564,14 @@ async function main() {
     last_exit_code: opts.exitCode,
     last_tokens: statusTokens,
     last_work_commit: statusWorkCommit,
+    // FULL 40-char work-commit SHA (short form is last_work_commit). null on
+    // idle ticks (no work commit this tick).
+    full_commit: fullCommit,
+    // "owner/repo" derived from the origin remote, or null.
+    repo_slug: repoSlug,
+    // Whether this tick moved one or more backlog items to [x], and which ones.
+    completed: completion.completed,
+    completed_items: completion.items,
     last_pull_count: opts.pulled,
     last_session_id: sessionKey,
     // Driver version-skew (W1): the git SHA of the shared driver this daemon is
@@ -504,6 +620,10 @@ async function main() {
           last_exit_code: statusObj.last_exit_code,
           last_tokens: statusObj.last_tokens,
           last_commit: statusObj.last_work_commit,
+          full_commit: statusObj.full_commit,
+          repo_slug: statusObj.repo_slug,
+          completed: statusObj.completed,
+          completed_items: statusObj.completed_items,
           driver_sha: statusObj.driver_sha,
           // Liveness heartbeat (D1 telemetry bus): seconds since epoch, sent on
           // EVERY tick incl. idle/cooldown — independent of any git commit, so
@@ -534,6 +654,10 @@ async function main() {
     num_turns: usage.num_turns,
     session_id: usage.session_id,
     work_commit: workCommit,
+    full_commit: fullCommit,
+    repo_slug: repoSlug,
+    completed: completion.completed,
+    completed_items: completion.items,
     pulled: opts.pulled,
     driver_sha: opts.driverSha || null,
   };

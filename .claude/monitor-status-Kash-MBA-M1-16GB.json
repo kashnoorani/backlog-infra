@@ -1,10 +1,10 @@
 {
-  "last_sweep_at": "2026-05-29T20:34:55Z",
+  "last_sweep_at": "2026-05-29T20:36:59Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 8,
+  "sweeps_total": 9,
   "fixed_total": 0,
-  "flagged_total": 8,
-  "recent_actions": [{"ts":"2026-05-29T20:20:22Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:22:26Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:24:31Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:26:35Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:28:39Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:30:44Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:32:48Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:34:53Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]
+  "flagged_total": 9,
+  "recent_actions": [{"ts":"2026-05-29T20:20:22Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:22:26Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:24:31Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:26:35Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:28:39Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:30:44Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:32:48Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:34:53Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"},{"ts":"2026-05-29T20:36:56Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]
 }

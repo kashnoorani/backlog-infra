@@ -414,6 +414,7 @@ replay).
 | `sync` | pull dotfiles + every active project, restart every agent daemon, reprint |
 | `list` | show installed agent launchd labels + their state |
 | `doctor` | read-only preflight: report drift between the manifest, project dirs, and daemons + per-project config hygiene (see below) |
+| `canary [--check] [--json]` | validate the shared driver before it goes fleet-wide; record/gate a pass keyed to the driver bin SHA (see below) |
 | `daemon-sync [--interval N] [--once]` | run `sync` on a loop (default 24 h) |
 | `install-watchdog` / `uninstall-watchdog` | (un)install a launchd plist running `daemon-sync` |
 
@@ -432,6 +433,19 @@ file valid; `git`/`node`/`jq` required, `gawk`/`fswatch` warned — `gawk` avoid
 the BSD-awk `-i inplace` footgun). It mutates nothing and exits non-zero on any
 hard failure (warnings don't fail), so it's safe to run anytime and usable as a
 CI/pre-sync gate.
+
+**`backlog-agents canary`** is blast-radius control for the *shared* driver:
+because every project runs the same `backlog-infra/bin/` checkout, one bad driver
+commit breaks the whole fleet at once (the 2026-05-28 cooldown-add bug did exactly
+that). Run mode validates the *current* driver — the hermetic self-test suite
+(`test/run.sh`, which contains the regression test for that bug class) plus a
+`doctor` hard-fail check — and on success records a pass keyed to the driver's
+**bin SHA** in `~/.claude/backlog-canary.json`. `--check` is the read-only gate
+(exit 0 iff the running driver's SHA has a recorded pass); the D1 reaper-restart
+and the future fleet-freeze consult it so a daemon never comes back up on an
+unvalidated driver. It's token-free and deterministic. The "let the rest pull"
+auto-rollout wiring (gating `daemon-sync` propagation on `canary --check`) lands
+with the fleet-freeze composite; the gate primitive is what this provides.
 
 ### `dev-projects` — repo lifecycle
 

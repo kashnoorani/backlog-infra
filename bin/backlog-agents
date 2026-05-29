@@ -22,6 +22,14 @@
 #                         file present, required tools). Read-only; never changes
 #                         state. Exits non-zero if any hard check FAILs.
 #
+#   backlog-agents canary [--check] [--json]
+#                         Blast-radius control for the shared driver. Run mode
+#                         validates the current driver (self-test suite + doctor)
+#                         and records a pass keyed to its bin SHA. --check is the
+#                         read-only gate (exit 0 iff the running driver passed) —
+#                         the reaper-restart / fleet-freeze consult it so a daemon
+#                         never comes back up on an unvalidated driver.
+#
 #   backlog-agents daemon-sync [--interval <seconds>] [--once]
 #                       Run `backlog-agents sync` in a loop, keeping all projects
 #                       pulled and agents healthy. Default interval is 86400s
@@ -1727,6 +1735,67 @@ do_doctor() {
   return 0
 }
 
+# ---- subcommand: canary ----
+# Blast-radius control for the SHARED driver: validate a driver version before
+# it goes fleet-wide. Because bin/ is shared, one bad driver commit breaks every
+# project at once (the 2026-05-28 cooldown-add bug did exactly this). The canary
+# asserts health against the *current* driver and records a pass keyed to its bin
+# SHA; the reaper-restart / fleet-freeze consult `canary --check` so a daemon
+# never comes back up on a driver that hasn't passed. Token-free + deterministic:
+# the self-test suite already contains the regression test for that bug class.
+#
+#   backlog-agents canary           run the checks; record a pass for the current SHA
+#   backlog-agents canary --check   read-only gate: exit 0 iff the running driver passed
+#   --json                          machine-readable result
+#
+# Overrides (testing): CANARY_STATE_FILE, CANARY_SELFTEST_CMD, CANARY_DOCTOR=0.
+do_canary() {
+  local check_only=0 json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --check) check_only=1 ;;
+      --json)  json=1 ;;
+      *) echo "backlog-agents canary: unknown flag: $a" >&2; exit 2 ;;
+    esac
+  done
+
+  local infra_dir="$ACTIVE_ROOT/backlog-infra"
+  local state_file="${CANARY_STATE_FILE:-$HOME/.claude/backlog-canary.json}"
+  local cur_sha=""
+  [[ -d "$infra_dir/.git" ]] && cur_sha="$(git -C "$infra_dir" log -1 --format=%h -- bin 2>/dev/null || true)"
+
+  if (( check_only )); then
+    local passed_sha=""
+    [[ -f "$state_file" ]] && passed_sha="$(jq -r '.passed_sha // empty' "$state_file" 2>/dev/null || true)"
+    if [[ -n "$cur_sha" && "$passed_sha" == "$cur_sha" ]]; then
+      (( json )) && printf '{"ok":true,"sha":"%s"}\n' "$cur_sha" || ok "canary current: driver ${cur_sha} has passed"
+      return 0
+    fi
+    (( json )) && printf '{"ok":false,"sha":"%s","passed_sha":"%s"}\n' "$cur_sha" "$passed_sha" \
+      || warn "canary STALE: running driver=${cur_sha:-?}, last passed=${passed_sha:-none} — run \`backlog-agents canary\` before letting the fleet pull"
+    return 1
+  fi
+
+  # Run mode: assert health, then record a pass for the current SHA.
+  info "canary: validating driver ${cur_sha:-?}"
+  local selftest_rc=0 doctor_rc=0
+  local selftest_cmd="${CANARY_SELFTEST_CMD:-bash $infra_dir/test/run.sh}"
+  info "  self-test: $selftest_cmd"
+  if $selftest_cmd >/dev/null 2>&1; then ok "  self-test passed"; else selftest_rc=1; warn "  self-test FAILED"; fi
+  if [[ "${CANARY_DOCTOR:-1}" == "1" ]]; then
+    if do_doctor >/dev/null 2>&1; then ok "  doctor passed"; else doctor_rc=1; warn "  doctor reported a HARD failure"; fi
+  fi
+  if (( selftest_rc || doctor_rc )); then
+    warn "canary FAILED for driver ${cur_sha:-?} — not recording a pass (do NOT roll this driver fleet-wide)"
+    return 1
+  fi
+  mkdir -p "$(dirname "$state_file")"
+  jq -n --arg sha "$cur_sha" --arg at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+     '{passed_sha:$sha, passed_at:$at, checks:{selftest:"pass", doctor:"pass"}}' > "$state_file"
+  ok "canary PASSED — recorded driver ${cur_sha} (${state_file})"
+  return 0
+}
+
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
@@ -1737,6 +1806,7 @@ case "$cmd" in
   sync) shift; do_sync "$@" ;;
   list) shift; do_list "$@" ;;
   doctor) shift; do_doctor "$@" ;;
+  canary) shift; do_canary "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
   uninstall-watchdog) do_uninstall_watchdog ;;
@@ -1745,7 +1815,7 @@ case "$cmd" in
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
-    sed -n '2,70p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,78p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     # Default: snapshot. Parse flags here so they're scoped to this path.

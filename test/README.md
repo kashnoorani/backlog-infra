@@ -78,6 +78,18 @@ is read-only — never touches the real fleet):
 6. status hook with a syntax error → hard fail (`node --check`)
 7. invalid budgets JSON → hard fail
 
+`canary.bats` — `backlog-agents canary` driver blast-radius gate (W3), run
+against a fake `$HOME` with a throwaway backlog-infra git repo (deterministic bin
+SHA). The heavy self-test suite is stubbed (`CANARY_SELFTEST_CMD`) and doctor
+disabled (`CANARY_DOCTOR=0`) so these exercise the record/gate mechanism:
+
+1. passing checks record a pass keyed to the current driver SHA
+2. a failing self-test does **not** record a pass
+3. `--check` passes once the current driver has a recorded pass
+4. `--check` goes stale the moment the driver bin SHA changes
+5. `--check` with no prior canary is stale (no false green)
+6. `--check --json` emits a machine-readable verdict
+
 ## TODO
 
 - **Concurrent claim-race** (two daemons push the same `claim:` → one wins,

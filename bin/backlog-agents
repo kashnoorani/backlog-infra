@@ -1430,7 +1430,6 @@ do_monitor() {
   local log_tail_lines=150
   local _last_status_commit=0
   local _status_heartbeat=300
-  local _self_root; _self_root="$(cd "$ACTIVE_ROOT/backlog-infra" 2>/dev/null && pwd -P || echo '')"
   # Reconciled notify config (docs/dead-mans-switch.md): the canonical file is
   # ~/.claude/agent-notify.json (shared with the driver: slack_webhook_url / email /
   # local_notify). The legacy ~/.config/backlog/notify.json (slack_webhook /
@@ -1476,11 +1475,6 @@ do_monitor() {
     if (( now_epoch - _last_notify < 300 )); then return 0; fi
     _last_notify="$now_epoch"
     _notify_raw "$@"
-  }
-
-  _is_self() {
-    local p; p="$(cd "${1:-}" 2>/dev/null && pwd -P)" || return 1
-    [[ "$p" == "$_self_root" ]]
   }
 
   _write_status() {
@@ -1582,26 +1576,23 @@ JSON
         local tree_actually_dirty=0
         [[ -n $(git -C "$proj_dir" status --porcelain 2>/dev/null) ]] && tree_actually_dirty=1
         if (( tree_actually_dirty )); then
-          if (( safe_to_fix && fix )); then
+          if (( safe_to_fix && fix )) && ! _is_infra_project "$name"; then
             git -C "$proj_dir" rebase --abort 2>/dev/null || true
-            if _is_self "$proj_dir"; then
-              local stash_hash=""
-              git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-              stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
-              git -C "$proj_dir" fetch origin 2>/dev/null || true
+            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
               git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-              git -C "$proj_dir" clean -fd 2>/dev/null || true
-              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — stash (${stash_hash:-?}) + reset (self-protect)")
-              sweep_fixed=$((sweep_fixed + 1))
-              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
-            else
-              git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
-                git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-              git -C "$proj_dir" clean -fd 2>/dev/null || true
-              fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
-              sweep_fixed=$((sweep_fixed + 1))
-              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
-            fi
+            git -C "$proj_dir" clean -fd 2>/dev/null || true
+            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git dirty tree — reset --hard + clean")
+            sweep_fixed=$((sweep_fixed + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"fixed\"}")
+          elif _is_infra_project "$name"; then
+            # The infra repo is operated INTERACTIVELY and its daemon is HELD — the
+            # monitor must NEVER stash/reset it (it would eat in-flight interactive
+            # work, and the held daemon's log lines are frozen/stale so a fix would
+            # re-fire every sweep). Flag only — the same exclusion as do_sync + the
+            # dead-man's-switch watcher.
+            fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree — infra repo (interactive, daemon held); flag only, not auto-reset")
+            sweep_flagged=$((sweep_flagged + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"flagged_infra\"}")
           else
             fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
             sweep_flagged=$((sweep_flagged + 1))
@@ -1612,45 +1603,36 @@ JSON
 
       # Pattern 2: git fast-forward failure
       if echo "$recent" | grep -qiE 'fatal: Cannot fast-forward'; then
-        if (( safe_to_fix && fix )); then
+        if _is_infra_project "$name"; then
+          # infra repo: interactive + daemon held — flag only, never reset.
+          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git fast-forward conflict — infra repo (interactive, daemon held); flag only, not auto-reset")
+          sweep_flagged=$((sweep_flagged + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"flagged_infra\"}")
+        elif (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
-          if _is_self "$proj_dir"; then
-            local stash_hash=""
-            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
+          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — stash (${stash_hash:-?}) + reset (self-protect)")
-            sweep_fixed=$((sweep_fixed + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
-          else
-            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
-              git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
-            sweep_fixed=$((sweep_fixed + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
-          fi
+          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git fast-forward conflict — fetch + reset")
+          sweep_fixed=$((sweep_fixed + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
         fi
       fi
 
       # Pattern 3: git push failure
       if echo "$recent" | grep -qiE 'failed to push some refs'; then
-        if (( safe_to_fix && fix )); then
+        if _is_infra_project "$name"; then
+          # infra repo: interactive + daemon held — flag only, never reset. (This is
+          # the case that re-fired every sweep off the held daemon's frozen log.)
+          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git push rejected — infra repo (interactive, daemon held); flag only, not auto-reset")
+          sweep_flagged=$((sweep_flagged + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"flagged_infra\"}")
+        elif (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
-          if _is_self "$proj_dir"; then
-            local stash_hash=""
-            git -C "$proj_dir" stash push -m "monitor-auto-stash $(date -u '+%Y-%m-%dT%H:%M:%SZ')" 2>/dev/null || true
-            stash_hash="$(git -C "$proj_dir" stash list --format='%gd' 2>/dev/null | head -1 || true)"
+          git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
             git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — stash (${stash_hash:-?}) + reset (self-protect)")
-            sweep_fixed=$((sweep_fixed + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"stashed\",\"stash\":\"${stash_hash:-?}\"}")
-          else
-            git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
-              git -C "$proj_dir" reset --hard origin/main 2>/dev/null || true
-            fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
-            sweep_fixed=$((sweep_fixed + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
-          fi
+          fix_descriptions+=("  ${GN}FIXED${RS} ${name}: git push rejected — fetch + reset")
+          sweep_fixed=$((sweep_fixed + 1))
+          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
         fi
       fi
 

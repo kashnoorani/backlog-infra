@@ -256,6 +256,20 @@ EOF
   [[ "$output" != *"proj-unknown@HostC"* ]]
 }
 
+# a6. Monitor self-protect (Patterns 1-3) must FLAG, never stash/reset, the held
+#     infra repo — the case that re-fired every sweep off the frozen daemon log and
+#     would eat in-flight interactive work. (Mirrors the do_sync infra exclusion.)
+@test "monitor: the infra repo is flagged, never reset, on a stale push-fail log" {
+  setup_fake_fleet
+  # Give the infra dir a backlog-agent log carrying the stale push-failure line.
+  echo "error: failed to push some refs to origin" > "$ACTIVE/backlog-infra/.claude/backlog-agent.log"
+  run env USER=tu bash "$AGENTS_BIN" monitor --once --fix
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"infra repo (interactive, daemon held); flag only"* ]]
+  [[ "$output" != *"FIXED${RS:-} backlog-infra"* ]]
+  [[ "$output" != *"backlog-infra: git push rejected — fetch + reset"* ]]
+}
+
 # a5. Per-incident dedup: a persistent death alerts ONCE across repeated sweeps.
 @test "monitor: a persistent dead daemon alerts once across sweeps (dedup)" {
   setup_fake_fleet

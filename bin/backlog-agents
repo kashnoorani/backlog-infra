@@ -1752,15 +1752,22 @@ do_doctor() {
   (( checked > 0 )) && _d_pass "checked $checked canonical plist(s)" || _d_warn "no canonical plists found"
 
   # --- 4. per-project config hygiene (gitignore + status hook) ---
+  # Assert every active repo handles the FULL canonical ephemeral .claude/ set
+  # (ephemeral_claude_files in _lib.sh), not a hand-picked subset. Per the
+  # orphan-stash bug class: a TRACKED ephemeral file is a hard fail (the daemon
+  # rewrites/deletes it each tick → autostash pop conflicts → orphan), while an
+  # untracked-but-unignored one is a warn (a latent autostash co-trigger).
   _d_head "Per-project config"
-  local req_ignores=(".claude/backlog-agent.log" ".claude/backlog-agent.lock/" ".claude/backlog-status.json")
+  local req_ignores=()
+  while IFS= read -r _eph; do [[ -n "$_eph" ]] && req_ignores+=("$_eph"); done < <(ephemeral_claude_files)
   local proj pn gi hook miss
   for proj in "$ACTIVE_ROOT"/*/; do
     proj="${proj%/}"
     [[ -d "$proj" ]] || continue
     [[ -n "$(find_backlog_file "$proj")" ]] || continue
     pn="$(basename "$proj")"
-    # gitignore patterns
+    # gitignore coverage: a missing pattern means the file is unignored, so if it
+    # ever appears it is the untracked-unignored autostash co-trigger → warn.
     gi="$proj/.gitignore"
     miss=""
     if [[ -f "$gi" ]]; then
@@ -1771,7 +1778,19 @@ do_doctor() {
     else
       miss="(no .gitignore) "
     fi
-    [[ -n "$miss" ]] && _d_warn "$pn: missing gitignore pattern(s): $miss"
+    [[ -n "$miss" ]] && _d_warn "$pn: .gitignore missing ephemeral pattern(s): $miss"
+    # tracked ephemeral file → hard fail (must be untracked AND ignored). Guarded
+    # on a real work tree so fake-repo test fixtures (bare .git dirs) are skipped.
+    if git -C "$proj" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      local tracked tf
+      tracked="$(git -C "$proj" ls-files -- "${req_ignores[@]}" 2>/dev/null)"
+      if [[ -n "$tracked" ]]; then
+        while IFS= read -r tf; do
+          [[ -z "$tf" ]] && continue
+          _d_fail "$pn: ephemeral file is TRACKED in git (untrack + gitignore it): $tf"
+        done <<< "$tracked"
+      fi
+    fi
     # status hook resolves (mirror the driver's resolution order)
     if   [[ -f "$proj/scripts/backlog-agent-status.mjs" ]]; then hook="$proj/scripts/backlog-agent-status.mjs"
     elif [[ -f "$proj/scripts/loop-status.mjs" ]];           then hook="$proj/scripts/loop-status.mjs"

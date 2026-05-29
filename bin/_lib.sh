@@ -3,6 +3,32 @@
 #   LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   . "$LIB_DIR/_lib.sh"
 
+# Canonical set of per-machine *ephemeral* .claude/ runtime files: written,
+# rewritten, or deleted by the daemon each tick and therefore must NEVER be
+# tracked or committed. Tracking one — or leaving it untracked-but-unignored —
+# is the root of the orphan-stash bug class: the status hook's pre-rebase
+# `git stash --include-untracked` grabs the file, then the post-rebase pop
+# conflicts (the daemon already rewrote/deleted it, or origin changed it) and
+# the stash is orphaned, piling up every tick. Single source of truth: `doctor`
+# asserts every active repo ignores all of these (hard-fail if any is tracked,
+# warn if untracked-unignored) and `templates/dev-project/.gitignore` is their
+# superset. One path per line; lock dirs keep the trailing slash. The deeper
+# "tracked status/history" variant is handled by the D1 telemetry bus (W1).
+ephemeral_claude_files() {
+  cat <<'EOF'
+.claude/backlog-agent.log
+.claude/backlog-agent-events.jsonl
+.claude/backlog-agent-failcounts.json
+.claude/agent-cooldown.json
+.claude/backlog-status.json
+.claude/watch-backlog.ping
+.claude/launchd-stdout.log
+.claude/launchd-stderr.log
+.claude/backlog-agent.lock/
+.claude/backlog-agent.tick.lock/
+EOF
+}
+
 # Human-readable age string from seconds-since-epoch diff.
 fmt_age() {
   local d=$1

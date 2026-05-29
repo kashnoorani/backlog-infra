@@ -20,8 +20,22 @@ mk_project() {
   local name="$1" root="$HOME/dev/projects/active/$1"
   mkdir -p "$root/.git" "$root/docs" "$root/scripts" "$root/.claude"
   printf '# b\n\n## Open\n' > "$root/docs/Backlog.md"
-  printf '.claude/backlog-agent.log\n.claude/backlog-agent.lock/\n.claude/backlog-status.json\n' > "$root/.gitignore"
+  # Write the FULL canonical ephemeral set so the fixture is warning-free.
+  bash -c '. "'"${BATS_TEST_DIRNAME}"'/../bin/_lib.sh"; ephemeral_claude_files' > "$root/.gitignore"
   printf 'process.exit(0)\n' > "$root/scripts/backlog-agent-status.mjs"
+}
+
+# Scaffold a project backed by a *real* git repo (the bare-.git mk_project
+# fixtures can't exercise the tracked-file check, which needs a work tree).
+mk_git_project() {
+  local name="$1" root="$HOME/dev/projects/active/$1"
+  mkdir -p "$root/docs" "$root/scripts" "$root/.claude"
+  printf '# b\n\n## Open\n' > "$root/docs/Backlog.md"
+  bash -c '. "'"${BATS_TEST_DIRNAME}"'/../bin/_lib.sh"; ephemeral_claude_files' > "$root/.gitignore"
+  printf 'process.exit(0)\n' > "$root/scripts/backlog-agent-status.mjs"
+  git -C "$root" init -q
+  git -C "$root" config user.email t@t.t
+  git -C "$root" config user.name t
 }
 
 # Append a manifest entry for a project name.
@@ -64,13 +78,38 @@ run_doctor() { run bash "$AGENTS_BIN" doctor; }
   [[ "$output" == *"orphan"* && "$output" == *"missing from the manifest"* ]]
 }
 
-# 5. Missing gitignore patterns → warn, exit 0.
+# 5. Missing ephemeral gitignore patterns → warn, exit 0.
 @test "missing gitignore patterns warn" {
   mk_project tahoe; add_manifest tahoe
   printf 'node_modules/\n' > "$HOME/dev/projects/active/tahoe/.gitignore"  # drop the required patterns
   run_doctor
   [ "$status" -eq 0 ]
-  [[ "$output" == *"missing gitignore pattern"* ]]
+  [[ "$output" == *"missing ephemeral pattern"* ]]
+  # the canonical set must name agent-cooldown.json (the gap this item closed)
+  [[ "$output" == *"agent-cooldown.json"* ]]
+}
+
+# 5b. A TRACKED ephemeral file → hard fail (untrack + gitignore it).
+@test "tracked ephemeral file fails" {
+  mk_git_project tahoe; add_manifest tahoe
+  local root="$HOME/dev/projects/active/tahoe"
+  # Track an ephemeral runtime file despite the .gitignore (gitignore does not
+  # untrack), reproducing the dark-mode-safari / sacred-geography cooldown case.
+  printf '{}\n' > "$root/.claude/agent-cooldown.json"
+  git -C "$root" add -f .claude/agent-cooldown.json
+  git -C "$root" commit -qm seed
+  run_doctor
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"TRACKED in git"* ]]
+  [[ "$output" == *"agent-cooldown.json"* ]]
+}
+
+# 5c. A clean real-git project (ignored, untracked) → no hard failures.
+@test "clean real-git fixture passes" {
+  mk_git_project tahoe; add_manifest tahoe
+  run_doctor
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no hard failures"* ]]
 }
 
 # 6. A status hook with a syntax error → hard fail.

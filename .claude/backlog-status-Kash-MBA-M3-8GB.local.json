@@ -1,22 +1,22 @@
 {
-  "last_tick_at": "2026-05-29T14:16:36.960Z",
+  "last_tick_at": "2026-05-29T14:58:10.683Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
-  "last_item": "**(P2 · W0) Enforce the full ephemeral-`.claude/` gitignore set fleet-wide + in `doctor` + template.** Broadened 2026-05-29 from the events.jsonl-only case after a second instance of the same class. The bug class: a per-machine ephemeral `.claude/` runtime file that is either untracked-but-unignored (autostash `--include-untracked` grabs it, pop fails → orphan) or outright tracked (the daemon deletes/rewrites it each tick → that tracked change is autostashed and fails to pop → orphan). Concrete instances found: (i) `.claude/backlog-agent-events.jsonl` — gitignored in `backlog-infra` only, untracked elsewhere; fixed during bring-up (added + pushed to 6 repos, stashes dropped). (ii) `.claude/agent-cooldown.json` — **tracked** in dark-mode-safari + sacred-geography (deleted on cooldown-clear → one orphan stash per tick; dark-mode-safari hit 4, sacred-geography 7); fixed 2026-05-29 (untrack + gitignore + push; see Done). **Note `agent-cooldown.json` is missing from `templates/dev-project/.gitignore` entirely.** (iii) `.claude/backlog-agent-failcounts.json` — listed in the template but **untracked-unignored** in backlog-dashboard, dark-mode-safari, predictive-history, sacred-geography (latent autostash co-trigger); only sacred-geography fixed so far. Enforcement: (a) define the canonical ephemeral set in one place and have `doctor` assert every active repo ignores all of it (currently it checks only a subset) — hard-fail on a *tracked* ephemeral file, warn on untracked-unignored; (b) make `templates/dev-project/.gitignore` the superset (add `agent-cooldown.json`); (c) one-shot sweep the remaining repos for the failcounts line. → ties to the D1 telemetry bus (W1), which removes the deeper \"tracked status/history\" variant (see TaizMail item below).",
+  "last_item": "**(P2 · W1) TaizMail-class orphan-stash leak: tracked status/history files pop-conflict under concurrent cross-machine writes.** Distinct from the gitignore class above — these files are *meant* to be tracked. Found 2026-05-29: TaizMail had **10 orphan stashes** whose content was `M .claude/backlog-history.jsonl` + `M .claude/backlog-status-<host>.local.json` (NOT cooldown/events). Mechanism: the status hook's pre-rebase autostash captures this tick's writes to those tracked files; when origin also changed them (the other machine's tick), the post-rebase pop conflicts → orphaned stash. This is the **\"telemetry riding on commits to shared `.claude/` files\"** root cause the **D1 telemetry bus (W1, COMMITTED)** is designed to eliminate — move per-tick liveness/status/history off git onto D1 so concurrent ticks stop colliding on these files. Until then it's intermittent (TaizMail: ~10 over 2h, not every tick). 10 junk stashes left in place on TaizMail's M1 clone (user opted: backlog item only); inspect-per-stash + drop when the W1 fix lands. **Sacred-geography note:** during the cooldown fix, one pre-existing (06:28, daemon-orphaned) `docs/Backlog.md` autostash was caught by a `stash clear` and re-anchored as `refs/orphan-rescue/backlog-2026-05-29T0628Z` (tag `orphan-rescue-backlog-0628`) — audited to contain no open/blocked items (compacted verbose prose only); drop the rescue ref once confirmed unneeded.",
   "last_exit_code": 0,
-  "last_tokens": 97907,
-  "last_work_commit": "bd1195a",
-  "full_commit": "bd1195a8d831c580e7a7edfdcb549808f7d438b3",
+  "last_tokens": 95401,
+  "last_work_commit": "146bd72",
+  "full_commit": "146bd72d3579698ad14ee347a7d46ea2812289a0",
   "repo_slug": "kashnoorani/backlog-infra",
   "completed": false,
   "completed_items": [],
   "last_pull_count": 0,
-  "last_session_id": "ed761a00-3f22-47c7-af0e-e1a0ae5e0cd4",
-  "driver_sha": "bd1195a",
-  "rolling_7d_tokens": 780639,
+  "last_session_id": "ac285aad-896f-4185-b711-7331032a4fad",
+  "driver_sha": "146bd72",
+  "rolling_7d_tokens": 876040,
   "backlog": {
     "thinking": 30,
-    "open": 1,
+    "open": 0,
     "in_progress": 0,
     "blocked": 0,
     "done": 1
@@ -24,6 +24,6 @@
   "artifacts": {
     "uncommitted": [],
     "unpushed_commits": 1,
-    "computed_at": "2026-05-29T14:16:38.388Z"
+    "computed_at": "2026-05-29T14:58:12.226Z"
   }
 }

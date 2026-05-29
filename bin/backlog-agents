@@ -51,6 +51,18 @@
 #                         tick); `unfreeze` is the manual override. --status prints
 #                         the current state; --check exits 0 iff frozen.
 #
+#   backlog-agents pause [--reason R] | resume
+#   backlog-agents stop  [--reason R] | start
+#                         Manual fleet control (docs/fleet-freeze.md), the siblings
+#                         of freeze on the SAME D1 table — precedence stop > pause >
+#                         freeze. `pause` holds every NON-exempt daemon to heartbeat-
+#                         only (claim retained; infra-exempt like freeze); `resume`
+#                         clears it. `stop` is a full halt — every daemon (incl.
+#                         infra) exits its loop, no heartbeat — until `start`; for a
+#                         hard local halt that survives launchd respawn, use
+#                         `launchctl bootout`. Cross-machine + uniform; reads
+#                         fail-OPEN. Append `--status`/`--check` to inspect a control.
+#
 #   backlog-agents metrics [--json]
 #                         Efficiency metrics from each project's per-tick ledger
 #                         (.claude/backlog-history.jsonl). Per-project table plus a
@@ -597,6 +609,30 @@ snapshot() {
     fi
   else
     printf '  monitor: %snot installed%s\n' "$DIM" "$RS"
+  fi
+
+  # ---- fleet control: freeze / pause / stop (W3, docs/fleet-freeze.md) ----
+  # Surface the active control plane state (the combined effective mode). Only
+  # printed when something is active, to keep the normal banner uncluttered.
+  # Best-effort + short read; a control-plane outage just omits the line.
+  local _ctl_body _ctl_mode
+  _ctl_body="$(_fleet_control_get 2>/dev/null || true)"
+  if [[ -n "$_ctl_body" ]]; then
+    _ctl_mode="$(printf '%s' "$_ctl_body" | jq -r '.mode // (if (.frozen//0)==1 then "freeze" else "none" end)' 2>/dev/null || echo none)"
+    if [[ "$_ctl_mode" != "none" && -n "$_ctl_mode" ]]; then
+      local _ctl_by _ctl_reason _ctl_color _ctl_word
+      _ctl_by="$(printf '%s' "$_ctl_body" | jq -r '.mode_armed_by // .armed_by // "—"' 2>/dev/null || echo '—')"
+      _ctl_reason="$(printf '%s' "$_ctl_body" | jq -r '.mode_reason // .reason // ""' 2>/dev/null || echo '')"
+      case "$_ctl_mode" in
+        stop)   _ctl_color="$RD"; _ctl_word="STOPPED" ;;
+        pause)  _ctl_color="$YL"; _ctl_word="PAUSED" ;;
+        freeze) _ctl_color="$YL"; _ctl_word="FROZEN" ;;
+        *)      _ctl_color="$YL"; _ctl_word="$_ctl_mode" ;;
+      esac
+      printf '  control: %s%s%s  by %s%s' "$_ctl_color" "$_ctl_word" "$RS" "$_ctl_by" \
+        "$([[ -n "$_ctl_reason" ]] && printf '  %s%s%s' "$DIM" "$_ctl_reason" "$RS")"
+      printf '\n'
+    fi
   fi
 
   echo
@@ -2007,18 +2043,21 @@ _fleet_control_get() {
   printf '%s' "$body"
 }
 
-# POST arm/clear. $1=frozen(0/1) $2=reason $3=armed_by $4=arming_sha.
-# Needs the bearer key (writes are privileged). Returns non-zero on any failure.
+# POST arm/clear ONE control. $1=frozen(0/1) $2=reason $3=armed_by $4=arming_sha
+# $5=control-key (freeze|pause|stop, default freeze — so the existing freeze/
+# unfreeze 4-arg callers stay on the freeze row unchanged). Needs the bearer key
+# (writes are privileged). Returns non-zero on any failure.
 _fleet_control_post() {
-  command -v curl >/dev/null 2>&1 || { warn "freeze: curl not available"; return 1; }
+  command -v curl >/dev/null 2>&1 || { warn "control: curl not available"; return 1; }
   local key; key="$(_health_key)"
-  [[ -z "$key" ]] && { warn "freeze: no health key at ~/.config/backlog/health-key — cannot write the flag"; return 1; }
+  [[ -z "$key" ]] && { warn "control: no health key at ~/.config/backlog/health-key — cannot write the flag"; return 1; }
   local payload
-  payload="$(jq -cn --argjson frozen "${1:-0}" --arg reason "${2:-}" --arg by "${3:-}" --arg sha "${4:-}" \
-    '{frozen:$frozen,
+  payload="$(jq -cn --argjson frozen "${1:-0}" --arg reason "${2:-}" --arg by "${3:-}" --arg sha "${4:-}" --arg ck "${5:-freeze}" \
+    '{key:$ck,
+      frozen:$frozen,
       reason:(if $reason=="" then null else $reason end),
       armed_by:(if $by=="" then null else $by end),
-      arming_sha:(if $sha=="" then null else $sha end)}')" || { warn "freeze: failed to build payload"; return 1; }
+      arming_sha:(if $sha=="" then null else $sha end)}')" || { warn "control: failed to build payload"; return 1; }
   local body code
   body="$(curl -s -m 8 -X POST -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
           -d "$payload" -w $'\n%{http_code}' "$FREEZE_URL" 2>/dev/null)" || { warn "freeze: POST failed (network)"; return 1; }
@@ -2125,6 +2164,91 @@ do_unfreeze() {
   fi
   return 1
 }
+
+# ---- subcommands: pause / resume / stop / start (W3, docs/fleet-freeze.md) ----
+# The MANUAL siblings of freeze, on the SAME fleet_control table (DECISION F).
+# Precedence stop > pause > freeze is resolved at the GET endpoint, so these only
+# need to arm/clear their own control row; the driver reads the combined "mode".
+#   pause  -> heartbeat-only hold (infra-exempt, like freeze; reversible by resume)
+#   stop   -> full halt (daemon exits its loop; reversible by start; bootout = hard)
+# All cross-machine + uniform (every daemon reads the same D1 control). Unlike
+# freeze there is NO auto-arm / auto-clear — pause/stop are deliberate operator
+# actions cleared only by `resume` / `start` (or `freeze --status` to inspect).
+#
+#   backlog-agents pause [--reason R]   arm the pause hold
+#   backlog-agents resume               clear the pause hold
+#   backlog-agents stop  [--reason R]   arm the full-halt
+#   backlog-agents start                clear the full-halt
+#   backlog-agents <ctl> --status       human-readable state of this control
+#   backlog-agents <ctl> --check        exit 0 iff this control is active
+
+# Generic arm/clear/inspect for a control key. $1=key(pause|stop) $2=verb(arm|clear)
+# then optional flags (--reason / --status / --check). --status/--check read the
+# combined control; arm/clear POST the row.
+_do_control() {
+  local ck="$1" verb="$2"; shift 2
+  local reason="" STATUS=0 CHECK=0
+  while (( $# )); do
+    case "$1" in
+      --status) STATUS=1 ;;
+      --check)  CHECK=1 ;;
+      --reason) shift; reason="${1:-}" ;;
+      *) echo "backlog-agents ${ck}: unknown flag: $1" >&2; exit 2 ;;
+    esac
+    shift
+  done
+
+  # --status / --check: read this control's active bit from the combined state.
+  if (( STATUS || CHECK )); then
+    local body active
+    if ! body="$(_fleet_control_get)"; then
+      (( CHECK )) && return 1
+      warn "${ck}: cannot read control (D1 unreachable)"; return 1
+    fi
+    active="$(printf '%s' "$body" | jq -r --arg k "$ck" '.controls[$k].active // 0' 2>/dev/null || echo 0)"
+    if (( STATUS )); then
+      if [[ "$active" == "1" ]]; then
+        warn "${ck} is ACTIVE — by=$(printf '%s' "$body" | jq -r --arg k "$ck" '.controls[$k].armed_by // "—"') \
+reason: $(printf '%s' "$body" | jq -r --arg k "$ck" '.controls[$k].reason // "—"')"
+      else
+        ok "${ck} is clear (not active)"
+      fi
+    fi
+    [[ "$active" == "1" ]]   # --check: exit 0 iff active
+    return
+  fi
+
+  # arm / clear (POST). by=manual; pause/stop carry no arming SHA.
+  local by frozen
+  by="$(hostname 2>/dev/null | sed -E 's/\.local$//')"; [[ -z "$by" ]] && by="manual"
+  if [[ "$verb" == "arm" ]]; then
+    frozen=1; [[ -z "$reason" ]] && reason="manual ${ck}"
+  else
+    frozen=0; reason="manual ${verb} (${ck} cleared)"
+  fi
+  if _fleet_control_post "$frozen" "$reason" "$by" "" "$ck"; then
+    if [[ "$verb" == "arm" ]]; then
+      case "$ck" in
+        pause) ok "fleet PAUSED (by=${by}) — reason: ${reason}"
+               ok "non-exempt daemons hold to heartbeat-only (claim retained); \`backlog-agents resume\` to resume" ;;
+        stop)  ok "fleet STOP armed (by=${by}) — reason: ${reason}"
+               ok "every daemon halts (exits its loop, no heartbeat) on its next tick; \`backlog-agents start\` to bring back, \`launchctl bootout\` for a hard local halt" ;;
+      esac
+    else
+      case "$ck" in
+        pause) ok "fleet RESUMED (pause cleared) — daemons resume work on their next tick" ;;
+        stop)  ok "fleet START (stop cleared) — daemons resume on their next launchd respawn / tick" ;;
+      esac
+    fi
+    return 0
+  fi
+  return 1
+}
+
+do_pause()  { _do_control pause arm   "$@"; }
+do_resume() { _do_control pause clear "$@"; }
+do_stop()   { _do_control stop  arm   "$@"; }
+do_start()  { _do_control stop  clear "$@"; }
 
 # ---- subcommand: metrics ----
 # Efficiency metrics from each project's per-tick ledger
@@ -2316,6 +2440,10 @@ case "$cmd" in
   canary) shift; do_canary "$@" ;;
   freeze) shift; do_freeze "$@" ;;
   unfreeze) shift; do_unfreeze "$@" ;;
+  pause) shift; do_pause "$@" ;;
+  resume) shift; do_resume "$@" ;;
+  stop) shift; do_stop "$@" ;;
+  start) shift; do_start "$@" ;;
   metrics) shift; do_metrics "$@" ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
@@ -2325,7 +2453,7 @@ case "$cmd" in
   migrate-daemons) do_migrate_daemons ;;
   monitor) shift; do_monitor "$@" ;;
   -h|--help)
-    sed -n '2,115p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,127p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     ;;
   *)
     # Default: snapshot. Parse flags here so they're scoped to this path.

@@ -336,10 +336,19 @@ lands and the fleet thaws quickly.
   and that the arm/clear write belongs on its own endpoint (it does — it's a rare,
   privileged operation, unlike the per-tick heartbeat).
 
-- **DECISION F — interaction with the W3 fleet pause/stop/resume sibling.** Both
-  this item and *(P2 · W3) Fleet pause / stop / resume control* are
-  pause-primitive, `scope=fleet` consumers sharing the same D1-flag substrate.
-  Decide whether `fleet_control` is one table with a `mode` column
-  (`freeze|pause|stop`) or separate flags. One table with a precedence rule
-  (`stop` > `pause` > `freeze`) is the likely shape — design them together so
-  they don't fight over the same daemon top-of-tick gate.
+- **DECISION F — interaction with the W3 fleet pause/stop/resume sibling.
+  RESOLVED 2026-05-29 (SHIPPED).** Both this item and *(P2 · W3) Fleet pause /
+  stop / resume control* are pause-primitive, `scope=fleet` consumers sharing the
+  same D1-flag substrate. **Resolution: ONE `fleet_control` table, precedence
+  `stop > pause > freeze`.** Implemented as separate control rows
+  (`key='freeze'|'pause'|'stop'`, the existing `frozen` column reused as the
+  per-row active bit) rather than a literal `mode` column — functionally the same
+  single-table/single-ordering decision but purely additive (migration
+  `0003_fleet_control_modes.sql` seeds two rows; 0002 unchanged). Precedence is
+  resolved at the GET endpoint (`/api/fleet-control` returns the effective
+  `mode`), so the daemon does ONE point-read at top-of-tick and never reconciles
+  competing flags — the gate switches on `mode` (stop⇒halt, pause/freeze⇒
+  heartbeat-only). pause is the manual sibling of freeze (infra-exempt, like
+  freeze); stop is a full halt (no exemption; flag-obey-by-exit, `launchctl
+  bootout` the hard backstop). See `fleet-control-design.md` (SHIPPED note at top)
+  for the full as-built record + deferred pieces (project/item scope, sentinel).

@@ -1,5 +1,46 @@
 # Fleet pause / stop / resume control (all machines) — design
 
+> **Status: SHIPPED (fleet scope), 2026-05-29.** The `fleet`-scope MVP is live —
+> `backlog-agents pause | resume | stop | start`, on the SAME D1 `fleet_control`
+> table as freeze, precedence **stop > pause > freeze**. As-built notes vs. this
+> draft (the draft remains the fuller spec for the deferred pieces):
+> - **DECISION F / [DECISION A] resolved — one table.** Implemented as **separate
+>   control rows** (`key='freeze'|'pause'|'stop'`, the existing `frozen` column as
+>   the per-row active bit) rather than a `mode` column — same single-table, single
+>   ordering decision, but purely additive (migration `0003_fleet_control_modes.sql`
+>   just seeds two rows; no column changes to 0002). The GET endpoint
+>   (`/api/fleet-control`) resolves precedence and returns the effective `mode`, so
+>   the daemon still does ONE point-read at top-of-tick. The read is a **dedicated
+>   GET** (reusing the freeze read path), NOT folded into the ingest response (§3's
+>   "free on the heartbeat" idea was never built for freeze either).
+> - **[DECISION C] resolved — pause AND stop fail-OPEN.** All three modes fail-open
+>   (D1 down ⇒ no control); `launchctl bootout` is the hard backstop. No sentinel
+>   was built (see below), so stop is not sentinel-outage-proof — by design, the
+>   confirmed call was consistency + "bootout is the real halt."
+> - **Stop mechanism (§5) — flag-obey-by-exit, NOT the sentinel + bootout fan-out.**
+>   A stopped daemon exits its loop; launchd (`KeepAlive`+`RunAtLoad`, 60s
+>   `ThrottleInterval`) respawns it and the next tick re-reads stop and exits again,
+>   so it stays effectively down (no work, no heartbeat) with a ~60s respawn blip
+>   until `start` clears the flag. `launchctl bootout` is the documented manual hard
+>   halt (no respawn). The `.claude/fleet-stopped` sentinel + cross-machine
+>   self-stop fan-out (§5) and the `daemon-sync` restart watchdog ([DECISION D]) are
+>   **deferred** — current behavior is uniform via the flag without them.
+> - **Pause infra exemption — pause EXEMPTS infra (like freeze); only stop halts it.**
+>   This DIFFERS from §7's "manual pause has no infra exemption." The confirmed call:
+>   keep the exemption rule uniform (the control-plane daemon is never heartbeat-held;
+>   only the full halt reaches it). [DECISION E]'s `--except` + per-project targeting
+>   is **deferred** with the rest of scope.
+> - **[DECISION F-stop-claims] resolved — rely on the TTL reaper.** A stopped daemon
+>   goes dark; its `[~]` claim is reclaimed once the D1 `heartbeat_epoch` lapses (90m).
+> - **DEFERRED:** `project`/`item` scope (§2, §4), auto-expiring pause ([DECISION G]),
+>   `--except` targeting, the stop sentinel + cross-machine restart watchdog. The
+>   shipped surface is fleet-wide pause/stop only. Tests: `test/fleet-pause.bats` (14).
+>
+> The rest of this document is the original DRAFT (2026-05-28) and describes the
+> fuller design those deferred pieces would build toward.
+
+---
+
 **Status: DRAFT (W3), 2026-05-28.** Backlog item: *(P2 · W3) Fleet pause / stop
 / resume control (all machines)* — pause-primitive consumer, `scope=fleet`,
 **manual**. This is the operator's hands-on lever over the whole fleet:

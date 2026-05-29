@@ -157,13 +157,18 @@ DIFF_SIZE_MAX_LINES=400
 # machinery or release/ignore config. Space-separated repo-relative paths.
 PROTECTED_PATHS="bin/backlog-agent bin/backlog-agent-status.mjs release.mjs CLAUDE.md .gitignore"
 
-# Fleet-freeze (W3, docs/fleet-freeze.md). Because bin/ is SHARED, a
-# fleet-affecting infra change in flight should hold the REST of the fleet to
-# heartbeat-only rather than have it work on mid-flight / unverified machinery.
-# The flag is a single fleet-wide row in the D1 telemetry bus, read at
-# top-of-tick (the same structural slot as cooldown_active). Reads are
-# DEPENDENCY-LIGHT + FAIL-OPEN: D1 unreachable ⇒ treat as not frozen (a control-
-# plane outage must not become a fleet-wide stall; manual pause is the backstop).
+# Fleet control: freeze / pause / stop (W3, docs/fleet-freeze.md). Because bin/ is
+# SHARED, a fleet-affecting infra change in flight should hold the REST of the
+# fleet to heartbeat-only rather than have it work on mid-flight / unverified
+# machinery (freeze). The same top-of-tick gate also carries the MANUAL siblings
+# pause (heartbeat-only hold) and stop (full halt — the daemon exits its loop).
+# All three are singleton rows in ONE D1 table (fleet_control), and the GET
+# endpoint resolves the EFFECTIVE control by precedence stop > pause > freeze and
+# returns it as "mode" — so the daemon does ONE read at top-of-tick (the same
+# structural slot as cooldown_active) and never has to reconcile competing flags.
+# Reads are DEPENDENCY-LIGHT + FAIL-OPEN: D1 unreachable ⇒ treat as no-control (a
+# control-plane outage must not become a fleet-wide stall; `launchctl bootout` is
+# the hard manual backstop for a real halt).
 #   - FREEZE_PROJECT: the project whose OWN daemon is EXEMPT from the freeze (it
 #     must keep ticking to land + verify the fix, else the freeze never clears →
 #     deadlock). For the exempt daemon the flag means "evaluate the clear".
@@ -621,14 +626,22 @@ _d1_heartbeat_epoch() {
   return 0
 }
 
-# --- Fleet-freeze flag read (docs/fleet-freeze.md §3) ---
-# Read the single fleet-wide freeze row from the D1 telemetry bus. Echoes
-# "<frozen>\t<reason>" where <frozen> is 0/1; echoes NOTHING on any failure
-# (unreachable, non-200, malformed) — FAIL-OPEN: the caller treats "no answer"
-# as not-frozen, so a control-plane outage never stalls the fleet. Same curl
-# idiom + bash-3.2-safe auth expansion as _d1_heartbeat_epoch. On a successful
-# read it refreshes FREEZE_CACHE (observational only; the gate fail-opens).
-_d1_freeze_get() {
+# --- Fleet control read (freeze / pause / stop; docs/fleet-freeze.md §3) ---
+# Read the combined fleet-control state from the D1 telemetry bus. The endpoint
+# resolves the EFFECTIVE control by precedence (stop > pause > freeze) and
+# returns it as "mode" (one of: none|freeze|pause|stop). Echoes "<mode>\t<reason>"
+# for an active control; echoes NOTHING on any failure (unreachable, non-200,
+# malformed) OR when nothing is active — FAIL-OPEN: the caller treats "no answer"
+# as no-control, so a control-plane outage never stalls the fleet (true for stop
+# too — DECISION: stop fail-opens like freeze/pause; `launchctl bootout` is the
+# hard backstop). Same curl idiom + bash-3.2-safe auth expansion as
+# _d1_heartbeat_epoch. On a successful read it refreshes FREEZE_CACHE
+# (observational only; the gate fail-opens).
+#
+# BACK-COMPAT: against a control plane that predates "mode" (returns only
+# "frozen"), it derives mode=freeze from frozen==1 — so a freshly-rolled driver
+# still honors a freeze through the deploy window before the new endpoint ships.
+_d1_control_get() {
   [[ "$FREEZE_DISABLE" == "1" ]] && return 0
   command -v curl >/dev/null 2>&1 || return 0
   local key_file="$HOME/.config/backlog/health-key"
@@ -637,22 +650,34 @@ _d1_freeze_get() {
     key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
     [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
   fi
-  local body http_code frozen reason
+  local body http_code mode reason frozen
   body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$FREEZE_URL" 2>/dev/null)" || return 0
   http_code="$(printf '%s' "$body" | tail -n1)"
   body="$(printf '%s' "$body" | sed '$d')"
   [[ "$http_code" == "200" ]] || return 0
-  # jq-free integer extract (same idiom as cooldown_active / heartbeat).
-  frozen="$(printf '%s' "$body" \
-            | grep -oE '"frozen"[[:space:]]*:[[:space:]]*[0-9]+' \
-            | grep -oE '[0-9]+$' | head -n1 || true)"
-  [[ -z "$frozen" ]] && return 0
+  # jq-free string extract (same idiom as cooldown_active / heartbeat).
+  mode="$(printf '%s' "$body" \
+          | grep -oE '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' \
+          | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  if [[ -z "$mode" ]]; then
+    # Pre-"mode" endpoint: derive from the freeze flag (frozen==1 ⇒ freeze).
+    frozen="$(printf '%s' "$body" \
+              | grep -oE '"frozen"[[:space:]]*:[[:space:]]*[0-9]+' \
+              | grep -oE '[0-9]+$' | head -n1 || true)"
+    [[ "$frozen" == "1" ]] && mode="freeze" || mode="none"
+  fi
+  [[ -z "$mode" || "$mode" == "none" ]] && { printf '%s\t\n' "none" > "$FREEZE_CACHE" 2>/dev/null || true; return 0; }
+  # Prefer the effective control's reason (mode_reason); fall back to the
+  # freeze-row "reason" (the only one a pre-"mode" endpoint exposes).
   reason="$(printf '%s' "$body" \
+            | grep -oE '"mode_reason"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  [[ -z "$reason" ]] && reason="$(printf '%s' "$body" \
             | grep -oE '"reason"[[:space:]]*:[[:space:]]*"[^"]*"' \
             | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
   # Refresh the observational cache (best-effort; never blocks the gate).
-  printf '%s\t%s\n' "$frozen" "$reason" > "$FREEZE_CACHE" 2>/dev/null || true
-  printf '%s\t%s' "$frozen" "$reason"
+  printf '%s\t%s\n' "$mode" "$reason" > "$FREEZE_CACHE" 2>/dev/null || true
+  printf '%s\t%s' "$mode" "$reason"
   return 0
 }
 
@@ -1162,35 +1187,63 @@ tick_once() {
     fi  # end fallback-unavailable (Layer 2 idle) branch
   fi
 
-  # --- Fleet-freeze short-circuit (docs/fleet-freeze.md) ---
-  # When a fleet-affecting infra change is in flight, the D1 freeze flag holds
-  # the rest of the fleet to heartbeat-only rather than working on stale /
-  # unverified shared machinery. Structural twin of the cooldown short-circuit
-  # above. backlog-infra's OWN daemon is EXEMPT: for it the flag is a signal to
-  # EVALUATE the clear condition (delegated to `backlog-agents freeze --eval`),
-  # then keep ticking normally so the fix can land + the fleet can thaw.
-  local _freeze; _freeze="$(_d1_freeze_get)"
-  if [[ "${_freeze%%$'\t'*}" == "1" ]]; then
-    if freeze_exempt; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet-freeze active — exempt daemon (${FREEZE_PROJECT}); evaluating clear, continuing to tick" | tee -a "$LOG_FILE"
-      # Best-effort: try to clear (skew zero across live hosts AND canary green).
-      # Never blocks this tick — the exempt daemon always proceeds to work.
-      if command -v backlog-agents >/dev/null 2>&1; then
-        backlog-agents freeze --eval >>"$LOG_FILE" 2>&1 || true
-      fi
-      # fall through to the normal claim + work flow
-    else
-      local _fz_reason="${_freeze#*$'\t'}"
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet-freeze active (${_fz_reason:-in-flight infra change}); heartbeat only (skipping claude until the fleet thaws)" | tee -a "$LOG_FILE"
-      pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
-      _run_status_hook "" 0 loop "$pre_head" 0
-      _post_tick_cleanup
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (fleet-freeze)" | tee -a "$LOG_FILE"
-      log_event tick_done outcome freeze reason "${_fz_reason:-}" duration_s "$(( $(date +%s) - tick_start_epoch ))"
-      TICK_OUTCOME=freeze
+  # --- Fleet control short-circuit: stop / pause / freeze (docs/fleet-freeze.md) ---
+  # ONE combined read (the endpoint resolves precedence stop > pause > freeze and
+  # returns the effective "mode"). Structural twin of the cooldown short-circuit
+  # above. Behaviour by mode:
+  #   stop  — FULL HALT. No work, no heartbeat: exit the tick (TICK_OUTCOME=stop)
+  #           so the daemon loop breaks and the process exits. launchd respawns
+  #           after ThrottleInterval and re-reads stop (exits again), so the daemon
+  #           stays effectively down until `backlog-agents start` clears it; the
+  #           in-flight claim is reaped once its heartbeat goes stale. No infra
+  #           exemption — stop halts EVERY daemon. `launchctl bootout` is the hard
+  #           local backstop for a true process-level halt.
+  #   pause  — manual heartbeat-only hold. backlog-infra's OWN daemon is EXEMPT
+  #            (only stop halts it), mirroring freeze.
+  #   freeze — auto-armed heartbeat-only hold while a driver change propagates.
+  #            backlog-infra's OWN daemon is EXEMPT: for it the flag is a signal
+  #            to EVALUATE the clear (delegated to `backlog-agents freeze --eval`),
+  #            then keep ticking so the fix can land + the fleet can thaw.
+  # Reads FAIL-OPEN (D1 down ⇒ no control), stop included.
+  local _control _ctl_mode _ctl_reason
+  _control="$(_d1_control_get)"
+  _ctl_mode="${_control%%$'\t'*}"
+  _ctl_reason="${_control#*$'\t'}"
+  [[ "$_ctl_reason" == "$_control" ]] && _ctl_reason=""   # no tab ⇒ no reason
+  case "$_ctl_mode" in
+    stop)
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet STOP active (${_ctl_reason:-manual stop}); halting daemon — no work, no heartbeat (clears on \`backlog-agents start\`; \`launchctl bootout\` for a hard halt)" | tee -a "$LOG_FILE"
+      log_event tick_done outcome stop reason "${_ctl_reason:-}" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+      TICK_OUTCOME=stop
       return 0
-    fi
-  fi
+      ;;
+    pause|freeze)
+      if freeze_exempt; then
+        if [[ "$_ctl_mode" == "freeze" ]]; then
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet-freeze active — exempt daemon (${FREEZE_PROJECT}); evaluating clear, continuing to tick" | tee -a "$LOG_FILE"
+          # Best-effort clear (skew zero across live hosts AND canary green).
+          # Never blocks this tick — the exempt daemon always proceeds to work.
+          if command -v backlog-agents >/dev/null 2>&1; then
+            backlog-agents freeze --eval >>"$LOG_FILE" 2>&1 || true
+          fi
+        else
+          echo "[$(date '+%Y-%m-%d %H:%M:%S')] fleet PAUSE active — exempt daemon (${FREEZE_PROJECT}); continuing to tick (only \`stop\` halts the control-plane daemon)" | tee -a "$LOG_FILE"
+        fi
+        # fall through to the normal claim + work flow
+      else
+        local _hold_label="fleet-freeze"
+        [[ "$_ctl_mode" == "pause" ]] && _hold_label="fleet-pause"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${_hold_label} active (${_ctl_reason:-in-flight infra change}); heartbeat only (skipping claude until the fleet resumes)" | tee -a "$LOG_FILE"
+        pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+        _run_status_hook "" 0 loop "$pre_head" 0
+        _post_tick_cleanup
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (${_hold_label})" | tee -a "$LOG_FILE"
+        log_event tick_done outcome "$_ctl_mode" reason "${_ctl_reason:-}" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+        TICK_OUTCOME="$_ctl_mode"
+        return 0
+      fi
+      ;;
+  esac
 
   # Pull before reading the backlog — catches cross-machine changes from
   # other computers that pushed to origin. Best-effort: no upstream is fine,
@@ -1758,12 +1811,18 @@ do_run() {
         else
           sleep_sec="$HEARTBEAT_SECONDS"
         fi ;;
-      freeze)
-        # Fleet-freeze hold: heartbeat-only at the normal heartbeat cadence so
-        # the fleet view sees the daemon alive (just frozen), and the daemon
-        # re-checks the flag promptly once the rollout thaws.
+      freeze|pause)
+        # Fleet-freeze / fleet-pause hold: heartbeat-only at the normal heartbeat
+        # cadence so the fleet view sees the daemon alive (just held), and the
+        # daemon re-checks the control promptly once it resumes/thaws.
         idle_streak=0
         sleep_sec="$HEARTBEAT_SECONDS" ;;
+      stop)
+        # Fleet STOP: full halt. Break the loop so the process exits (launchd
+        # respawns after ThrottleInterval and re-reads stop, so the daemon stays
+        # effectively down until `backlog-agents start` clears the flag).
+        echo "fleet STOP — exiting the daemon loop (\`backlog-agents start\` to resume; \`launchctl bootout\` for a hard halt)."
+        break ;;
       *) sleep_sec="$FAST_SECONDS" ;;
     esac
     [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"
@@ -1813,12 +1872,18 @@ do_watch() {
         else
           sleep_sec="$HEARTBEAT_SECONDS"
         fi ;;
-      freeze)
-        # Fleet-freeze hold: heartbeat-only at the normal heartbeat cadence so
-        # the fleet view sees the daemon alive (just frozen), and the daemon
-        # re-checks the flag promptly once the rollout thaws.
+      freeze|pause)
+        # Fleet-freeze / fleet-pause hold: heartbeat-only at the normal heartbeat
+        # cadence so the fleet view sees the daemon alive (just held), and the
+        # daemon re-checks the control promptly once it resumes/thaws.
         idle_streak=0
         sleep_sec="$HEARTBEAT_SECONDS" ;;
+      stop)
+        # Fleet STOP: full halt. Break the loop so the process exits (launchd
+        # respawns after ThrottleInterval and re-reads stop, so the daemon stays
+        # effectively down until `backlog-agents start` clears the flag).
+        echo "fleet STOP — exiting the daemon loop (\`backlog-agents start\` to resume; \`launchctl bootout\` for a hard halt)."
+        break ;;
       *) sleep_sec="$FAST_SECONDS" ;;
     esac
     [[ -n "$sleep_sec" ]] && sleep_interruptible "$sleep_sec"

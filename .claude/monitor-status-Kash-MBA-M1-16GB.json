@@ -1,12 +1,10 @@
 {
-  "last_sweep_at": "2026-05-29T20:14:11Z",
-  "running": false,
-  "exit_code": 0,
-  "exit_state": "stopped",
+  "last_sweep_at": "2026-05-29T20:20:24Z",
+  "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 6,
-  "fixed_total": 6,
-  "flagged_total": 0,
-  "recent_actions": []
+  "sweeps_total": 1,
+  "fixed_total": 0,
+  "flagged_total": 1,
+  "recent_actions": [{"ts":"2026-05-29T20:20:22Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]
 }

@@ -1,5 +1,5 @@
 {
-  "last_tick_at": "2026-05-29T15:32:09.576Z",
+  "last_tick_at": "2026-05-29T15:37:17.600Z",
   "last_host": "Kash-MBA-M3-8GB",
   "last_mode": "loop",
   "last_item": "**(P2 · W1) TaizMail-class orphan-stash leak: tracked status/history files pop-conflict under concurrent cross-machine writes.** Distinct from the gitignore class above — these files are *meant* to be tracked. Found 2026-05-29: TaizMail had **10 orphan stashes** whose content was `M .claude/backlog-history.jsonl` + `M .claude/backlog-status-<host>.local.json` (NOT cooldown/events). Mechanism: the status hook's pre-rebase autostash captures this tick's writes to those tracked files; when origin also changed them (the other machine's tick), the post-rebase pop conflicts → orphaned stash. This is the **\"telemetry riding on commits to shared `.claude/` files\"** root cause the **D1 telemetry bus (W1, COMMITTED)** is designed to eliminate — move per-tick liveness/status/history off git onto D1 so concurrent ticks stop colliding on these files. Until then it's intermittent (TaizMail: ~10 over 2h, not every tick). 10 junk stashes left in place on TaizMail's M1 clone (user opted: backlog item only); inspect-per-stash + drop when the W1 fix lands. **Sacred-geography note:** during the cooldown fix, one pre-existing (06:28, daemon-orphaned) `docs/Backlog.md` autostash was caught by a `stash clear` and re-anchored as `refs/orphan-rescue/backlog-2026-05-29T0628Z` (tag `orphan-rescue-backlog-0628`) — audited to contain no open/blocked items (compacted verbose prose only); drop the rescue ref once confirmed unneeded.",
@@ -24,6 +24,6 @@
   "artifacts": {
     "uncommitted": [],
     "unpushed_commits": 0,
-    "computed_at": "2026-05-29T15:32:11.207Z"
+    "computed_at": "2026-05-29T15:37:18.972Z"
   }
 }

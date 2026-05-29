@@ -131,6 +131,8 @@ EOF
 #   dead        -> 200, found:true, heartbeat_epoch = NOW-7200    (>90m, dead)
 #   notfound    -> 404, found:false
 #   unreachable -> exit 7 (curl "couldn't connect"), no body
+#   byhost      -> 200; dead heartbeat if the queried &host= contains "dead",
+#                  live otherwise (lets one tick see one owner dead, one alive).
 # Also seeds a health-key so the bearer-auth branch is exercised.
 make_curl() {
   local mode="$1"
@@ -149,6 +151,13 @@ case "$mode" in
   dead)        emit "{\"found\":true,\"heartbeat_epoch\":$((now-7200))}" 200 ;;
   notfound)    emit "{\"found\":false}" 404 ;;
   unreachable) exit 7 ;;   # curl: (7) Failed to connect
+  byhost)
+    # Pick the requested host out of the &host= query param across curl's args.
+    q="$(printf '%s\n' "$@" | sed -nE 's|.*[?&]host=([^&]*).*|\1|p' | head -n1)"
+    case "$q" in
+      *dead*) emit "{\"found\":true,\"heartbeat_epoch\":$((now-7200))}" 200 ;;
+      *)      emit "{\"found\":true,\"heartbeat_epoch\":$now}" 200 ;;
+    esac ;;
 esac
 exit 0
 EOF

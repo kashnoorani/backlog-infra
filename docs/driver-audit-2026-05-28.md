@@ -9,12 +9,26 @@ Every line was verified against the file by a skeptic; severities below are the
 **verifier's corrected severity**, not the finder's. Calibrated to the real
 runtime: bash 3.2.57, `set -euo pipefail`, BSD userland, multi-machine fleet.
 
-> **Status (2026-05-28):** §1 (findings 1–5) and §2 (findings 6–7) are **FIXED**
-> — `|| true` guards on the bare set-e abort sites, base-10 normalization in the
-> reset-time parser, and pure-bash wall-clock watchdogs (no coreutils `timeout`
-> dep) on the `claude` + status-hook calls (+ `spawnSync` timeouts in the hook).
-> Each shipped with a `test/tick.bats` case (suite 82/82 green). §3 (concurrency)
-> and §4 (lows) remain open — see §6 sequencing.
+> **Status (2026-05-28): ALL confirmed findings FIXED.**
+> - **§1** (findings 1–5): `|| true` guards on the bare set-e abort sites, base-10
+>   normalization in the reset-time parser.
+> - **§2** (6–7): pure-bash wall-clock watchdogs (no coreutils `timeout` dep) on
+>   the `claude` + status-hook calls (+ `spawnSync` timeouts in the hook).
+> - **§3(a)** (finding 8 — the headline split-brain fix): claims now carry an
+>   owner stamp (`<!-- @host -->`); the reaper parses it and probes the *claiming*
+>   host's heartbeat, never the local host's. Unstamped (legacy) claims are
+>   unattributable → fail-safe skip in a normal tick (startup reclaim still clears
+>   them). Stamp is written on claim, stripped on every unclaim, hidden in the
+>   fleet CLI, and ignored by the completion-diff + lint dedup.
+> - **§3(b)** (finding 9): `_maybe_auto_complete` push now uses the claim block's
+>   rebase+retry CAS instead of a bare `push || true` (no silent dropped completion).
+> - **§4(c)** (finding 11): the divergence `reset --hard` now logs the discarded
+>   SHA loudly + a reflog recovery command (no longer silent).
+> - **§4(d)** (finding 12): the orphaned auto-stash now reports its running count
+>   and warns past 5 pending, so it can't leak invisibly.
+>
+> Shipped with `test/tick.bats` cases (per-owner reclaim, unstamped fail-safe,
+> claim-stamp, unclaim-strip, auto-complete-on-origin) — **full suite 87/87 green.**
 
 ---
 

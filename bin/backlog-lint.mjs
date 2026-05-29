@@ -146,7 +146,9 @@ function lint(text) {
 // items differing only in emphasis are still distinct enough to keep; but
 // trailing whitespace and case are not meaningful.
 function normalizeTitle(body) {
-  return body.replace(/\s+/g, " ").trim().toLowerCase();
+  // Drop a trailing claim owner stamp (`<!-- @host -->`) so the same item
+  // claimed by a host doesn't read as a distinct title vs. its unclaimed form.
+  return body.replace(/\s*<!--\s*@[^>]*-->\s*$/, "").replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function truncate(s, n = 80) {

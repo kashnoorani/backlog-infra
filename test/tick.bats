@@ -72,37 +72,39 @@ setup() { _setup_repo; }
   [[ ! "$output" =~ [0-9]{7,}m ]]
 }
 
-# 6a. Live D1 heartbeat -> owning daemon alive -> [~] NOT reclaimed.
+# NOTE: the reaper now attributes liveness PER CLAIM via the owner stamp
+# (`<!-- @host -->`) the daemon writes on claim, so these tests stamp their
+# claims with a fake owner (@M3) and the curl shim answers for that host.
+
+# 6a. Live owner heartbeat -> owning daemon alive -> [~] NOT reclaimed, stamp kept.
 @test "live D1 heartbeat does not reclaim a [~] claim" {
   make_curl live
-  write_backlog_open "- [~] in-flight on a live daemon"
+  write_backlog_open "- [~] in-flight on a live daemon <!-- @M3 -->"
   git -C "$WORK" commit -qam "claim"
   git -C "$WORK" push -q origin main
   run_tick                       # NOT startup
   [ "$status" -eq 0 ]
-  open_has_marker '~'            # still claimed
+  grep -q '^- \[~\] in-flight on a live daemon <!-- @M3 -->$' "$WORK/docs/Backlog.md"
   [[ "$output" != *"reclaim"* ]]
 }
 
-# 6b. Dead heartbeat (>90m old) -> reclaim fires and logs the D1-heartbeat
-#     reason. (We assert on the reclaim log, not the final marker: the same
-#     tick immediately re-claims the freed item — the surviving daemon picking
-#     up the orphaned work — exactly as the startup-reclaim test above does.)
+# 6b. Dead owner heartbeat (>90m) -> reclaim, logging the owning host. (Assert on
+#     the log, not the marker: the surviving daemon re-claims the freed item.)
 @test "stale D1 heartbeat reclaims a [~] claim" {
   make_curl dead
-  write_backlog_open "- [~] orphaned by a daemon that stopped beating"
+  write_backlog_open "- [~] orphaned by a daemon that stopped beating <!-- @M3 -->"
   git -C "$WORK" commit -qam "claim"
   git -C "$WORK" push -q origin main
   run_tick
   [ "$status" -eq 0 ]
   [[ "$output" == *"reclaim"* ]]
-  [[ "$output" == *"no D1 heartbeat"* ]]
+  [[ "$output" == *"no D1 heartbeat from M3"* ]]
 }
 
 # 6c. D1 unreachable (curl exit 7) -> FAIL SAFE -> [~] NOT reclaimed (DECISION 1).
 @test "unreachable D1 does not reclaim (fail-safe)" {
   make_curl unreachable
-  write_backlog_open "- [~] in-flight, dashboard is down"
+  write_backlog_open "- [~] in-flight, dashboard is down <!-- @M3 -->"
   git -C "$WORK" commit -qam "claim"
   git -C "$WORK" push -q origin main
   run_tick
@@ -111,10 +113,10 @@ setup() { _setup_repo; }
   [[ "$output" != *"reclaim"* ]]
 }
 
-# 6d. 404 / found:false (no row for this project,host) -> also fail safe.
+# 6d. 404 / found:false (no row for this owner) -> also fail safe.
 @test "missing D1 row does not reclaim (fail-safe)" {
   make_curl notfound
-  write_backlog_open "- [~] no telemetry row yet"
+  write_backlog_open "- [~] no telemetry row yet <!-- @M3 -->"
   git -C "$WORK" commit -qam "claim"
   git -C "$WORK" push -q origin main
   run_tick
@@ -130,13 +132,106 @@ setup() { _setup_repo; }
 @test "missing health-key does not crash the reaper" {
   make_curl live                 # would say "alive" — but no key to send
   rm -f "$HOME/.config/backlog/health-key"
-  write_backlog_open "- [~] in-flight, this machine has no health key"
+  write_backlog_open "- [~] in-flight, this machine has no health key <!-- @M3 -->"
   git -C "$WORK" commit -qam "claim"
   git -C "$WORK" push -q origin main
   run_tick
   [ "$status" -eq 0 ]
   open_has_marker '~'            # live heartbeat still read -> no reclaim
   [[ "$output" != *"unbound variable"* ]]
+}
+
+# --- audit §3(a): per-owner liveness (the split-brain fix) ---
+
+# 6f. Two claims, two owners: only the DEAD owner's claim is reclaimed; the LIVE
+#     owner's claim is left alone. The reclaimed item is then re-claimed by THIS
+#     host (stamp swapped @M1-dead -> local) — proving claim-stamp + strip too.
+@test "reaper reclaims only the dead owner's claim, not the live owner's" {
+  local host; host="$(hostname | sed -E 's/\.local$//')"
+  make_curl byhost
+  write_backlog_open \
+    "- [~] dead owner item <!-- @M1-dead -->" \
+    "- [~] live owner item <!-- @M1-live -->"
+  git -C "$WORK" commit -qam "two claims"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"no D1 heartbeat from M1-dead"* ]]   # dead owner reclaimed
+  [[ "$output" != *"M1-live"* ]]                        # live owner untouched
+  # live owner's claim survives verbatim (kept, stamp intact)
+  grep -q '^- \[~\] live owner item <!-- @M1-live -->$' "$WORK/docs/Backlog.md"
+  # dead owner's item was reclaimed (old stamp stripped) and re-claimed by us
+  grep -q "^- \[~\] dead owner item <!-- @${host} -->\$" "$WORK/docs/Backlog.md"
+}
+
+# 6g. An UNSTAMPED (legacy) claim is unattributable -> fail safe -> NOT reclaimed
+#     in a normal tick, even with a dead heartbeat. (Startup reclaim, tested
+#     above, still clears it unconditionally.)
+@test "unstamped legacy claim is not reclaimed in a normal tick" {
+  make_curl dead
+  write_backlog_open "- [~] legacy unstamped claim"
+  git -C "$WORK" commit -qam "legacy claim"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  grep -q '^- \[~\] legacy unstamped claim$' "$WORK/docs/Backlog.md"   # preserved
+  [[ "$output" != *"reclaim"* ]]
+}
+
+# 6h. Claiming an item stamps it with THIS host (so a future reaper can attribute it).
+@test "claiming an item stamps the owning host" {
+  local host; host="$(hostname | sed -E 's/\.local$//')"
+  make_curl live
+  write_backlog_open "- [ ] stamp me"        # distinct from the fixture default
+  git -C "$WORK" commit -qam "open item"
+  git -C "$WORK" push -q origin main
+  run_tick                                   # make_claude noop (default) keeps it claimed
+  [ "$status" -eq 0 ]
+  grep -q "^- \[~\] stamp me <!-- @${host} -->\$" "$WORK/docs/Backlog.md"
+}
+
+# 6i. Unclaiming (here via a generic claude failure) strips the owner stamp so
+#     the reopened [ ] line is clean and won't double-stamp on the next claim.
+@test "unclaim strips the owner stamp from the reopened item" {
+  make_claude fail_other
+  write_backlog_open "- [ ] reopen me"       # distinct from the fixture default
+  git -C "$WORK" commit -qam "open item"
+  git -C "$WORK" push -q origin main
+  run_tick
+  claude_was_called
+  grep -q '^- \[ \] reopen me$' "$WORK/docs/Backlog.md"   # reopened, no stamp
+  ! grep -q '<!--' "$WORK/docs/Backlog.md"
+}
+
+# --- audit §3(b): auto-complete pushes via CAS ---
+
+# 6j. A metadata-only "already implemented" tick auto-completes the item AND the
+#     [x] completion reaches origin. The rewritten push uses rebase+retry CAS
+#     (vs the old bare `push || true` that could silently drop the completion).
+@test "auto-complete lands a metadata-only completion on origin" {
+  # Track a .claude/ file so _maybe_auto_complete sees "only .claude/ changed".
+  echo seed > "$WORK/.claude/meta"
+  git -C "$WORK" add -f .claude/meta
+  git -C "$WORK" commit -qm "track meta"
+  git -C "$WORK" push -q origin main
+  # claude shim: touch only the tracked .claude/ file (no real change), exit 0.
+  cat > "$SHIM/claude" <<EOF
+#!/usr/bin/env bash
+touch "\${CLAUDE_CALLED:-/dev/null}"
+echo changed > .claude/meta
+exit 0
+EOF
+  chmod +x "$SHIM/claude"
+  write_backlog_open "- [ ] already implemented upstream"
+  git -C "$WORK" commit -qam "open item"
+  git -C "$WORK" push -q origin main
+  run_tick
+  [ "$status" -eq 0 ]
+  open_has_marker 'x'                       # auto-completed locally
+  ! open_has_marker '~'
+  # the completion landed on origin (CAS push succeeded, not silently dropped)
+  git -C "$WORK" fetch -q origin
+  git -C "$WORK" show origin/main:docs/Backlog.md | grep -qE '^(- )?\[x\] already implemented upstream'
 }
 
 # 7. Diverged HEAD with a conflict -> reset --hard to origin (idempotent recovery).

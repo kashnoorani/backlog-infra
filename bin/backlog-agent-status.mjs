@@ -249,6 +249,9 @@ function stripTaskTitle(line) {
   return line
     .replace(/^[+-]/, "")
     .replace(/^\s*(- )?\[[ x~!?]\]\s*/, "")
+    // Strip the claim owner stamp (`<!-- @host -->`) so a [~] line and its
+    // completed [x] line pair on title regardless of whether the stamp survived.
+    .replace(/\s*<!--\s*@[^>]*-->\s*$/, "")
     .trim();
 }
 

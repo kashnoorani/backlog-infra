@@ -239,13 +239,16 @@ maybe_install_daemon() {
 # fall back to a tempfile + mv so the claim/unclaim blocks don't
 # silently no-op on macOS that ships with BSD awk.
 _local_awk_inplace() {
-  local file="$1" script="$2"
+  local file="$1" script="$2"; shift 2
+  # Remaining args ("$@") are passed verbatim to awk *before* the program — e.g.
+  # `-v owner="…"` — so callers can inject values without string-splicing them
+  # into the awk source. Empty "$@" expands to nothing (safe under set -u).
   if command -v gawk >/dev/null 2>&1; then
-    gawk -i inplace "$script" "$file"
+    gawk -i inplace "$@" "$script" "$file"
   else
     local tmpfile
     tmpfile="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.awk-tmp.$$")"
-    awk "$script" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
+    awk "$@" "$script" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
   fi
 }
 
@@ -390,10 +393,12 @@ acquire_lock() {
     orphaned="$(grep -c -E '^(- )?\[\~\] ' "$BACKLOG_FILE" 2>/dev/null || true)"
     orphaned="${orphaned:-0}"
     if (( orphaned > 0 )); then
+      # Flip [~]->[ ] and drop the owner stamp. First expr handles stamped
+      # claims (strip the trailing tag), second handles legacy unstamped ones.
       if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+        sed -i '' -E -e 's|^((- )?)\[\~\] (.*) +<!-- @[^>]*-->[[:space:]]*$|\1[ ] \3|g' -e 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
       else
-        sed -i -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+        sed -i -E -e 's|^((- )?)\[\~\] (.*) +<!-- @[^>]*-->[[:space:]]*$|\1[ ] \3|g' -e 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
       fi
       echo "auto-unclaimed $orphaned orphaned [~] item(s) (stale lock recovery)" >&2
     fi
@@ -506,6 +511,18 @@ _health_host() {
   hostname 2>/dev/null | sed -E 's/\.local$//' || echo "?"
 }
 
+# Owner stamp appended to a [~] claim line so the cross-machine reaper can probe
+# the CLAIMING host's heartbeat, not the local host's. Rendered as a trailing
+# HTML comment: invisible in rendered GFM, and a line *suffix* so the many
+# `^(- )?\[~\] ` prefix matchers are unaffected. Stripped again on unclaim.
+_owner_tag() { printf ' <!-- @%s -->' "$(_health_host)"; }
+
+# Echo the owning host parsed from a [~] line's owner stamp (empty for an
+# unstamped / legacy claim — the reaper treats that as unattributable).
+_claim_owner() {
+  printf '%s' "$1" | sed -nE 's|^(- )?\[~\] .*<!-- @([^ >]+) *-->[[:space:]]*$|\2|p'
+}
+
 # URL-encode the few characters that legitimately appear in a project/host:
 # space and the few punctuation chars. Project names are git-repo-safe in
 # practice (no `&`, `?`, `#`), so a minimal encoder is enough; spaces are the
@@ -529,6 +546,9 @@ _urlencode() {
 # health key is present so the endpoint can be locked down later w/o a client
 # change. Short -m timeout so a slow/unreachable dashboard never stalls a tick.
 _d1_heartbeat_epoch() {
+  # $1 (optional): host to probe. Defaults to the local host. The reaper passes
+  # the CLAIMING host parsed off each [~] line so it reads the right liveness row.
+  local host_arg="${1:-}"
   command -v curl >/dev/null 2>&1 || return 0
   local key_file="$HOME/.config/backlog/health-key"
   local auth=() key
@@ -538,7 +558,7 @@ _d1_heartbeat_epoch() {
   fi
   local project host url body http_code
   project="$(_urlencode "$(_health_project)")"
-  host="$(_urlencode "$(_health_host)")"
+  host="$(_urlencode "${host_arg:-$(_health_host)}")"
   url="https://kash-backlogs.pages.dev/api/heartbeat?project=${project}&host=${host}"
 
   # -s silent, -m 5 hard cap, -w to capture the HTTP status separately so we can
@@ -563,54 +583,51 @@ _d1_heartbeat_epoch() {
 }
 
 # Reclaim stale [~] items that were claimed but never completed.
-# Liveness is taken from the D1 telemetry heartbeat (`heartbeat_epoch`) for this
-# (project, host): if it is older than the stale threshold the owning daemon is
-# dead and its [~] items are flipped back to [ ] so another tick (possibly on
-# another machine) can pick them up. If D1 is unreachable / has no row / the
-# heartbeat is null, the reaper FAILS SAFE and does NOT reclaim (DECISION 1) —
-# a stuck claim is recoverable, a false reclaim mid-work is the costly incident.
-# Sets RECLAIMED_COUNT to the number of items flipped back.
+# Liveness is the D1 telemetry heartbeat (`heartbeat_epoch`) of the CLAIMING
+# host — parsed from the owner stamp on each [~] line — NOT the local host's. So
+# one host's stale-self heartbeat can never reclaim another host's live work
+# (the split-brain hazard from docs/driver-audit-2026-05-28.md §3). Per claim:
+# if the owner's heartbeat is older than the stale threshold the owning daemon
+# is dead -> flip the item back to [ ] and strip its owner stamp. If D1 is
+# unreachable / has no row / the heartbeat is null, OR the claim is unstamped
+# (legacy, unattributable), the reaper FAILS SAFE and skips it (DECISION 1) —
+# the unconditional startup reclaim cleans it on the next daemon (re)start.
+# On startup (STARTUP_RECLAIM=1) every [~] is a dead incarnation's orphan and is
+# reclaimed unconditionally, no probe. Sets RECLAIMED_COUNT to items flipped.
 reclaim_stale_claims() {
   RECLAIMED_COUNT=0
-  local stale_secs=5400 now hb_epoch age line line_num item_title reason
+  local stale_secs=5400 now line line_num item_title owner hb_epoch reason startup=0
 
   now="$(date +%s)"
-  # Plain "are we in a git repo?" guard — output discarded (no longer used for
-  # liveness; the heartbeat below is the liveness signal).
+  # Plain "are we in a git repo?" guard — output discarded.
   [[ -z "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" ]] && return
 
-  # On daemon startup (first tick) any [~] items belong to a dead incarnation —
-  # reclaim immediately, no liveness probe (its predecessor is by definition
-  # gone, and we must not block startup on the dashboard being up).
-  if [[ "${STARTUP_RECLAIM:-0}" != "1" ]]; then
-    # Liveness now comes from the D1 heartbeat, NOT git-commit recency.
-    hb_epoch="$(_d1_heartbeat_epoch)"
-
-    # DECISION 1 — fail safe. Empty heartbeat == D1 unreachable / no row / null /
-    # malformed. Treat unknown liveness as ALIVE and do NOT reclaim.
-    [[ -z "$hb_epoch" ]] && return
-
-    age=$(( now - hb_epoch ))
-    # Heartbeat fresh enough -> the owning daemon is alive -> do NOT reclaim.
-    (( age <= stale_secs )) && return
-    # else: heartbeat older than the stale threshold -> daemon is dead ->
-    # fall through and reclaim its [~] items.
-  fi
+  [[ "${STARTUP_RECLAIM:-0}" == "1" ]] && startup=1
   STARTUP_RECLAIM=0
 
   while IFS= read -r line; do
     line_num="$(echo "$line" | cut -d: -f1)"
-    item_title="$(echo "$line" | cut -d: -f2- | sed -E 's/^(- )?\[~\] //')"
-    # Best-effort: a transiently read-only backlog / unwritable log must not
-    # abort the daemon mid-reclaim (set -e); the item is re-reclaimed next tick.
-    sed -i '' "${line_num}s/\[~\]/[ ]/" "$BACKLOG_FILE" || true
-    # On the startup path hb_epoch was never probed (empty) — report the orphan
-    # reclaim plainly instead of the bogus "(now - 0)/60" age the math would give.
-    if [[ -n "$hb_epoch" ]]; then
-      reason="no D1 heartbeat in $(( (now - hb_epoch) / 60 ))m"
-    else
+    # Bare title: strip the marker prefix AND the trailing owner stamp.
+    item_title="$(echo "$line" | cut -d: -f2- | sed -E 's/^(- )?\[~\] //; s/ +<!-- @[^>]*-->[[:space:]]*$//')"
+
+    if (( startup )); then
       reason="startup reclaim of orphaned claim"
+    else
+      # Probe the CLAIMING host's heartbeat. Unstamped (legacy) claims are
+      # unattributable -> fail safe (skip); startup reclaim cleans them later.
+      owner="$(_claim_owner "$(echo "$line" | cut -d: -f2-)")"
+      [[ -z "$owner" ]] && continue
+      hb_epoch="$(_d1_heartbeat_epoch "$owner")"
+      [[ -z "$hb_epoch" ]] && continue                 # DECISION 1 fail-safe
+      (( now - hb_epoch <= stale_secs )) && continue   # owner alive -> keep
+      reason="no D1 heartbeat from ${owner} in $(( (now - hb_epoch) / 60 ))m"
     fi
+
+    # Flip [~]->[ ] and strip the owner stamp on just this line: stamped expr
+    # first, then a plain flip for an unstamped (startup) orphan. Best-effort
+    # (|| true) so a transiently read-only backlog can't abort the daemon.
+    sed -i '' -E "${line_num}s|^((- )?)\[~\] (.*) +<!-- @[^>]*-->[[:space:]]*\$|\1[ ] \3|" "$BACKLOG_FILE" 2>/dev/null || true
+    sed -i '' -E "${line_num}s|^(- )?\[~\] |\1[ ] |" "$BACKLOG_FILE" 2>/dev/null || true
     echo "  [reclaim] stale [~] item '${item_title}' (${reason})" | tee -a "$LOG_FILE" || true
     RECLAIMED_COUNT=$((RECLAIMED_COUNT + 1))
   done < <(grep -nE '^(- )?\[~\] ' "$BACKLOG_FILE" 2>/dev/null || true)
@@ -658,7 +675,15 @@ _post_tick_cleanup() {
   if [[ -n $(git -C "$PWD" status --porcelain 2>/dev/null) ]]; then
     local stash_msg; stash_msg="backlog-agent auto-stash: orphaned changes after tick $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     if git -C "$PWD" stash push -m "$stash_msg" 2>/dev/null; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] orphaned changes stashed — recover with git stash pop" | tee -a "$LOG_FILE"
+      # Nothing ever auto-pops these (they're preserved for manual recovery), so
+      # surface the running count — otherwise they leak invisibly (audit §4d).
+      local n_stashes; n_stashes="$(git -C "$PWD" stash list 2>/dev/null | grep -c 'backlog-agent auto-stash' || true)"
+      n_stashes="${n_stashes:-1}"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] orphaned changes stashed (${n_stashes} backlog-agent auto-stash(es) pending — 'git stash list' to review, 'git stash pop' to recover)" | tee -a "$LOG_FILE"
+      log_event orphan_stashed pending "$n_stashes"
+      if (( n_stashes >= 5 )); then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: ${n_stashes} orphaned auto-stashes have piled up — claude keeps leaving the tree dirty; investigate and clean up." | tee -a "$LOG_FILE"
+      fi
     fi
   fi
 }
@@ -913,9 +938,25 @@ _maybe_auto_complete() {
     { print }
   ' 2>/dev/null || true
   git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
-  git -C "$PWD" commit -m "auto-complete: ${item} (already implemented)" >/dev/null 2>&1
-  git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
-  echo "  [auto-done] ${item} (only metadata changed — already implemented)" | tee -a "$LOG_FILE"
+  # If the marker flip staged nothing (no [~] matched), there's nothing to land.
+  git -C "$PWD" commit -m "auto-complete: ${item} (already implemented)" >/dev/null 2>&1 || return 0
+  # CAS, like the claim push: a bare `push || true` would silently drop the [x]
+  # completion if a concurrent remote advanced between pull and push, and the
+  # next tick's reset would then re-open a done item (audit §3b). On push
+  # rejection, rebase the completion on top of origin and retry; if that fails,
+  # leave the local [x] commit for the next sync to reconcile — do NOT reset.
+  local acbranch; acbranch="$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if git -C "$PWD" push origin "$acbranch" 2>/dev/null; then
+    echo "  [auto-done] ${item} (only metadata changed — already implemented)" | tee -a "$LOG_FILE"
+  else
+    git -C "$PWD" fetch origin "$acbranch" 2>/dev/null || true
+    if git -C "$PWD" pull --rebase origin "$acbranch" 2>/dev/null && git -C "$PWD" push origin "$acbranch" 2>/dev/null; then
+      echo "  [auto-done] ${item} (already implemented; rebase + retry)" | tee -a "$LOG_FILE"
+    else
+      git -C "$PWD" rebase --abort 2>/dev/null || true
+      echo "  [auto-done?] ${item} — completion commit not pushed; will reconcile next tick" | tee -a "$LOG_FILE"
+    fi
+  fi
   return 0
 }
 
@@ -1020,8 +1061,14 @@ tick_once() {
         echo "  [git] rebase succeeded (local commits preserved on top of origin)" | tee -a "$LOG_FILE"
       else
         git -C "$PWD" rebase --abort 2>/dev/null || true
+        # Capture the about-to-be-discarded HEAD so the reset isn't silent. The
+        # commit(s) here can include real unpushed work claude committed but
+        # couldn't push; reset --hard leaves them in the reflog, so log the SHA
+        # loudly with the recovery command (audit §4c).
+        local discarded_sha; discarded_sha="$(git -C "$PWD" rev-parse --short HEAD 2>/dev/null || true)"
         git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
-        echo "  [git] rebase conflict — reset to origin, local commits discarded" | tee -a "$LOG_FILE"
+        echo "  [git] rebase conflict — reset to origin; discarded local commit ${discarded_sha:-?} (recover: git reflog / git reset --hard ${discarded_sha:-<sha>})" | tee -a "$LOG_FILE"
+        log_event reset_discarded sha "${discarded_sha:-}" reason rebase_conflict
       fi
       if [[ "$stashed" == "true" ]]; then
         git -C "$PWD" stash pop 2>/dev/null || git -C "$PWD" stash drop 2>/dev/null || true
@@ -1133,15 +1180,17 @@ tick_once() {
   # item stays stuck — recoverable via `backlog-agent unclaim`.
   local claimed=false
   if [[ -n "$item_title" ]]; then
+    # Stamp the claim with THIS host so the reaper probes the right owner.
+    local owner_tag; owner_tag="$(_owner_tag)"
     _local_awk_inplace "$BACKLOG_FILE" '
       BEGIN { in_open=0; done=0 }
       /^## Open/       { in_open=1; print; next }
       /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
       in_open && !done && /^(- )?\[[ !]\] / {
-        sub(/\[[ !]\]/, "[~]"); done=1
+        sub(/\[[ !]\]/, "[~]"); $0 = $0 owner; done=1
       }
       { print }
-    ' 2>/dev/null || true
+    ' -v owner="$owner_tag" 2>/dev/null || true
     if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
       git -C "$PWD" add "$BACKLOG_FILE"
       if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
@@ -1265,7 +1314,7 @@ tick_once() {
           /^## Open/       { in_open=1; print; next }
           /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
           in_open && !done && /^(- )?\[~\] / {
-            sub(/\[~\]/, "[ ]"); done=1
+            sub(/\[~\]/, "[ ]"); sub(/ +<!-- @[^>]*-->[ ]*$/, ""); done=1
           }
           { print }
         ' 2>/dev/null || true
@@ -1612,10 +1661,11 @@ do_unclaim() {
     echo "no [~] (in-progress) items found"
     return 0
   fi
+  # Flip [~]->[ ] and drop the owner stamp (stamped first, then legacy).
   if [[ "$(uname)" == "Darwin" ]]; then
-    sed -i '' -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+    sed -i '' -E -e 's|^((- )?)\[\~\] (.*) +<!-- @[^>]*-->[[:space:]]*$|\1[ ] \3|g' -e 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
   else
-    sed -i -E 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
+    sed -i -E -e 's|^((- )?)\[\~\] (.*) +<!-- @[^>]*-->[[:space:]]*$|\1[ ] \3|g' -e 's|^(- )?\[\~\] |\1[ ] |g' "$BACKLOG_FILE"
   fi
   echo "unclaimed $n item(s) [~] → [ ]"
 }

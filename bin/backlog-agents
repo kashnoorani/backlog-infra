@@ -157,6 +157,7 @@ top_open_item() {
     in_open && /^## / { exit }
     in_open && /^- \[[ !~]\] / {
       sub(/^- \[[ !~]\] /, "")
+      sub(/ *<!-- @[^>]*-->$/, "")   # hide the claim owner stamp
       sub(/[. ]+$/, "")
       print
       exit
@@ -718,7 +719,7 @@ snapshot() {
       /^## Open/        { in_sec=1; next }
       /^## In progress/ { in_sec=1; next }
       /^## /            { in_sec=0; next }
-      in_sec && /^- \[~\] / { sub(/^- \[~\] /, ""); sub(/[. ]+$/, ""); print }
+      in_sec && /^- \[~\] / { sub(/^- \[~\] /, ""); sub(/ *<!-- @[^>]*-->$/, ""); sub(/[. ]+$/, ""); print }
     ' "$backlog" 2>/dev/null || true)"
     [[ -n "$wip_items" ]] || continue
     while IFS= read -r wip_item; do

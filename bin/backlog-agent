@@ -143,6 +143,22 @@ AGENT_FALLBACK_FILE="${HOME}/.claude/agent-fallback.json"
 CIRCUIT_BREAKER_THRESHOLD=3
 FAILCOUNTS_FILE="${STATE_DIR}/backlog-agent-failcounts.json"
 
+# Dead-man's-switch — repeated status-hook failure (W2, docs/dead-mans-switch.md).
+# [notify-channel consumer] The status hook does the tick's git ops (fetch / rebase
+# / push) + telemetry every tick. When it fails N consecutive ticks the daemon is
+# ALIVE but not syncing or committing — exactly the cooldown-add incident, where the
+# hook's git op failed every tick for ~8h, the dashboard showed STALE, and nothing
+# escalated. This is the DRIVER half of the switch (the daemon can alert about
+# ITSELF here because it's alive, just failing; the OUTSIDE-the-daemon staleness
+# half — a dead daemon can't alert about itself — lives in `backlog-agents monitor`).
+# Count consecutive status_fail in a per-host JSON state file ({count, alerted});
+# at the threshold fire ONE notify_send, then THROTTLE (the `alerted` flag) so a
+# persistent failure doesn't re-alert every tick. status_ok clears the state (resets
+# the streak AND the alerted flag, so the NEXT incident can alert again). Per-host
+# ephemeral state, gitignored like the failcounts / event log.
+DMS_HOOKFAIL_THRESHOLD="${DMS_HOOKFAIL_THRESHOLD:-3}"
+HOOKFAIL_STATE_FILE="${STATE_DIR}/backlog-agent-hookfail.json"
+
 # Diff-size guardrail (W2). After a work tick, inspect the commit(s) claude
 # pushed. If a single tick touched more than DIFF_SIZE_MAX_FILES files or
 # DIFF_SIZE_MAX_LINES changed lines, it's likely a runaway edit — log_event
@@ -972,34 +988,104 @@ JSON
   _d1_publish_cooldown "$until_epoch"
 }
 
-# Fire an opt-in Slack/email alert that this project's daemon just entered a
-# plan-limit cooldown. Opt-in via ~/.claude/agent-notify.json:
-#   { "slack_webhook_url": "https://hooks.slack.com/...", "email": "you@x.com" }
-# Both keys optional. Best-effort by design: no config / no jq → silent no-op,
-# and every send is backgrounded with a short timeout so a slow or unreachable
-# endpoint can never stall or abort the daemon. start_cooldown only runs once
-# per cooldown window (active cooldowns short-circuit the claude tick), so this
-# fires once per "entered cooldown" event rather than every heartbeat.
-notify_cooldown() {
-  local until_str="${1:-?}"
+# --- Opt-in notification channel (W2; docs/dead-mans-switch.md) ---
+# Fire a best-effort Slack / email / macOS-local alert. The ONE canonical config is
+# ~/.claude/agent-notify.json ($NOTIFY_CONFIG):
+#   { "slack_webhook_url": "https://hooks.slack.com/...",
+#     "email": "you@example.com",
+#     "local_notify": true }
+# All keys optional; an absent file or all-empty keys ⇒ silent no-op. Parsing is
+# jq-FREE (grep/sed extraction, same idiom as the D1 reads) so an alert never
+# depends on jq being installed, and every send is backgrounded with a short
+# timeout so a slow / unreachable endpoint can never stall or abort the daemon.
+# Both the plan-limit cooldown alert (notify_cooldown) and the dead-man's-switch
+# (_hookfail_record) route through here so there's exactly ONE config + code path.
+# The CLI monitor's _notify (bin/backlog-agents) reads the SAME canonical file.
+# Usage: notify_send "<title>" "<body>"  (title = Slack prefix + email subject).
+notify_send() {
+  local title="${1:-backlog-agent}" body="${2:-}"
+  [[ -n "$body" ]] || return 0
   [[ -f "$NOTIFY_CONFIG" ]] || return 0
-  command -v jq >/dev/null 2>&1 || return 0
-  local slack_url email
-  slack_url="$(jq -r '.slack_webhook_url // empty' "$NOTIFY_CONFIG" 2>/dev/null || true)"
-  email="$(jq -r '.email // empty' "$NOTIFY_CONFIG" 2>/dev/null || true)"
-  [[ -z "$slack_url" && -z "$email" ]] && return 0
-  local project host msg
-  project="$(basename "$(pwd)")"
-  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
-  msg="⏸ backlog-agent [${project}@${host}] hit the Anthropic plan/session limit — claude ticks paused until ${until_str}"
+  local slack_url email local_notify
+  slack_url="$(grep -oE '"slack_webhook_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$NOTIFY_CONFIG" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  email="$(grep -oE '"email"[[:space:]]*:[[:space:]]*"[^"]*"' "$NOTIFY_CONFIG" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  local_notify="$(grep -oE '"local_notify"[[:space:]]*:[[:space:]]*(true|false)' "$NOTIFY_CONFIG" 2>/dev/null \
+              | grep -oE '(true|false)$' | head -n1 || true)"
+  [[ -z "$slack_url" && -z "$email" && "$local_notify" != "true" ]] && return 0
   if [[ -n "$slack_url" ]] && command -v curl >/dev/null 2>&1; then
-    local payload; payload="$(jq -nc --arg t "$msg" '{text: $t}')"
+    # JSON-escape backslash + double-quote in our own controlled text (jq-free).
+    local esc payload
+    esc="$(printf '%s' "${title}: ${body}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    payload="$(printf '{"text":"%s"}' "$esc")"
     ( curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
         --data "$payload" "$slack_url" >/dev/null 2>&1 || true ) &
   fi
   if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
-    ( printf '%s\n' "$msg" | mail -s "backlog-agent cooldown: ${project}@${host}" "$email" >/dev/null 2>&1 || true ) &
+    ( printf '%s\n' "$body" | mail -s "$title" "$email" >/dev/null 2>&1 || true ) &
   fi
+  if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
+    local osbody ostitle
+    osbody="$(printf '%s' "$body" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    ostitle="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    ( osascript -e "display notification \"${osbody}\" with title \"${ostitle}\"" >/dev/null 2>&1 || true ) &
+  fi
+  return 0
+}
+
+# Fire the plan-limit cooldown alert (Layer 2). Thin wrapper over notify_send so
+# the cooldown alert and the dead-man's-switch share one config + code path.
+# start_cooldown runs once per cooldown window (active cooldowns short-circuit the
+# claude tick) so this fires once per "entered cooldown" event, not every heartbeat.
+notify_cooldown() {
+  local until_str="${1:-?}"
+  local project host
+  project="$(basename "$(pwd)")"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+  notify_send "backlog-agent cooldown: ${project}@${host}" \
+    "⏸ backlog-agent [${project}@${host}] hit the Anthropic plan/session limit — claude ticks paused until ${until_str}"
+}
+
+# Record a status-hook outcome for the dead-man's-switch (the repeated-hook-failure
+# half; docs/dead-mans-switch.md). $1 = 1 for status_ok, 0 for status_fail; $2 =
+# optional reason (e.g. "exit 1" / hook_missing) woven into the alert text. On
+# success: clear the state file (resets BOTH the consecutive-fail streak and the
+# `alerted` throttle, so the NEXT incident can alert). On failure: bump count; when
+# it reaches DMS_HOOKFAIL_THRESHOLD and we haven't already alerted for THIS incident,
+# fire ONE notify_send + set `alerted` (so a persistent failure doesn't re-alert
+# every tick). node for parse/serialize (already a hard dep; mirrors failcount_*).
+# Best-effort: any failure is a silent no-op so the switch can never abort a tick.
+_hookfail_record() {
+  local ok="${1:-0}" reason="${2:-}"
+  [[ -z "${HOOKFAIL_STATE_FILE:-}" ]] && return 0
+  if [[ "$ok" == "1" ]]; then
+    [[ -f "$HOOKFAIL_STATE_FILE" ]] && rm -f "$HOOKFAIL_STATE_FILE" 2>/dev/null
+    return 0
+  fi
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local out count fire
+  out="$(node -e '
+    const fs = require("fs");
+    const [file, thrStr] = [process.argv[1], process.argv[2]];
+    const thr = parseInt(thrStr, 10) || 3;
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    const count = (Number.isInteger(obj.count) ? obj.count : 0) + 1;
+    let fire = 0;
+    if (count >= thr && !obj.alerted) { fire = 1; obj.alerted = true; }
+    obj.count = count;
+    try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
+    process.stdout.write(count + " " + fire);
+  ' "$HOOKFAIL_STATE_FILE" "$DMS_HOOKFAIL_THRESHOLD" 2>/dev/null || echo "0 0")"
+  count="${out%% *}"; fire="${out##* }"
+  [[ "$fire" == "1" ]] || return 0
+  local project host msg
+  project="$(basename "$(pwd)")"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+  msg="⚠ backlog-agent [${project}@${host}] status hook FAILED ${count} consecutive ticks${reason:+ (${reason})} — the daemon is alive but not syncing/committing. Check .claude/backlog-agent.log."
+  log_event dms_hookfail_alert count "$count" reason "${reason:-hook_fail}"
+  notify_send "backlog-agent dead-man's-switch: ${project}@${host}" "$msg"
   return 0
 }
 
@@ -1174,12 +1260,15 @@ _run_status_hook() {
     wait "$hook_wd_pid" 2>/dev/null || true
     if [[ $hook_rc -eq 0 ]]; then
       log_event status_ok item "$item"
+      _hookfail_record 1
     else
       log_event status_fail item "$item" exit_code "$hook_rc"
+      _hookfail_record 0 "exit ${hook_rc}"
     fi
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] status hook not found or not executable: ${HOOK:-<not set>}" | tee -a "$LOG_FILE"
     log_event status_fail item "$item" reason hook_missing
+    _hookfail_record 0 hook_missing
   fi
 }
 

@@ -1431,26 +1431,51 @@ do_monitor() {
   local _last_status_commit=0
   local _status_heartbeat=300
   local _self_root; _self_root="$(cd "$ACTIVE_ROOT/backlog-infra" 2>/dev/null && pwd -P || echo '')"
-  local _notify_config="$HOME/.config/backlog/notify.json"
+  # Reconciled notify config (docs/dead-mans-switch.md): the canonical file is
+  # ~/.claude/agent-notify.json (shared with the driver: slack_webhook_url / email /
+  # local_notify). The legacy ~/.config/backlog/notify.json (slack_webhook /
+  # local_notify) is honored as a fallback so an existing setup keeps working.
+  local _notify_config="$HOME/.claude/agent-notify.json"
+  local _notify_config_legacy="$HOME/.config/backlog/notify.json"
   local _last_notify=0
 
-  _notify() {
+  # Send to every configured channel with NO throttle. Prefers the canonical config,
+  # falls back to legacy; accepts either slack key name. The dead-man's-switch calls
+  # this directly (its own per-incident dedup is the throttle — a dead daemon is too
+  # important for the cosmetic 300s window).
+  _notify_raw() {
     local title="${1:-backlog-monitor}" body="${2:-}"
+    [[ -n "$body" ]] || return 0
+    local f=""
+    if [[ -f "$_notify_config" ]]; then f="$_notify_config"
+    elif [[ -f "$_notify_config_legacy" ]]; then f="$_notify_config_legacy"
+    else return 0; fi
+    local slack email local_notify
+    slack="$(jq -r '.slack_webhook_url // .slack_webhook // ""' "$f" 2>/dev/null || echo '')"
+    email="$(jq -r '.email // ""' "$f" 2>/dev/null || echo '')"
+    local_notify="$(jq -r 'if (.local_notify==true) then "true" else "false" end' "$f" 2>/dev/null || echo 'false')"
+    if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
+      osascript -e "display notification \"${body}\" with title \"${title}\"" 2>/dev/null || true
+    fi
+    if [[ -n "$slack" ]] && command -v curl >/dev/null 2>&1; then
+      local payload
+      payload="$(jq -nc --arg t "$title" --arg b "$body" --arg h "$this_host" '{"text": "\($t) (\($h)): \($b)"}')"
+      curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$slack" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
+      ( printf '%s\n' "$body" | mail -s "${title} (${this_host})" "$email" >/dev/null 2>&1 || true )
+    fi
+  }
+
+  # Throttled wrapper for the cosmetic / noisy alerts (cooldown-parse, stuck agent,
+  # code bug): at most one send per 300s across all of them.
+  _notify() {
+    local body="${2:-}"
     [[ -n "$body" ]] || return 0
     local now_epoch; now_epoch="$(date +%s)"
     if (( now_epoch - _last_notify < 300 )); then return 0; fi
     _last_notify="$now_epoch"
-    local slack_webhook local_notify
-    slack_webhook="$(jq -r '.slack_webhook // ""' "$_notify_config" 2>/dev/null || echo '')"
-    local_notify="$(jq -r '.local_notify // false' "$_notify_config" 2>/dev/null || echo 'false')"
-    if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
-      osascript -e "display notification \"${body}\" with title \"${title}\"" 2>/dev/null || true
-    fi
-    if [[ -n "$slack_webhook" ]] && command -v curl >/dev/null 2>&1; then
-      local payload
-      payload="$(jq -nc --arg t "$title" --arg b "$body" --arg h "$this_host"         '{"text": "\($t) (\($h)): \($b)"}')"
-      curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$slack_webhook" >/dev/null 2>&1 || true
-    fi
+    _notify_raw "$@"
   }
 
   _is_self() {
@@ -1501,6 +1526,16 @@ JSON
   }
 
   local -a recent_actions=()
+
+  # Dead-man's-switch (docs/dead-mans-switch.md): a daemon whose INDEPENDENT D1
+  # heartbeat is older than this is presumed dead (2x the driver's HEARTBEAT_SECONDS
+  # of 1800 = a missed beat plus margin). _dms_alerted is a '|'-delimited set of
+  # "project@host" keys currently in the alerted state — per-incident dedup so a
+  # persistent death alerts once, re-arming when the daemon heartbeats again. Lives
+  # in do_monitor scope so it persists across _monitor_run sweeps (a monitor restart
+  # re-arms all, which is fine). bash-3.2-safe (no associative arrays).
+  local _dms_stale_secs="${DMS_STALE_SECS:-3600}"
+  local _dms_alerted='|'
 
   _monitor_run() {
     local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1680,6 +1715,56 @@ JSON
         _notify "backlog-monitor — stuck agent" "${name}: ${fail_count} tick failures, no cooldown"
       fi
     done
+
+    # Pattern 8: dead-man's-switch — STALE-too-long daemon (docs/dead-mans-switch.md).
+    # The OUTSIDE-the-daemon half of the switch: a dead daemon can't alert about
+    # itself, so the monitor reads the INDEPENDENT D1 heartbeat (written every tick
+    # incl. idle/cooldown, decoupled from git) for each (project, host) it knows and
+    # fires when one hasn't heartbeated for > _dms_stale_secs. Reading D1 (not the
+    # git-borne status file) is the whole point — the cooldown-add incident showed a
+    # FRESH-looking dashboard while the hook silently failed. Catches per-daemon death
+    # AND a whole OTHER machine's death (its synced status file still names it, but its
+    # heartbeat goes stale) — as long as at least one machine's monitor lives. FAIL-OPEN:
+    # 404 / unreachable / null epoch ⇒ skip (can't conclude death; mirrors the reaper).
+    # infra is EXCLUDED (its daemon is held by policy → legitimately not heartbeating).
+    local -a dms_trips=()
+    local now_epoch_dms; now_epoch_dms="$(date +%s)"
+    local dms_proj dms_pname dms_sfile dms_host dms_epoch dms_age dms_key
+    for dms_proj in "${unique[@]}"; do
+      dms_pname="$(basename "$dms_proj")"
+      _is_infra_project "$dms_pname" && continue
+      for dms_sfile in "$dms_proj"/.claude/backlog-status-*.json; do
+        [[ -f "$dms_sfile" ]] || continue
+        dms_host="$(basename "$dms_sfile" .json)"; dms_host="${dms_host#backlog-status-}"
+        dms_host="${dms_host%.local}"
+        [[ -n "$dms_host" ]] || continue
+        dms_key="${dms_pname}@${dms_host}"
+        dms_epoch="$(_heartbeat_epoch "$dms_pname" "$dms_host")"
+        if [[ -z "$dms_epoch" ]]; then
+          continue   # fail-open: can't read liveness → don't conclude death
+        fi
+        dms_age=$(( now_epoch_dms - dms_epoch ))
+        if (( dms_age > _dms_stale_secs )); then
+          case "$_dms_alerted" in
+            *"|${dms_key}|"*) : ;;   # already alerted this incident → throttle
+            *)
+              _dms_alerted="${_dms_alerted}${dms_key}|"
+              dms_trips+=("${dms_key} (no heartbeat for $(( dms_age / 60 ))m)")
+              fix_descriptions+=("  ${RD}DEAD-MAN${RS} ${dms_pname}@${dms_host}: no D1 heartbeat for $(( dms_age / 60 ))m (>${_dms_stale_secs}s) — daemon presumed dead")
+              sweep_flagged=$((sweep_flagged + 1))
+              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${dms_pname}\",\"host\":\"${dms_host}\",\"action\":\"dead_mans_switch\",\"result\":\"alerted\",\"age_sec\":${dms_age}}")
+              ;;
+          esac
+        else
+          # daemon is heartbeating again → re-arm so a future death re-alerts.
+          _dms_alerted="${_dms_alerted//|${dms_key}|/|}"
+        fi
+      done
+    done
+    if (( ${#dms_trips[@]:-0} > 0 )); then
+      local dms_body; dms_body="$(printf '%s; ' "${dms_trips[@]}")"
+      _notify_raw "backlog-monitor — DEAD daemon(s)" "${dms_body%; }"
+    fi
 
     sweeps_total=$((sweeps_total + 1))
     fixed_total=$((fixed_total + sweep_fixed))
@@ -2042,6 +2127,9 @@ do_canary() {
 FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
 HEALTH_URL="${HEALTH_URL:-https://kash-backlogs.pages.dev/api/health}"
 COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
+# Per-(project,host) liveness point-read (the same signal the reaper uses); the
+# dead-man's-switch staleness watcher in `monitor` consults it. docs/dead-mans-switch.md.
+HEARTBEAT_URL="${HEARTBEAT_URL:-https://kash-backlogs.pages.dev/api/heartbeat}"
 # DECISION B liveness window: a host whose heartbeat is older than this is not
 # counted toward skew-zero (a powered-off laptop must not pin the freeze). 90m,
 # mirroring the reaper's stale-claim threshold.
@@ -2050,6 +2138,31 @@ FREEZE_LIVENESS_SECS="${FREEZE_LIVENESS_SECS:-5400}"
 _health_key() {
   local f="$HOME/.config/backlog/health-key"
   [[ -f "$f" ]] && tr -d '[:space:]' < "$f" 2>/dev/null || true
+}
+
+# Point-read a single (project, host) heartbeat_epoch from the D1 bus — the same
+# /api/heartbeat liveness signal the reaper consults (written every tick incl.
+# idle/cooldown, decoupled from git commits). Echoes the integer epoch on success;
+# echoes NOTHING on any failure (no curl, network, non-200, found:false, null) so
+# the dead-man's-switch watcher treats "no answer" as FAIL-OPEN (can't conclude a
+# daemon is dead). jq-free integer extract, mirroring the driver's _d1_heartbeat_epoch.
+_heartbeat_epoch() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local proj="${1:-}" host="${2:-}"
+  [[ -n "$proj" ]] || return 0
+  # Minimal URL-encode of spaces (fleet project/host names are otherwise slugs).
+  local p="${proj// /%20}" h="${host// /%20}"
+  local key auth=() body code epoch
+  key="$(_health_key)"; [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' \
+          "${HEARTBEAT_URL}?project=${p}&host=${h}" 2>/dev/null)" || return 0
+  code="$(printf '%s' "$body" | tail -n1)"; body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$code" == "200" ]] || return 0
+  printf '%s' "$body" | grep -q '"found"[[:space:]]*:[[:space:]]*true' || return 0
+  epoch="$(printf '%s' "$body" | grep -oE '"heartbeat_epoch"[[:space:]]*:[[:space:]]*[0-9]+' \
+           | grep -oE '[0-9]+$' | head -n1 || true)"
+  [[ -n "$epoch" ]] && printf '%s' "$epoch"
+  return 0
 }
 
 # Reference driver SHA = origin/main's last bin commit (short). Empty if no repo.

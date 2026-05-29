@@ -9,6 +9,7 @@ coverage/
 .claude/backlog-agent.log
 .claude/backlog-agent-events.jsonl
 .claude/backlog-agent-failcounts.json
+.claude/backlog-agent-hookfail.json
 .claude/agent-cooldown.json
 .claude/backlog-agent.lock/
 .claude/backlog-agent.tick.lock/

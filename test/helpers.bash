@@ -40,6 +40,12 @@ _setup_repo() {
   # it (SECRET_SCAN_DISABLE=0).
   export SECRET_SCAN_DISABLE=1
 
+  # Per-project budget enforcement (bin/backlog-agent _budget_over_cap): disabled
+  # by default so ordinary tick tests never read the budgets file / ledger and
+  # never pause; per-project-budget.bats re-enables it (BUDGET_DISABLE=0) with a
+  # seeded budgets file + history ledger.
+  export BUDGET_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

@@ -264,6 +264,27 @@ SECRET_SCAN_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/backl
 # Set to 1 in tests / to hard-disable the secret gate (skips ensure + Guard 5).
 SECRET_SCAN_DISABLE="${SECRET_SCAN_DISABLE:-0}"
 
+# --- Per-project budget enforcement (W2; docs/per-project-budget.md) ---
+# [pause-primitive consumer, scope=project] A self-imposed *spend* cap, distinct
+# from the account-level plan-limit cooldown (Anthropic's hard cap, Layer 2): if
+# THIS project's own rolling token spend exceeds a per-project cap, the daemon
+# pauses to heartbeat-only (and alerts ONCE), then resumes on its own as the
+# rolling window drains back under the cap — stopping one runaway project from
+# burning the shared account budget. The signal is LOCAL + per-project: it's a
+# plain sum over this project's own ledger (`backlog-history.jsonl`), which is
+# git-TRACKED, so the window sum already spans every host (= project-total spend,
+# not just this machine's). No D1 round-trip — dependency-light + fail-open by
+# construction. Caps live in BUDGETS_FILE's optional `projects` map; a project
+# with no entry is UNCAPPED (today's behaviour = opt-in enforcement). Both the
+# rolling-5h and rolling-week windows enforce (pause if EITHER is over cap).
+# backlog-infra's OWN daemon is EXEMPT (operated interactively; see freeze_exempt).
+BUDGETS_FILE="${BUDGETS_FILE:-${HOME}/.claude/backlog-budgets.json}"
+# Per-host alert-once state ({alerted:bool}); fire ONE notify_send on entering
+# budget-pause, throttle while it persists, reset on resume. Ephemeral, gitignored.
+BUDGET_STATE_FILE="${STATE_DIR}/backlog-agent-budget.json"
+# Set to 1 in tests / to hard-disable budget enforcement (no per-project pause).
+BUDGET_DISABLE="${BUDGET_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -1108,6 +1129,99 @@ _hookfail_record() {
   return 0
 }
 
+# --- Per-project budget enforcement (W2; docs/per-project-budget.md) ---
+# Echo a one-line reason string (e.g. "5h 3.1M/3.0M" or "week 31M/30M, 5h 3.1M/3.0M")
+# if THIS project's rolling token spend is over its per-project cap, else echo
+# NOTHING. The whole feature is FAIL-OPEN: any missing/unreadable input — budget
+# disabled, no node, no budgets file, no `projects` entry for this project, no cap
+# set, or an unreadable ledger — echoes empty (= no enforcement = today's
+# behaviour). The cap is keyed by `_health_project` (same identity freeze_exempt
+# uses). Spend = a plain sum of the ledger's `tokens` over the window; the ledger
+# is git-tracked, so the sum already spans every host (project-total, decision #2).
+# Both windows enforce: trips if rolling-5h > cap_5h OR rolling-week > cap_week
+# (each independently optional). Side-effect on UNDER-cap: clears the alert-once
+# state so the next breach can alert again (mirrors cooldown_active's expiry rm).
+# node (a hard dep) does the combined read + windowing in one pass.
+_budget_over_cap() {
+  [[ "$BUDGET_DISABLE" == "1" ]] && return 0
+  command -v node >/dev/null 2>&1 || return 0
+  [[ -f "$BUDGETS_FILE" ]] || return 0
+  local ledger="${STATE_DIR}/backlog-history.jsonl"
+  [[ -f "$ledger" ]] || return 0
+  local project now reason
+  project="$(_health_project)"
+  now="$(date +%s)"
+  reason="$(node -e '
+    const fs = require("fs");
+    const [budgetsFile, ledgerFile, project, nowStr] = process.argv.slice(1);
+    const now = parseInt(nowStr, 10);
+    let budgets;
+    try { budgets = JSON.parse(fs.readFileSync(budgetsFile, "utf8")); } catch { process.exit(0); }
+    const p = budgets && budgets.projects && budgets.projects[project];
+    if (!p || typeof p !== "object") process.exit(0);            // no entry ⇒ uncapped
+    const cap5h = Number.isFinite(p.rolling_5h_tokens)   ? p.rolling_5h_tokens   : null;
+    const capWk = Number.isFinite(p.rolling_week_tokens) ? p.rolling_week_tokens : null;
+    if (cap5h === null && capWk === null) process.exit(0);       // no cap set ⇒ uncapped
+    let data;
+    try { data = fs.readFileSync(ledgerFile, "utf8"); } catch { process.exit(0); }
+    const cut5h = now - 5 * 3600, cutWk = now - 7 * 24 * 3600;
+    let s5 = 0, sw = 0;
+    for (const line of data.split("\n")) {
+      if (!line.trim()) continue;
+      let r; try { r = JSON.parse(line); } catch { continue; }
+      const tok = Number.isFinite(r.tokens) ? r.tokens : 0;
+      if (tok <= 0) continue;
+      const t = Date.parse(r.ts) / 1000;
+      if (!Number.isFinite(t)) continue;
+      if (t >= cut5h) s5 += tok;
+      if (t >= cutWk) sw += tok;
+    }
+    const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : "" + n;
+    const parts = [];
+    if (cap5h !== null && s5 > cap5h) parts.push("5h " + fmt(s5) + "/" + fmt(cap5h));
+    if (capWk !== null && sw > capWk) parts.push("week " + fmt(sw) + "/" + fmt(capWk));
+    if (parts.length) process.stdout.write(parts.join(", "));
+  ' "$BUDGETS_FILE" "$ledger" "$project" "$now" 2>/dev/null || true)"
+  if [[ -z "$reason" ]]; then
+    rm -f "$BUDGET_STATE_FILE" 2>/dev/null || true   # under cap ⇒ reset alert-once
+    return 0
+  fi
+  printf '%s' "$reason"
+  return 0
+}
+
+# Fire ONE budget-pause alert per breach, then throttle (mirrors _hookfail_record's
+# {alerted} flag). The flag lives in BUDGET_STATE_FILE and is cleared by
+# _budget_over_cap when spend drops back under the cap, so a later breach re-alerts.
+# Best-effort: any failure is a silent no-op (never aborts a tick).
+_budget_alert_once() {
+  local reason="${1:-}"
+  [[ -z "${BUDGET_STATE_FILE:-}" ]] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  # Always refresh `reason` (so the banner shows the current breach); only `fire`
+  # the alert on the rising edge (alerted flag not yet set this breach).
+  local fire
+  fire="$(node -e '
+    const fs = require("fs");
+    const [file, reason] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    let fire = 0;
+    if (!obj.alerted) { fire = 1; obj.alerted = true; }
+    obj.reason = reason;
+    try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
+    process.stdout.write("" + fire);
+  ' "$BUDGET_STATE_FILE" "$reason" 2>/dev/null || echo 0)"
+  [[ "$fire" == "1" ]] || return 0
+  local project host
+  project="$(_health_project)"
+  host="$(_health_host)"
+  log_event budget_alert reason "$reason"
+  notify_send "backlog-agent budget cap: ${project}@${host}" \
+    "⏸ backlog-agent [${project}@${host}] exceeded its per-project token budget (${reason}) — Claude ticks held (heartbeat-only, or routed to a fallback agent if configured) until the rolling window drains back under the cap."
+  return 0
+}
+
 # --- Layer 3: alternative-agent fallback (docs/multi-agent-design.md) ---
 
 # Returns 0 (true) iff the opt-in fallback agent is configured AND usable right
@@ -1551,6 +1665,39 @@ tick_once() {
     TICK_OUTCOME=cooldown
     return 0
     fi  # end fallback-unavailable (Layer 2 idle) branch
+  fi
+
+  # --- Per-project budget enforcement (W2; docs/per-project-budget.md) ---
+  # Self-imposed SPEND cap (distinct from the account plan-limit cooldown above):
+  # if THIS project's own rolling token spend exceeds a per-project cap in
+  # backlog-budgets.json, pause to heartbeat-only + alert ONCE, self-clearing as
+  # the rolling window drains. backlog-infra's OWN daemon is EXEMPT (operated
+  # interactively — like freeze/pause). Like the cooldown above, this honors the
+  # Layer-3 fallback: a budget cap is on *Anthropic* spend, so a non-Claude
+  # fallback may still drive the tick. The `use_fallback` guard avoids re-handling
+  # if the cooldown block already chose the fallback this tick.
+  if [[ "$use_fallback" != "1" ]] && ! freeze_exempt; then
+    local _budget_reason; _budget_reason="$(_budget_over_cap)"
+    if [[ -n "$_budget_reason" ]]; then
+      _budget_alert_once "$_budget_reason"
+      if fallback_agent_available; then
+        use_fallback=1
+        agent_name="$(fallback_agent_name)"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] per-project budget cap exceeded (${_budget_reason}); running this tick via fallback agent '${agent_name}' (non-Anthropic spend)" | tee -a "$LOG_FILE"
+        log_event budget_fallback agent "$agent_name" reason "$_budget_reason"
+        # fall through to the normal claim + work flow with the fallback agent
+      else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] per-project budget cap exceeded (${_budget_reason}); heartbeat only (skipping claude until the rolling window drains under the cap)" | tee -a "$LOG_FILE"
+        pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+        _run_status_hook "" 0 loop "$pre_head" 0
+        _post_tick_cleanup
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (budget)" | tee -a "$LOG_FILE"
+        log_event budget_paused reason "$_budget_reason"
+        log_event tick_done outcome budget reason "$_budget_reason" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+        TICK_OUTCOME=budget
+        return 0
+      fi
+    fi
   fi
 
   # --- Fleet control short-circuit: stop / pause / freeze (docs/fleet-freeze.md) ---

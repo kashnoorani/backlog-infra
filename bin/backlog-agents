@@ -667,6 +667,22 @@ snapshot() {
     fi
   fi
 
+  # ---- per-project budget pause (W2, docs/per-project-budget.md) ----
+  # Surface any project that's currently over its self-imposed per-project token
+  # cap. Unlike control/cooldown (D1-backed, fleet-wide), the budget signal is
+  # LOCAL + per-host: each over-cap daemon drops a `.claude/backlog-agent-budget.json`
+  # (cleared when spend drains under the cap). Read those local state files for the
+  # projects on THIS machine. Only printed when at least one is over cap.
+  local _bproj _bfile _bover
+  for _bproj in "${unique[@]}"; do
+    _bfile="$_bproj/.claude/backlog-agent-budget.json"
+    [[ -f "$_bfile" ]] || continue
+    jq -e '.alerted == true' "$_bfile" >/dev/null 2>&1 || continue
+    _bover="$(jq -r '.reason // "over cap"' "$_bfile" 2>/dev/null || echo 'over cap')"
+    printf '  budget: %sOVER CAP%s  %s%s%s  %s(%s)%s\n' \
+      "$YL" "$RS" "$B" "$(basename "$_bproj")" "$RS" "$DIM" "$_bover" "$RS"
+  done
+
   echo
 
   # ---- driver version-skew (W1) ----
@@ -2081,6 +2097,33 @@ do_doctor() {
     _d_fail "budgets file is not valid JSON ($budgets)"
   else
     _d_pass "budgets file present and valid"
+    # Optional per-project enforcement map (W2; docs/per-project-budget.md). Each
+    # entry's rolling_5h_tokens / rolling_week_tokens (if present) must be a
+    # positive integer. A malformed entry is a WARN, not a fail: enforcement is
+    # fail-open, so a bad value just leaves that project uncapped (no pause).
+    if jq -e 'has("projects")' "$budgets" >/dev/null 2>&1; then
+      if ! jq -e '.projects | type == "object"' "$budgets" >/dev/null 2>&1; then
+        _d_warn "budgets .projects is not an object — per-project caps ignored (uncapped)"
+      else
+        local _bad
+        _bad="$(jq -r '
+          .projects | to_entries[]
+          | select(.key | startswith("_") | not)        # skip _comment-style keys
+          | .key as $k | .value as $v
+          | [ "rolling_5h_tokens", "rolling_week_tokens" ][] as $field
+          | select(($v | type) == "object" and ($v | has($field)))
+          | $v[$field] as $n
+          | select(($n | type) != "number" or $n <= 0 or ($n | floor) != $n)
+          | "\($k).\($field)"' "$budgets" 2>/dev/null | paste -sd, -)"
+        if [[ -n "$_bad" ]]; then
+          _d_warn "budgets per-project cap(s) not a positive integer: ${_bad} (those windows uncapped)"
+        else
+          local _ncap
+          _ncap="$(jq -r '[.projects | to_entries[] | select(.key | startswith("_") | not)] | length' "$budgets" 2>/dev/null || echo 0)"
+          _d_pass "budgets per-project caps valid (${_ncap} project(s) capped)"
+        fi
+      fi
+    fi
   fi
   local tool
   for tool in git node jq; do

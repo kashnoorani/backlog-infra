@@ -9,6 +9,7 @@ dist/
 .claude/backlog-agent-events.jsonl
 .claude/backlog-agent-failcounts.json
 .claude/backlog-agent-hookfail.json
+.claude/backlog-agent-budget.json
 .claude/agent-cooldown.json
 .claude/backlog-agent.lock/
 .claude/backlog-tick.inflight

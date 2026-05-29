@@ -204,6 +204,31 @@ COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
 # Set to 1 in tests / to hard-disable the account-cooldown read + publish.
 ACCOUNT_COOLDOWN_DISABLE="${ACCOUNT_COOLDOWN_DISABLE:-0}"
 
+# Per-tick outcome verification (W2; Guard 4 — the FIRST *vetoing* tick-guard;
+# Guards 1/2/3 are the circuit-breaker + diff-size + protected-path siblings).
+# `claude -p` exiting 0 + flipping an item to [x] is NOT proof the project's gate
+# is green — claude can declare done while typecheck/tests are broken and the
+# daemon records silent "progress". After an exit-0 tick that CLAIMED COMPLETION,
+# the daemon independently runs the project's gate on the committed HEAD; on
+# failure it REOPENS the item ([x]→[ ]) + bumps the failcount (feeding the Guard-1
+# circuit breaker → [?] after K) rather than recording success. Like Guards 2/3 it
+# does NOT auto-revert (the commit stands, flagged — auto-reverting an already-
+# pushed commit is a cross-machine hazard). docs/per-tick-verification.md.
+#   Gate source (resolve_gate, in precedence order):
+#     1. .claude/backlog-gate.json  {"gate": ["npm","run","verify"]}  (array=argv,
+#        or a string run via `bash -c`);
+#     2. package.json fallback: a "verify" script, else "typecheck" && "test"
+#        chained (npm's default "no test specified" placeholder is ignored so a
+#        project that never set up tests is not falsely failed);
+#     3. no gate defined ⇒ FAIL-OPEN (skip verification = current behaviour).
+# A gate that overruns GATE_TIMEOUT_SECS is killed and counts as a FAILURE (a gate
+# that can't finish in budget is not green) — the breaker surfaces a chronically
+# slow/broken gate as [?] rather than letting it pass silently.
+GATE_FILE="${STATE_DIR}/backlog-gate.json"
+GATE_TIMEOUT_SECS="${GATE_TIMEOUT_SECS:-600}"
+# Set to 1 in tests / to hard-disable verification (forces the fail-open path).
+GATE_DISABLE="${GATE_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -1204,6 +1229,92 @@ _maybe_auto_complete() {
   return 0
 }
 
+# --- Guard 4 (W2): per-tick outcome verification helpers ---
+
+# True iff the just-worked item's title now appears on an [x] line in ## Open,
+# i.e. THIS tick claimed completion. Matched as a fixed substring (titles carry
+# regex-special chars: **, (, ), `) so claude appending a one-line summary to the
+# [x] line still counts. Scoped to ## Open because that's where the canonical
+# in-place [~]→[x] flip lands (compaction → Done runs later, in _post_tick_cleanup).
+_completion_claimed() {
+  local item="$1"
+  [[ -z "$item" ]] && return 1
+  sed -n '/^## Open/,/^## [A-Z]/p' "$BACKLOG_FILE" 2>/dev/null \
+    | grep -F -- "$item" | grep -qE '^(- )?\[x\] '
+}
+
+# Populate the global array GATE_CMD with the project's verification command, in
+# precedence order: (1) .claude/backlog-gate.json `.gate` (array ⇒ argv run
+# directly; string ⇒ run via `bash -c`); (2) package.json — a "verify" script,
+# else "typecheck" && "test" chained via `bash -c` (npm's stock "no test
+# specified" placeholder is ignored). Returns 1 (GATE_CMD empty) when no gate is
+# defined ⇒ caller FAILS OPEN. Uses node (a hard dependency already — see
+# failcount_*); no jq needed, and package.json parsing is robust.
+resolve_gate() {
+  GATE_CMD=()
+  [[ "$GATE_DISABLE" == "1" ]] && return 1
+  command -v node >/dev/null 2>&1 || return 1
+  local line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    GATE_CMD+=( "$line" )
+  done < <(node -e '
+    // Resolve the gate argv, then print ONCE at the end. NB: do NOT
+    // process.exit() right after stdout.write — when stdout is a pipe (this runs
+    // under a process substitution) the write is async and exit() truncates it
+    // (the classic node pipe-flush footgun). Letting node end naturally flushes.
+    const fs = require("fs");
+    const [gateFile, pkgFile] = [process.argv[1], process.argv[2]];
+    let out = null;
+    // 1. explicit per-project config.
+    try {
+      const g = (JSON.parse(fs.readFileSync(gateFile, "utf8")) || {}).gate;
+      if (Array.isArray(g) && g.length) out = g.map(String);
+      else if (typeof g === "string" && g.trim()) out = ["bash", "-c", g];
+    } catch {}
+    // 2. package.json convention fallback.
+    if (!out) {
+      try {
+        const s = (JSON.parse(fs.readFileSync(pkgFile, "utf8")) || {}).scripts || {};
+        if (s.verify) out = ["npm", "run", "verify"];
+        else {
+          const chain = [];
+          if (s.typecheck) chain.push("npm run typecheck");
+          // Ignore the npm default placeholder so a project with no real tests
+          // is not falsely failed (reopened forever until the breaker blocks it).
+          if (s.test && !/no test specified/i.test(s.test)) chain.push("npm run test");
+          if (chain.length) out = ["bash", "-c", chain.join(" && ")];
+        }
+      } catch {}
+    }
+    // 3. no gate ⇒ print nothing ⇒ caller fails open. The trailing newline is
+    // load-bearing: `while read` drops a final unterminated line, so without it a
+    // single-element gate (the common case) would never enter the loop body.
+    if (out) process.stdout.write(out.join("\n") + "\n");
+  ' "$GATE_FILE" "package.json" 2>/dev/null || true)
+  [[ ${#GATE_CMD[@]} -gt 0 ]] || return 1
+  return 0
+}
+
+# Run the resolved gate (GATE_CMD) on the current HEAD under a pure-bash
+# wall-clock watchdog (GATE_TIMEOUT_SECS), mirroring the claude/status-hook
+# watchdogs so a hanging test can never wedge the tick. Captures combined output
+# to $1. Returns the gate's real exit (0 = pass); a watchdog kill yields a
+# non-zero (143) which the caller treats as a FAILED verification.
+run_gate() {
+  local out_file="$1"
+  local gpid gwd grc=0
+  "${GATE_CMD[@]}" < /dev/null > "$out_file" 2>&1 &
+  gpid=$!
+  ( sleep "$GATE_TIMEOUT_SECS"; kill -TERM "$gpid" 2>/dev/null ) >/dev/null 2>&1 &
+  gwd=$!
+  if wait "$gpid"; then grc=0; else grc=$?; fi
+  pkill -P "$gwd" 2>/dev/null || true
+  kill -TERM "$gwd" 2>/dev/null || true
+  wait "$gwd" 2>/dev/null || true
+  return "$grc"
+}
+
 tick_once() {
   local ts pre_head item_title claude_exit
   # Layer 3: which agent runs this tick. "claude" normally; set to the fallback
@@ -1692,16 +1803,79 @@ tick_once() {
     if [[ "$claimed" == "true" ]]; then
       _maybe_auto_complete "$item_title" >/dev/null 2>&1 || true
     fi
-    # Guard 1 (W2): a clean tick clears the item's consecutive-failure streak.
-    failcount_reset "$item_title"
+
+    # Snapshot the commit(s) claude (+ auto-complete) landed this tick:
+    # work_base..work_head. Captured ONCE here, BEFORE any verification reopen
+    # commit advances HEAD, so it is reused cleanly by Guard 4 (verification),
+    # Guards 2/3 (diff-size/protected-path), and the fleet-freeze auto-arm —
+    # none of which should see the reopen markup commit.
+    local work_head=""
+    [[ -n "$work_base" ]] && work_head="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
+    local work_committed=false
+    [[ -n "$work_base" && -n "$work_head" && "$work_head" != "$work_base" ]] && work_committed=true
+
+    # --- Guard 4 (W2): per-tick outcome verification (the first VETOING guard) ---
+    # exit 0 + claude's self-report is NOT proof the gate is green. When this tick
+    # both LANDED A COMMIT and CLAIMED COMPLETION (the item is now [x]) and the
+    # project defines a gate, independently run it on the committed HEAD. On
+    # failure (or timeout) REOPEN the item ([x]→[ ]) + failcount_bump so K
+    # consecutive verification failures trip the Guard-1 circuit breaker → [?].
+    # No auto-revert (commit stands, flagged — mirrors Guards 2/3). No gate
+    # defined ⇒ FAIL-OPEN (skip = the prior behaviour). docs/per-tick-verification.md.
+    local verify_failed=false
+    if [[ "$claimed" == "true" && "$work_committed" == "true" ]] \
+         && _completion_claimed "$item_title" && resolve_gate; then
+      local gate_out; gate_out="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.gate-out.$$")"
+      echo "  [verify] running gate: ${GATE_CMD[*]} (timeout ${GATE_TIMEOUT_SECS}s)" | tee -a "$LOG_FILE"
+      local gate_rc=0
+      run_gate "$gate_out" || gate_rc=$?
+      cat "$gate_out" >> "$LOG_FILE" 2>/dev/null || true
+      if [[ $gate_rc -ne 0 ]]; then
+        verify_failed=true
+        echo "  [verify] FAILED (exit=${gate_rc}) for '${item_title}' — reopening + bumping failcount (commit kept, flagged)" | tee -a "$LOG_FILE"
+        # Reopen [x] → [ ] in ## Open, targeting THIS item by title. index() is a
+        # literal substring match (titles carry regex-special chars), so a [x]
+        # line with claude's appended summary still matches. Strip the owner stamp
+        # too (mirrors the exit≠0 unclaim path) — otherwise it leaks into the
+        # stripped title on the NEXT pick + claim, drifting the failcount key so
+        # the circuit breaker never accumulates. Scoped `git add` of the backlog.
+        _local_awk_inplace "$BACKLOG_FILE" '
+          BEGIN { in_open=0; done=0 }
+          /^## Open/       { in_open=1; print; next }
+          /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+          in_open && !done && /^(- )?\[x\] / && index($0, title) {
+            sub(/\[x\]/, "[ ]"); sub(/ +<!-- @[^>]*-->[ ]*$/, ""); done=1
+          }
+          { print }
+        ' -v title="$item_title" 2>/dev/null || true
+        if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+          git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+          git -C "$PWD" commit -m "verify-failed: reopen ${item_title}" >/dev/null 2>&1
+          git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+          echo "  [verify] reopened ${item_title}" | tee -a "$LOG_FILE"
+        else
+          echo "  [verify] WARNING: '${item_title}' failed its gate but could not be auto-reopened (no [x] match in ## Open) — needs manual attention" | tee -a "$LOG_FILE"
+        fi
+        local vfails; vfails="$(failcount_bump "$item_title")"
+        log_event verify_failed item "$item_title" exit_code "$gate_rc" gate "${GATE_CMD[*]}" fails "$vfails"
+      else
+        echo "  [verify] gate passed for '${item_title}'" | tee -a "$LOG_FILE"
+        log_event verify_passed item "$item_title" gate "${GATE_CMD[*]}"
+      fi
+      rm -f "$gate_out" 2>/dev/null || true
+    fi
+
+    # Guard 1 (W2): a clean tick clears the item's consecutive-failure streak —
+    # but only when verification did NOT fail (a failure already bumped above).
+    if [[ "$verify_failed" != "true" ]]; then
+      failcount_reset "$item_title"
+    fi
 
     # --- Guards 2 & 3 (W2): inspect what claude actually committed this tick ---
-    # Both scope their diff to work_base..HEAD — the commit(s) claude pushed,
-    # excluding the daemon's own reclaim/claim markup commits. Neither
-    # auto-reverts: the commit stands and we flag it for the user to review.
-    if [[ -n "$work_base" ]]; then
-      local work_head; work_head="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
-      if [[ -n "$work_head" && "$work_head" != "$work_base" ]]; then
+    # Both scope their diff to work_base..work_head — the commit(s) claude pushed,
+    # excluding the daemon's own reclaim/claim/verify-reopen markup commits.
+    # Neither auto-reverts: the commit stands and we flag it for the user to review.
+    if [[ "$work_committed" == "true" ]]; then
         local changed_files changed_lines
         changed_files="$(git -C "$PWD" diff --name-only "$work_base" "$work_head" 2>/dev/null | grep -c . || true)"
         changed_files="${changed_files:-0}"
@@ -1743,7 +1917,10 @@ tick_once() {
         # Distinct from PROTECTED_PATHS above (per-project review signal; that
         # set also covers CLAUDE.md/.gitignore, which are NOT fleet-affecting).
         # The clear is fast + automatic, so arming on every bin/ commit is cheap.
-        if freeze_exempt && command -v backlog-agents >/dev/null 2>&1; then
+        # Guard 4 ordering: VERIFY FIRST — never arm the freeze (hold the whole
+        # fleet) on a bin/ commit that just FAILED its own gate; the item is being
+        # reopened, so there's no verified infra change to propagate.
+        if [[ "$verify_failed" != "true" ]] && freeze_exempt && command -v backlog-agents >/dev/null 2>&1; then
           local fleet_hit=""
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue
@@ -1757,7 +1934,6 @@ tick_once() {
               --reason "in-flight infra change: ${item_title}" >>"$LOG_FILE" 2>&1 || true
           fi
         fi
-      fi
     fi
   fi
   rm -f "$capture_file" 2>/dev/null || true

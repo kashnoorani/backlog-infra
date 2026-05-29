@@ -53,6 +53,17 @@ Tests drive the real entry point black-box: `backlog-agent tick`.
    (now-gitignored) shared file, so it silently skipped every status commit.
    Fixed to check only the staged files.
 
+`events.bats` — structured event log (`.claude/backlog-agent-events.jsonl`,
+W0), the machine-readable stream that replaces regex-on-prose for downstream
+consumers:
+
+1. idle tick → `tick_start` + `tick_done(idle)`, valid JSONL, no `claim`
+2. successful tick → `claim` + `claude_exit(0)` + `tick_done(work)` + `status_ok`
+3. plan-limit failure → `cooldown_armed` + failing `claude_exit`
+4. active cooldown → `tick_done(cooldown)`, no `claim`
+5. titles with quotes/backslashes stay valid JSON (escaping)
+6. every line carries the envelope (`ts`, `event`, `project`, `host`, `pid`)
+
 ## TODO
 
 - **Concurrent claim-race** (two daemons push the same `claim:` → one wins,

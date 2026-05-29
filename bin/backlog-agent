@@ -52,16 +52,19 @@ if [[ -f docs/Backlog.md ]]; then
   BACKLOG_FILE="docs/Backlog.md"
   LOCK_DIR=".claude/backlog-agent.lock"
   LOG_FILE=".claude/backlog-agent.log"
+  EVENT_LOG_FILE=".claude/backlog-agent-events.jsonl"
   INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
 elif [[ -f Backlog.md ]]; then
   BACKLOG_FILE="Backlog.md"
   LOCK_DIR=".claude/backlog-agent.lock"
   LOG_FILE=".claude/backlog-agent.log"
+  EVENT_LOG_FILE=".claude/backlog-agent-events.jsonl"
   INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
 elif [[ -f backlog.txt ]]; then
   BACKLOG_FILE="backlog.txt"
   LOCK_DIR=".claude/backlog-agent.lock"
   LOG_FILE=".claude/backlog-agent.log"
+  EVENT_LOG_FILE=".claude/backlog-agent-events.jsonl"
   INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
 else
   # Allow status/help to run from anywhere; only fail on commands that
@@ -69,6 +72,7 @@ else
   BACKLOG_FILE=""
   LOCK_DIR=""
   LOG_FILE=""
+  EVENT_LOG_FILE=""
   INFLIGHT_FILE=""
 fi
 
@@ -167,6 +171,7 @@ BACKLOG_EOF
   BACKLOG_FILE="docs/Backlog.md"
   LOCK_DIR=".claude/backlog-agent.lock"
   LOG_FILE=".claude/backlog-agent.log"
+  EVENT_LOG_FILE=".claude/backlog-agent-events.jsonl"
   INFLIGHT_FILE=".claude/backlog-agent-tick.inflight"
   # HOOK was already set at script start (it doesn't depend on BACKLOG_FILE).
   echo "backlog-agent: scaffolded docs/Backlog.md for ${project_name}" >&2
@@ -213,6 +218,57 @@ _local_awk_inplace() {
     tmpfile="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.awk-tmp.$$")"
     awk "$script" "$file" > "$tmpfile" && mv "$tmpfile" "$file"
   fi
+}
+
+# --- structured event log (W0) ---
+# A second, machine-readable stream alongside the freeform $LOG_FILE. One
+# JSON object per line (JSONL) for the key tick lifecycle events
+# (tick_start, claim, claim_lost, claude_exit, cooldown_armed,
+# status_ok/status_fail, tick_done). The freeform log stays as-is for human
+# `backlog-agent log` tailing; this file is what the monitor, metrics, digest,
+# and dead-man's-switch consume instead of regex-on-prose. Per-host and
+# ephemeral (gitignored), like $LOG_FILE.
+
+# Minimal JSON string escaper — backslash first, then quote and the common
+# control chars. Dependency-free on purpose: logging must never fail because
+# jq is missing. Item titles are the only untrusted input and rarely contain
+# control chars beyond these.
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+# Append one structured event. Usage: log_event <event> [key value]...
+# Always stamps ts (UTC ISO-8601), event, project, host, pid. Extra args are
+# consumed in key/value pairs; a value that looks numeric or boolean is emitted
+# bare (so exit_code/counts/flags are real JSON numbers/bools), otherwise it's a
+# JSON string. Best-effort: a missing $EVENT_LOG_FILE or a write failure is a
+# silent no-op — never aborts a tick.
+log_event() {
+  [[ -z "${EVENT_LOG_FILE:-}" ]] && return 0
+  local event="$1"; shift || true
+  local ts proj host line
+  ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo '')"
+  proj="$(basename "$PWD" 2>/dev/null || echo '?')"
+  host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+  line="{\"ts\":\"${ts}\",\"event\":\"$(_json_escape "$event")\""
+  line+=",\"project\":\"$(_json_escape "$proj")\",\"host\":\"$(_json_escape "$host")\",\"pid\":$$"
+  local k v
+  while (( $# >= 2 )); do
+    k="$1"; v="$2"; shift 2
+    if [[ "$v" =~ ^-?[0-9]+$ || "$v" == "true" || "$v" == "false" ]]; then
+      line+=",\"$(_json_escape "$k")\":${v}"
+    else
+      line+=",\"$(_json_escape "$k")\":\"$(_json_escape "$v")\""
+    fi
+  done
+  line+="}"
+  printf '%s\n' "$line" >> "$EVENT_LOG_FILE" 2>/dev/null || true
 }
 
 # --- helpers ---
@@ -392,6 +448,16 @@ _post_tick_cleanup() {
     fi
   fi
 
+  # Same rotation for the structured event stream — keep the most recent lines.
+  if [[ -n "${EVENT_LOG_FILE:-}" ]] && [[ -f "$EVENT_LOG_FILE" ]]; then
+    local event_log_size
+    event_log_size="$(wc -c < "$EVENT_LOG_FILE" 2>/dev/null || echo 0)"
+    if (( event_log_size > max_log_bytes )); then
+      tail -n 5000 "$EVENT_LOG_FILE" > "${EVENT_LOG_FILE}.tmp" && mv "${EVENT_LOG_FILE}.tmp" "$EVENT_LOG_FILE"
+      log_event log_rotated bytes_before "$event_log_size"
+    fi
+  fi
+
   # Auto-compact — archive Done items when they pile up.
   local done_count
   done_count="$(grep -cE '^(- )?\[x\] ' "$BACKLOG_FILE" 2>/dev/null || echo 0)"
@@ -473,6 +539,7 @@ JSON
     wait_info="until ${until_iso:-+${COOLDOWN_SECONDS}s}"
   fi
   echo "  [cooldown] plan/session limit detected — pausing claude ticks ${wait_info} (rm ${COOLDOWN_FILE} to clear)" | tee -a "$LOG_FILE"
+  log_event cooldown_armed until "$until_iso" until_epoch "$until_epoch" reason "$reason" parsed_from_reset "$parsed_from"
   notify_cooldown "$until_iso"
 }
 
@@ -598,9 +665,16 @@ _parse_reset_to_epoch() {
 _run_status_hook() {
   local item="$1" exit_code="${2:-0}" mode="${3:-loop}" pre_head="$4" pulled="${5:-0}"
   if [[ -n "$HOOK" && -f "$HOOK" ]]; then
-    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" >> "$LOG_FILE" 2>&1 || true
+    local hook_rc=0
+    node "$HOOK" --item "$item" --exit-code "$exit_code" --mode "$mode" --pre-head "$pre_head" --pulled "$pulled" >> "$LOG_FILE" 2>&1 || hook_rc=$?
+    if [[ $hook_rc -eq 0 ]]; then
+      log_event status_ok item "$item"
+    else
+      log_event status_fail item "$item" exit_code "$hook_rc"
+    fi
   else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] status hook not found or not executable: ${HOOK:-<not set>}" | tee -a "$LOG_FILE"
+    log_event status_fail item "$item" reason hook_missing
   fi
 }
 
@@ -652,12 +726,14 @@ tick_once() {
   trap 'rmdir "$TICK_LOCK_DIR" 2>/dev/null || true' RETURN
 
   ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  local tick_start_epoch; tick_start_epoch="$(date +%s)"
   {
     echo
     echo "================================================================"
     echo "[$ts] tick start"
     echo "================================================================"
   } | tee -a "$LOG_FILE"
+  log_event tick_start
 
   # --- Layer 2: plan-limit cooldown short-circuit ---
   # A prior tick may have hit the Anthropic plan/session cap and armed a
@@ -679,6 +755,7 @@ tick_once() {
       local now_ep; now_ep="$(date +%s)"
       COOLDOWN_WAIT_SECONDS=$(( cooldown_epoch - now_ep > 0 ? cooldown_epoch - now_ep : 0 ))
     fi
+    log_event tick_done outcome cooldown duration_s "$(( $(date +%s) - tick_start_epoch ))"
     TICK_OUTCOME=cooldown
     return 0
   fi
@@ -793,6 +870,7 @@ tick_once() {
     _post_tick_cleanup
     [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (idle)" | tee -a "$LOG_FILE"
+    log_event tick_done outcome idle duration_s "$(( $(date +%s) - tick_start_epoch ))"
     TICK_OUTCOME=idle
     return 0
   fi
@@ -820,6 +898,7 @@ tick_once() {
         if [[ "$claim_pushed" == "true" ]]; then
           claimed=true
           echo "  [claim] ${item_title}" | tee -a "$LOG_FILE"
+          log_event claim item "$item_title"
         else
           # Push failed — another machine may have pushed first. Try to
           # rebase the claim on top of origin. If the item is still open
@@ -833,6 +912,7 @@ tick_once() {
             if git -C "$PWD" push origin "$branch" 2>/dev/null; then
               claimed=true
               echo "  [claim] ${item_title} (rebase + retry)" | tee -a "$LOG_FILE"
+              log_event claim item "$item_title" rebased true
             else
               git -C "$PWD" reset --hard "origin/$branch" 2>/dev/null || true
               echo "  [skipped] claim push failed after rebase for '${item_title}' — reset to origin" | tee -a "$LOG_FILE"
@@ -851,9 +931,11 @@ tick_once() {
   # If claim push failed (claimed=false but item was found), skip claude
   # — the item was unclaimed and stays [ ] for the next tick.
   if [[ -n "$item_title" && "$claimed" != "true" ]]; then
+    log_event claim_lost item "$item_title"
     _post_tick_cleanup
     [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick skipped (claim push failed)" | tee -a "$LOG_FILE"
+    log_event tick_done outcome claim_lost duration_s "$(( $(date +%s) - tick_start_epoch ))"
     return 0
   fi
 
@@ -877,6 +959,7 @@ tick_once() {
   claude_exit=0
   { claude -p --fallback-model claude-haiku-4-5 "$prompt" < /dev/null 2>&1 | tee -a "$LOG_FILE" "$capture_file"; } \
     || claude_exit=${PIPESTATUS[0]}
+  log_event claude_exit item "$item_title" exit_code "$claude_exit"
   if [[ $claude_exit -ne 0 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick failed (claude exit=$claude_exit)" | tee -a "$LOG_FILE"
     # Layer 2: if the failure was a plan/session-limit rejection, arm a
@@ -925,6 +1008,7 @@ tick_once() {
   _post_tick_cleanup
   [[ -n "$INFLIGHT_FILE" ]] && rm -f "$INFLIGHT_FILE"
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done" | tee -a "$LOG_FILE"
+  log_event tick_done outcome work item "$item_title" exit_code "$claude_exit" duration_s "$(( $(date +%s) - tick_start_epoch ))"
   TICK_OUTCOME=work
 }
 

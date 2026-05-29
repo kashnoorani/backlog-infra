@@ -344,6 +344,36 @@ fleet view still works). Token usage is read from the **Claude transcript**, so
 it's Claude-specific — an alternative agent would log `0 tok` until extended
 (see §11).
 
+### Structured event log (`.claude/backlog-agent-events.jsonl`)
+
+Alongside the freeform human log (`.claude/backlog-agent.log`, tailed by
+`backlog-agent log`), the driver emits a **machine-readable JSONL stream** — one
+JSON object per line — for the key tick lifecycle events. This exists so the
+monitor, metrics, fleet digest, and dead-man's-switch can match on a structured
+field instead of grepping log *prose* (which silently breaks when a message is
+reworded). The freeform log is unchanged for backward compatibility; the JSONL
+file is the new substrate downstream consumers read.
+
+Every line carries a common envelope (`ts` UTC ISO-8601, `event`, `project`,
+`host`, `pid`) plus event-specific fields:
+
+| `event` | When | Extra fields |
+|---|---|---|
+| `tick_start` | top of every tick | — |
+| `claim` | item claimed (CAS push landed) | `item`, `rebased` (on retry path) |
+| `claim_lost` | claim push failed — another machine won | `item` |
+| `claude_exit` | after `claude -p` returns | `item`, `exit_code` |
+| `cooldown_armed` | plan/session-limit cooldown written | `until`, `until_epoch`, `reason`, `parsed_from_reset` |
+| `status_ok` / `status_fail` | status hook returned 0 / non-zero (or missing) | `item`, `exit_code` / `reason` |
+| `tick_done` | tick end | `outcome` (`work`\|`idle`\|`cooldown`\|`claim_lost`), `duration_s`, and on `work`: `item`, `exit_code` |
+
+The emitter (`log_event` in `backlog-agent`) is **dependency-free and
+best-effort**: no jq needed (a small built-in `_json_escape` handles quotes,
+backslashes, and control chars in item titles), and any write failure or absent
+path is a silent no-op so logging can never abort a tick. The file is per-host,
+gitignored, and rotated (tail-truncated past 10 MB) in `_post_tick_cleanup`
+exactly like the freeform log.
+
 ---
 
 ## 7. Fleet & lifecycle tooling
@@ -557,6 +587,7 @@ fallback. Full investigation and rationale in
 | `backlog-agent.lock/` (+ `pid`) | `acquire_lock` | no (gitignored) | process lock (daemon-lifetime, one per checkout) |
 | `backlog-agent.tick.lock/` | `tick_once` | no (gitignored) | per-tick mutex — serializes the fswatch + poll drivers within one daemon |
 | `backlog-agent.log` | `tick_once` (tee) | no | live worker log (rotated at 10 MB) |
+| `backlog-agent-events.jsonl` | `log_event` | no (gitignored) | structured event stream — one JSON line per lifecycle event (rotated at 10 MB); see §6 |
 | `backlog-agent-tick.inflight` | `tick_once` | no | `<pid>\t<epoch>\t<title>` of in-flight tick |
 | `agent-cooldown.json` | `start_cooldown` | no | plan-limit cooldown `until_epoch` |
 | `launchd-{stdout,stderr}.log` | launchd | no | daemon stdio |

@@ -7,6 +7,7 @@ coverage/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 .claude/backlog-agent.log
+.claude/backlog-agent-events.jsonl
 .claude/backlog-agent.lock/
 .claude/backlog-agent.tick.lock/
 .claude/watch-backlog.ping

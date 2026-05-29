@@ -529,13 +529,19 @@ async function main() {
   };
   appendFileSync(HISTORY_LOG, `${JSON.stringify(effort)}\n`);
 
-  // Gracefully no-op the commit/push when `.claude/` (or these specific
-  // files) is wholesale-gitignored — the local fleet view (`backlog-agents`
-  // reads .claude/*.json directly) still works, and the user can opt
-  // into cross-machine visibility later by tuning .gitignore to match
-  // the convention used by other projects (ignore logs+locks, track
+  // Gracefully no-op the commit/push when `.claude/` is wholesale-gitignored
+  // — the local fleet view (`backlog-agents` reads .claude/*.json directly)
+  // still works, and the user can opt into cross-machine visibility later by
+  // tuning .gitignore to match the convention (ignore logs+locks, track
   // status+history).
-  const ignored = spawnSync("git", ["check-ignore", STATUS_FILE, HOST_STATUS_FILE, HISTORY_LOG], {
+  //
+  // Check ONLY the files we actually stage (per-host status + history). The
+  // SHARED backlog-status.json is now intentionally gitignored (it churned the
+  // tree and is never staged), so including it here made check-ignore return 0
+  // and silently skip every status commit even when host+history are tracked
+  // — the fleet went STALE with no visible error. Regression: test/status-hook.bats
+  // "still commits per-host + history when only shared status.json is gitignored".
+  const ignored = spawnSync("git", ["check-ignore", HOST_STATUS_FILE, HISTORY_LOG], {
     cwd: REPO_ROOT,
   });
   if (ignored.status === 0) {

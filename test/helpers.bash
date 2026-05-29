@@ -120,6 +120,46 @@ run_tick() {
 # True if claude was invoked during the last tick.
 claude_was_called() { [ -f "$CLAUDE_CALLED" ]; }
 
+# Fixture for testing the status hook (bin/backlog-agent-status.mjs) directly.
+# Mirrors prod: the shared backlog-status.json is gitignored, while the per-host
+# status file and history.jsonl are tracked. HOME is redirected to an empty dir
+# so the hook finds no transcript (→ zero usage) and no real user config.
+# Sets globals: REMOTE, WORK, HOOK_BIN.
+_setup_status_repo() {
+  REMOTE="$BATS_TEST_TMPDIR/remote.git"
+  WORK="$BATS_TEST_TMPDIR/work"
+  HOOK_BIN="${BATS_TEST_DIRNAME}/../bin/backlog-agent-status.mjs"
+
+  export GIT_TERMINAL_PROMPT=0
+  export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com
+  export GIT_COMMITTER_NAME=Test GIT_COMMITTER_EMAIL=test@example.com
+  export HOME="$BATS_TEST_TMPDIR/home"   # empty → no transcript, no user config
+  mkdir -p "$HOME"
+
+  git init -q --bare -b main "$REMOTE"
+  git init -q -b main "$WORK"
+  mkdir -p "$WORK/docs" "$WORK/.claude"
+  write_backlog_open_in "$WORK" "- [ ] do the thing"
+  # Mirror prod .gitignore: ignore the shared status file + logs/locks; track
+  # the per-host status file and the append-only history.
+  cat > "$WORK/.gitignore" <<'EOF'
+.claude/backlog-agent.log
+.claude/backlog-agent.lock/
+.claude/backlog-status.json
+EOF
+  git -C "$WORK" add -A
+  git -C "$WORK" commit -qm "init"
+  git -C "$WORK" remote add origin "$REMOTE"
+  git -C "$WORK" push -qu origin main
+  cd "$WORK"
+}
+
+# Invoke the real status hook. Extra args are appended.
+run_hook() {
+  run env node "$HOOK_BIN" --item "do the thing" --exit-code 0 --mode loop \
+    --pre-head "$(git -C "$WORK" rev-parse HEAD)" --pulled 0 "$@"
+}
+
 # True if the ## Open section contains an item with the given marker char.
 # Portable (no gawk match() arrays). $1 = marker, e.g. '~' or ' ' or 'x'.
 open_has_marker() {

@@ -99,6 +99,102 @@ function git(args, { allowFail = false } = {}) {
   return { status: r.status, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
+// ---------- pre-rebase autostash recovery ----------
+// The hook autostashes a dirty working tree before rebasing onto origin, then
+// pops. When this tick and another machine's tick both touched the SAME tracked,
+// hook-owned telemetry files (.claude/backlog-status*.json, backlog-history.jsonl),
+// the post-rebase `stash pop` conflicts on them — and a failed pop leaves the
+// stash ORPHANED, which silently accumulates (TaizMail: 10 orphans in 2h).
+//
+// Those files are disposable from the stash's point of view: this same run
+// rewrites the status JSONs and re-appends the history line further down. So
+// when the pop conflict is CONFINED to that ephemeral set, auto-resolve (union
+// the append-only history, take origin's status) and DROP the stash. A conflict
+// touching ANY other path is genuine work — fall back to the legacy
+// warn-and-leave so nothing the agent produced is ever silently discarded.
+// (Interim mitigation; the D1 telemetry bus removes git-borne telemetry entirely.)
+const EPHEMERAL_RE = /^\.claude\/(backlog-status.*\.json|backlog-history\.jsonl)$/;
+
+function showBlob(ref, rel) {
+  // Clean content of <rel> at <ref> ("" if the path is absent there).
+  const r = spawnSync("git", ["show", `${ref}:${rel}`], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+  });
+  return r.status === 0 ? r.stdout ?? "" : "";
+}
+
+function unionLines(a, b) {
+  // Order-preserving union of newline-delimited records (a first, then b-only),
+  // exact-duplicate lines collapsed. Used to merge the append-only history.
+  const seen = new Set();
+  const out = [];
+  for (const text of [a, b]) {
+    for (const line of text.split("\n")) {
+      if (!line || seen.has(line)) continue;
+      seen.add(line);
+      out.push(line);
+    }
+  }
+  return out.length ? `${out.join("\n")}\n` : "";
+}
+
+// Pop the pre-rebase autostash, recovering from an ephemeral-only conflict by
+// resolving + dropping the stash instead of orphaning it.
+function popAutostash() {
+  const popR = spawnSync("git", ["stash", "pop"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+  });
+  if (popR.status === 0) return;
+
+  // Pop failed — identify the unmerged (conflicted) paths.
+  const u = spawnSync("git", ["diff", "--name-only", "--diff-filter=U"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+  });
+  const paths = (u.status === 0 ? u.stdout : "")
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const allEphemeral = paths.length > 0 && paths.every((p) => EPHEMERAL_RE.test(p));
+  if (!allEphemeral) {
+    // Real or unknown conflict — never auto-discard; leave the stash for the
+    // user to recover, matching the original behavior.
+    console.error(
+      `[backlog-agent-status] stash pop after rebase failed (changes left in stash):\n${popR.stderr}`,
+    );
+    return;
+  }
+
+  // Confined to hook-owned telemetry. Resolve each conflict: union the
+  // append-only history; take origin's (HEAD's) version of the rewritten status
+  // files (the hook overwrites them again later this run regardless).
+  for (const rel of paths) {
+    const head = showBlob("HEAD", rel);
+    const merged = rel.endsWith("backlog-history.jsonl")
+      ? unionLines(head, showBlob("stash@{0}", rel))
+      : head;
+    writeFileSync(join(REPO_ROOT, rel), merged);
+    git(["add", rel], { allowFail: true });
+  }
+  // Drop the now-resolved stash so it can never orphan.
+  const dropR = spawnSync("git", ["stash", "drop"], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+  });
+  if (dropR.status !== 0) {
+    console.error(
+      `[backlog-agent-status] stash drop after ephemeral conflict resolve failed:\n${dropR.stderr}`,
+    );
+  } else {
+    console.log(
+      `[backlog-agent-status] resolved ephemeral autostash conflict (${paths.join(", ")}) and dropped stash`,
+    );
+  }
+}
+
 // ---------- transcript discovery + usage extraction ----------
 function findNewestTranscript() {
   const encoded = REPO_ROOT.replaceAll("/", "-");
@@ -510,12 +606,7 @@ async function main() {
     }
 
     if (stashed) {
-      const popR = spawnSync("git", ["stash", "pop"], { cwd: REPO_ROOT, encoding: "utf8" });
-      if (popR.status !== 0) {
-        console.error(
-          `[backlog-agent-status] stash pop after rebase failed (changes left in stash):\n${popR.stderr}`,
-        );
-      }
+      popAutostash();
     }
   }
 

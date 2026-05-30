@@ -53,6 +53,12 @@ _setup_repo() {
   # transcript + ceilings file.
   export CEILING_DISABLE=1
 
+  # Backlog-injection provenance guard (bin/backlog-agent _relocate_injected_open_items
+  # + Guard 7): disabled by default so ordinary tick tests never relocate
+  # agent-added ## Open items; injection-guard.bats re-enables it
+  # (INJECTION_GUARD_DISABLE=0).
+  export INJECTION_GUARD_DISABLE=1
+
   # Remote-unblock poll-and-apply (bin/backlog-agent process_unblock_requests /
   # _d1_unblock_get): disabled by default so ordinary tick tests never reach the
   # network; remote-unblock.bats re-enables it (REMOTE_UNBLOCK_DISABLE=0) behind a

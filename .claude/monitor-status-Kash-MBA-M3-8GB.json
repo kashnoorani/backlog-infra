@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-30T03:17:15Z",
+  "last_sweep_at": "2026-05-30T03:23:25Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M3-8GB",
-  "sweeps_total": 192,
+  "sweeps_total": 195,
   "fixed_total": 24,
   "flagged_total": 0,
   "recent_actions": [{"ts":"2026-05-29T21:04:14Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T21:04:14Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-29T22:25:50Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T01:34:18Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T02:52:30Z","project":"sacred-geography","action":"stale_lock","result":"fixed"}]

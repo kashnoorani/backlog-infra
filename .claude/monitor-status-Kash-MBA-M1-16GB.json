@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-30T11:29:25Z",
+  "last_sweep_at": "2026-05-30T11:35:33Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 1,
+  "sweeps_total": 4,
   "fixed_total": 0,
   "flagged_total": 1,
   "recent_actions": [{"ts":"2026-05-30T11:29:24Z","project":"backlog-infra","action":"git_push_rejected","result":"flagged_infra"}]

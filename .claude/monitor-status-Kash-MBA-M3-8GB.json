@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-30T11:37:51Z",
+  "last_sweep_at": "2026-05-30T11:43:59Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M3-8GB",
-  "sweeps_total": 31,
+  "sweeps_total": 34,
   "fixed_total": 0,
   "flagged_total": 0,
   "recent_actions": []

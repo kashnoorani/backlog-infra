@@ -29,6 +29,8 @@ mk_project() {
 .claude/backlog-agent.log
 .claude/backlog-agent-events.jsonl
 .claude/backlog-agent-failcounts.json
+.claude/backlog-agent-hookfail.json
+.claude/backlog-agent-budget.json
 .claude/agent-cooldown.json
 .claude/backlog-agent.lock/
 .claude/backlog-agent.tick.lock/
@@ -101,6 +103,20 @@ run_doctor() { run bash "$AGENTS_BIN" doctor; }
   [ "$status" -eq 1 ]
   [[ "$output" == *"TRACKED ephemeral file"* ]]
   [[ "$output" == *".claude/agent-cooldown.json"* ]]
+}
+
+# 5c. The doctor SSOT array (EPHEMERAL_CLAUDE_IGNORES) and the project template's
+# `.gitignore` must stay in lockstep — drift here is exactly what left
+# hookfail.json/budget.json unguarded. Assert exact equality of the `.claude/`
+# patterns, both directions, so neither side can gain an entry the other lacks.
+@test "ephemeral SSOT and template .gitignore agree" {
+  local repo="${BATS_TEST_DIRNAME}/.."
+  local ssot tmpl
+  ssot="$(sed -n '/^EPHEMERAL_CLAUDE_IGNORES=(/,/^)/p' "$repo/bin/backlog-agents" \
+          | grep -oE '"[^"]+"' | tr -d '"' | sort)"
+  tmpl="$(grep -E '^\.claude/' "$repo/templates/dev-project/.gitignore" | sort)"
+  [ -n "$ssot" ]
+  [ "$ssot" = "$tmpl" ]
 }
 
 # 6. A status hook with a syntax error → hard fail.

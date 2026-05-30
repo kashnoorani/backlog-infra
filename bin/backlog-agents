@@ -185,7 +185,9 @@ INFRA_PROJECT="${INFRA_PROJECT:-backlog-infra}"
 #     the same pop-conflict → orphan.
 # `doctor` asserts every active repo ignores all of these (hard-fail on a
 # *tracked* one, warn on untracked-unignored). `templates/dev-project/.gitignore`
-# is kept a superset of this list. Deliberately EXCLUDES the per-host status
+# carries exactly this set of `.claude/` patterns — enforced by the parity test
+# in test/doctor.bats so the two can never drift (the gap that let hookfail/budget
+# go unguarded). Deliberately EXCLUDES the per-host status
 # (`.claude/backlog-status-<host>.local.json`) and history
 # (`.claude/backlog-history.jsonl`) files, which are MEANT to be tracked — their
 # concurrent-write pop-conflicts are a separate class the D1 telemetry bus
@@ -196,6 +198,8 @@ EPHEMERAL_CLAUDE_IGNORES=(
   ".claude/backlog-agent.log"
   ".claude/backlog-agent-events.jsonl"
   ".claude/backlog-agent-failcounts.json"
+  ".claude/backlog-agent-hookfail.json"
+  ".claude/backlog-agent-budget.json"
   ".claude/agent-cooldown.json"
   ".claude/backlog-agent.lock/"
   ".claude/backlog-agent.tick.lock/"

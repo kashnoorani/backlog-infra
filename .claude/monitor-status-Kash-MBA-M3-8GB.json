@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-30T07:33:28Z",
+  "last_sweep_at": "2026-05-30T07:39:37Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M3-8GB",
-  "sweeps_total": 313,
+  "sweeps_total": 316,
   "fixed_total": 100,
   "flagged_total": 0,
   "recent_actions": [{"ts":"2026-05-30T06:25:02Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:27:08Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:29:15Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:31:22Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:33:28Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:35:35Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:37:42Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:39:49Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:41:55Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:45:20Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:50:25Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:52:30Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:54:35Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T06:56:39Z","project":"backlog-dashboard","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T07:27:18Z","project":"sacred-geography","action":"stale_lock","result":"fixed"}]

@@ -3293,9 +3293,12 @@ do_tool_profile() {
 
   # One real claude -p in the sandbox, deny-settings layered onto the user's global
   # auto-accept config (defaultMode auto) — exactly the daemon's posture. Bounded
-  # spend so a verify can never run away.
+  # spend so a verify can never run away. A DENIED tool makes claude exit non-zero
+  # (it couldn't complete the asked task); swallow that — the oracle is the file
+  # contents / on-disk state, NOT claude's exit code — so `set -e` can't abort the
+  # remaining checks mid-run.
   _tp_run() { ( cd "$sb" && "$claude_bin" -p --settings "$settings" \
-                  --max-budget-usd 0.10 "$1" </dev/null 2>&1 ); }
+                  --max-budget-usd 0.10 "$1" </dev/null 2>&1 ) || true; }
 
   local fails=0
   # 1. secret read DENIED: sentinel must NOT appear in claude's output.

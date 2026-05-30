@@ -71,12 +71,14 @@ while [[ $# -gt 0 ]]; do [[ "$1" == "--settings" ]] && { settings="$2"; shift; }
 denied() { printf '%s' "$settings" | grep -qF "$1"; }
 if [[ "$prompt" =~ ^Read\ the\ file\ ([^ ]+)\  ]]; then
   f="${BASH_REMATCH[1]}"
-  if denied "Read($f)"; then echo "I can't do that: permission denied for Read($f)"; exit 0; fi
+  # A denied tool makes real `claude -p` exit NON-ZERO (it couldn't do the task);
+  # mimic that so the harness's `set -e` tolerance (|| true) is exercised here.
+  if denied "Read($f)"; then echo "permission denied for Read($f)" >&2; exit 1; fi
   cat "$f" 2>/dev/null; exit 0
 fi
 if [[ "$prompt" =~ containing\ exactly\ ([^ ]+)\ to\ the\ file\ ([^ ]+) ]]; then
   tok="${BASH_REMATCH[1]}"; f="${BASH_REMATCH[2]%.}"   # strip trailing sentence period
-  if denied "Edit($f)"; then echo "I can't do that: permission denied for Edit($f)"; exit 0; fi
+  if denied "Edit($f)"; then echo "permission denied for Edit($f)" >&2; exit 1; fi
   printf '%s\n' "$tok" >> "$f"; echo "done"; exit 0
 fi
 echo "no-op"; exit 0

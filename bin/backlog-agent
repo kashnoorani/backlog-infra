@@ -235,6 +235,23 @@ COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
 # Set to 1 in tests / to hard-disable the account-cooldown read + publish.
 ACCOUNT_COOLDOWN_DISABLE="${ACCOUNT_COOLDOWN_DISABLE:-0}"
 
+# Remote unblock (W2, scope=item; the FIRST inbound control path — rides the same
+# D1 poll-and-apply bus as cooldown/fleet-control). A `[?]` blocker can today only
+# be answered on the machine that owns the clone (edit docs/Backlog.md + `unblock`).
+# This lets the user reply to the fleet digest (Telegram bot -> POST /api/unblock ->
+# a D1 unblock_requests row) and have the answer land in the right project's backlog
+# from outside any clone: each daemon polls GET /api/unblock?project=<self> top-of-
+# tick (jq-free body shape, node-parsed for the arbitrary answer text; FAIL-OPEN — D1
+# unreachable / no pending rows ⇒ the daemon does nothing), matches its own project,
+# locates the addressed `[?]` item (the Nth, the same ordering `unblock` prints),
+# writes the `[user]` answer into the body + flips `[?]`→`[!]`, commits/pushes, and
+# marks the row applied. Item addressing is `<project>#<index>` + an optional
+# title-prefix guard (a stale index ⇒ NO-OP + re-notify, never the wrong item).
+# docs/remote-unblock.md.
+UNBLOCK_URL="${UNBLOCK_URL:-https://kash-backlogs.pages.dev/api/unblock}"
+# Set to 1 in tests / to hard-disable the remote-unblock poll + apply.
+REMOTE_UNBLOCK_DISABLE="${REMOTE_UNBLOCK_DISABLE:-0}"
+
 # Per-tick outcome verification (W2; Guard 4 — the FIRST *vetoing* tick-guard;
 # Guards 1/2/3 are the circuit-breaker + diff-size + protected-path siblings).
 # `claude -p` exiting 0 + flipping an item to [x] is NOT proof the project's gate
@@ -804,6 +821,110 @@ auto_flip_blocked() {
   done < <(grep -nE '^(- )?\[\?\] ' "$BACKLOG_FILE" 2>/dev/null || true)
 }
 
+# --- Remote-unblock apply (W2; docs/remote-unblock.md) ---
+# Apply ONE unblock request to this project's backlog. Args: id, item_index,
+# title_prefix (may be empty), answer (decoded, may be multi-line). Locates the Nth
+# `[?]` item (the same ordering `do_unblock` prints). GUARD: if the index is out of
+# range OR a non-empty title_prefix doesn't match the Nth `[?]`'s title (the blocker
+# set shifted between the digest and the reply), it NO-OPS — re-notifies the user,
+# logs unblock_mismatch, and clears the row `mismatch` — never unblocking the wrong
+# item. On a match it writes the `[user]` answer into the item body + flips
+# `[?]`→`[!]` (so the worker retries; auto_flip_blocked is the belt-and-suspenders),
+# commits the backlog atomically + pushes (durable + fleet-visible), then clears the
+# row `applied`. set-e-safe: every fallible step is `|| …`-guarded so a transient
+# failure can't abort the tick.
+_unblock_apply() {
+  local id="$1" item_index="$2" title_prefix="$3" answer="$4"
+  [[ -f "$BACKLOG_FILE" ]] || return 0
+
+  # Enumerate [?] items as parallel line-number + stripped-title arrays (owner-stamp
+  # stripped, mirroring do_unblock / the digest scan).
+  local -a lines titles
+  while IFS=$'\t' read -r ln rest; do
+    lines+=("$ln"); titles+=("$rest")
+  done < <(awk '/^(- )?\[\?\] / { line=$0; sub(/^(- )?\[\?\] /, "", line); sub(/ *<!-- @[^>]*-->[[:space:]]*$/, "", line); print NR "\t" line }' "$BACKLOG_FILE" 2>/dev/null || true)
+  local n=${#lines[@]}
+
+  if (( item_index < 1 || item_index > n )); then
+    echo "  [unblock] request #$id: no [?] item #$item_index (have $n) — re-notifying" | tee -a "$LOG_FILE"
+    notify_send "remote-unblock: stale handle ($(_health_project))" \
+      "$(_health_project)#${item_index}: no such [?] item (have ${n} open). The blocker set changed — re-check the latest digest."
+    log_event unblock_mismatch id "$id" item_index "$item_index" have "$n" reason out_of_range
+    _d1_unblock_clear "$id" mismatch
+    return 0
+  fi
+
+  local target_line="${lines[$((item_index-1))]}" target_title="${titles[$((item_index-1))]}"
+  if [[ -n "$title_prefix" ]]; then
+    case "$target_title" in
+      "$title_prefix"*) : ;;
+      *)
+        echo "  [unblock] request #$id: title-prefix mismatch at #$item_index — re-notifying" | tee -a "$LOG_FILE"
+        notify_send "remote-unblock: stale handle ($(_health_project))" \
+          "$(_health_project)#${item_index} no longer matches '${title_prefix}…' (now: '${target_title:0:60}'). Not applied — re-check the latest digest."
+        log_event unblock_mismatch id "$id" item_index "$item_index" reason title_prefix
+        _d1_unblock_clear "$id" mismatch
+        return 0
+        ;;
+    esac
+  fi
+
+  # Flip [?]→[!] on the target line AND insert the [user] answer block right after it
+  # (string concat in awk — no regex interpretation of the answer text). Answer is
+  # passed via the environment so quotes/backslashes/newlines can't break the program.
+  local tmp; tmp="$(mktemp 2>/dev/null)" || return 0
+  if ANSWER="$answer" awk -v ln="$target_line" '
+      { if (NR==ln) {
+          line=$0; sub(/\[\?\]/, "[!]", line); print line;
+          ans=ENVIRON["ANSWER"]; nl=split(ans, arr, "\n");
+          for (i=1; i<=nl; i++) { if (i==1) print "  [user] " arr[i]; else print "  " arr[i]; }
+        } else print
+      }
+    ' "$BACKLOG_FILE" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv "$tmp" "$BACKLOG_FILE" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  else
+    rm -f "$tmp"; return 0
+  fi
+
+  echo "  [unblock] applied request #$id -> $(_health_project)#${item_index}: ${target_title:0:60}" | tee -a "$LOG_FILE"
+  log_event unblock_applied id "$id" item_index "$item_index" item "${target_title:0:80}"
+
+  # Commit + push atomically (-m BEFORE --, the arg-order gotcha; one shell call).
+  local msg; msg="remote-unblock: $(_health_project)#${item_index} answered"
+  if git -C "$PWD" commit -q -m "$msg" -- "$BACKLOG_FILE" 2>/dev/null; then
+    git -C "$PWD" push -q 2>/dev/null \
+      || echo "  [unblock] push deferred (commit landed locally; monitor/next tick carries it)" | tee -a "$LOG_FILE"
+  fi
+  _d1_unblock_clear "$id" applied
+  return 0
+}
+
+# Poll the D1 bus for THIS project's pending unblock requests and apply each. Called
+# top-of-tick (after the pull, before auto_flip_blocked) so origin is current and the
+# index matches. FAIL-OPEN throughout (no rows / unreachable ⇒ no-op). The same
+# project runs on M1+M3: a true simultaneous race is improbable (staggered ticks +
+# pull-before-apply), the clear is an idempotent CAS, and the title-prefix guard makes
+# a stale re-apply a no-op — documented in docs/remote-unblock.md.
+process_unblock_requests() {
+  [[ "$REMOTE_UNBLOCK_DISABLE" == "1" ]] && return 0
+  local out; out="$(_d1_unblock_get)" || return 0
+  [[ -n "$out" ]] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  # `|`-delimited so the empty-title_prefix middle field survives `read` (TAB IFS
+  # would collapse it). Both prefix + answer are base64 — decode each via node.
+  local id idx pfx_b64 ans_b64 pfx ans
+  while IFS='|' read -r id idx pfx_b64 ans_b64; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    [[ -n "$ans_b64" ]] || continue
+    pfx="$(printf '%s' "$pfx_b64" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>process.stdout.write(s.trim()?Buffer.from(s.trim(),"base64").toString("utf8"):""))' 2>/dev/null || true)"
+    ans="$(printf '%s' "$ans_b64" | node -e 'let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>process.stdout.write(Buffer.from(s.trim(),"base64").toString("utf8")))' 2>/dev/null || true)"
+    [[ -n "$ans" ]] || continue
+    log_event unblock_requested id "$id" item_index "$idx"
+    _unblock_apply "$id" "$idx" "$pfx" "$ans"
+  done <<< "$out"
+  return 0
+}
+
 # --- D1 heartbeat liveness (docs/reaper-switch-design.md) ---
 # Derive the (project, host) keys EXACTLY as backlog-agent-status.mjs writes
 # them, so the heartbeat read hits the same health_status row the push updates.
@@ -982,6 +1103,80 @@ _d1_account_cooldown_epoch() {
   now="$(date +%s)"
   (( now < epoch )) || return 0   # expired ⇒ no account cooldown (auto-expiry)
   printf '%s' "$epoch"
+  return 0
+}
+
+# --- Remote-unblock read (W2; docs/remote-unblock.md) ---
+# Fetch this project's PENDING unblock requests from the D1 bus and echo them, ONE
+# per line, as `id|item_index|title_prefix_b64|answer_b64`. title_prefix AND answer
+# are base64-encoded so arbitrary user text (newlines, tabs, quotes, an EMPTY prefix)
+# survives the shell round-trip, and `|` is the delimiter — a non-whitespace char
+# outside the base64 alphabet, so `read` PRESERVES an empty middle field (a TAB IFS
+# would collapse `\t\t` into one and shift the columns). Echoes NOTHING on any failure
+# / when none pending — FAIL-OPEN (the caller does nothing). The GET endpoint is public
+# + read-only; we still send the bearer when present so it can be locked down later w/o
+# a client change. Same curl idiom as the other reads, but node-parsed (not grep)
+# because the answer is arbitrary free text — node is already a hard dep here
+# (resolve_gate/resolve_ceiling).
+_d1_unblock_get() {
+  [[ "$REMOTE_UNBLOCK_DISABLE" == "1" ]] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key"
+  local auth=() key
+  if [[ -f "$key_file" ]]; then
+    key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+    [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  fi
+  local project url body http_code
+  project="$(_urlencode "$(_health_project)")"
+  url="${UNBLOCK_URL}?project=${project}"
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$url" 2>/dev/null)" || return 0
+  http_code="$(printf '%s' "$body" | tail -n1)"
+  body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$http_code" == "200" ]] || return 0
+  # node-parse the {requests:[…]} body into `id|idx|prefix_b64|answer_b64`. Any parse
+  # error or empty list ⇒ no output ⇒ fail-open. The reducer is intentionally
+  # defensive: a request missing id/item_index/answer is skipped, not fatal.
+  printf '%s' "$body" | node -e '
+    let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{
+      let o; try{o=JSON.parse(s)}catch{return}
+      const rs=(o&&Array.isArray(o.requests))?o.requests:[];
+      for(const r of rs){
+        if(r==null) continue;
+        const id=parseInt(r.id,10), idx=parseInt(r.item_index,10);
+        if(!Number.isInteger(id)||!Number.isInteger(idx)||idx<1) continue;
+        if(typeof r.answer!=="string"||!r.answer.trim()) continue;
+        const pfx=(typeof r.title_prefix==="string")?r.title_prefix:"";
+        const pb=Buffer.from(pfx,"utf8").toString("base64");
+        const ab=Buffer.from(r.answer,"utf8").toString("base64");
+        process.stdout.write(`${id}|${idx}|${pb}|${ab}\n`);
+      }
+    });
+  ' 2>/dev/null || return 0
+  return 0
+}
+
+# Mark an unblock request applied on the D1 bus (idempotent CAS 0->1 server-side).
+# $1 = row id, $2 = result tag (applied|mismatch). Backgrounded best-effort + fail-
+# open, exactly like _d1_publish_cooldown — a failed clear only means the row stays
+# pending and is retried next tick (the apply itself is guard-protected against a
+# double-write). No key ⇒ can't write ⇒ the row lingers (harmless; re-applied is a
+# no-op via the [?]→[!] guard).
+_d1_unblock_clear() {
+  [[ "$REMOTE_UNBLOCK_DISABLE" == "1" ]] && return 0
+  local id="${1:-}" result="${2:-applied}"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key" key=""
+  [[ -f "$key_file" ]] && key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+  [[ -n "$key" ]] || return 0
+  local host payload
+  host="$(_health_host)"
+  payload="$(printf '{"id":%s,"applied":1,"applied_by":"%s","result":"%s"}' "$id" "$host" "$result")"
+  ( curl -s -m 8 -X POST \
+      -H "Authorization: Bearer $key" -H "Content-Type: application/json" \
+      -d "$payload" "$UNBLOCK_URL" >/dev/null 2>&1 || true ) &
   return 0
 }
 
@@ -2082,6 +2277,11 @@ tick_once() {
       echo "  [git] pulled ${pulled} commit(s)" | tee -a "$LOG_FILE"
     fi
   fi
+
+  # Remote unblock: apply any pending unblock answers from the D1 bus (a reply to the
+  # fleet digest) into this project's backlog BEFORE the auto-flip below picks them up.
+  # Fail-open (no rows / unreachable ⇒ no-op); see docs/remote-unblock.md.
+  process_unblock_requests
 
   # Auto-flip [?] items that have [user] answers, so manual `backlog-agent unblock`
   # is only needed when the user explicitly wants to block (no answer yet).

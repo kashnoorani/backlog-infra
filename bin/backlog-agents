@@ -2873,10 +2873,15 @@ do_digest() {
     bf="$(find_backlog_file "$proj_dir")"
     local -a btitles=()
     if [[ -n "$bf" ]]; then
+      # The Nth [?] (file order) IS the <project>#<N> handle a remote-unblock reply
+      # uses (same ordering as `backlog-agent unblock`); carry the 1-based index so
+      # the reply UI / Telegram bot can name the item. See docs/remote-unblock.md.
+      local _bidx=0
       while IFS= read -r bt; do
         [[ -n "$bt" ]] || continue
+        _bidx=$((_bidx + 1))
         btitles+=("$bt")
-        blockers_list="${blockers_list}${pname}"$'\t'"${bt}"$'\n'
+        blockers_list="${blockers_list}${pname}"$'\t'"${_bidx}"$'\t'"${bt}"$'\n'
       done < <(awk '/^(- )?\[\?\] /{ line=$0; sub(/^(- )?\[\?\] /,"",line); sub(/ *<!-- @[^>]*-->$/,"",line); print line }' "$bf")
     fi
     blk=${#btitles[@]}
@@ -2959,10 +2964,10 @@ do_digest() {
   fi
 
   if [[ -n "$blockers_list" ]]; then
-    printf '\n  %sOpen [?] blockers%s (answer with: %sbacklog-agent unblock%s):\n' "$B" "$RS" "$DIM" "$RS"
-    while IFS=$'\t' read -r p t; do
+    printf '\n  %sOpen [?] blockers%s (answer locally: %sbacklog-agent unblock%s — or reply %s<project>#<N> your answer%s):\n' "$B" "$RS" "$DIM" "$RS" "$DIM" "$RS"
+    while IFS=$'\t' read -r p idx t; do
       [[ -n "$p" ]] || continue
-      printf '    %s[%s]%s %s\n' "$DIM" "$p" "$RS" "${t:0:90}"
+      printf '    %s%s#%s%s %s\n' "$DIM" "$p" "$idx" "$RS" "${t:0:90}"
     done < <(printf '%s' "$blockers_list")
   fi
   if [[ -n "$completions_list" ]]; then
@@ -2978,10 +2983,10 @@ do_digest() {
   if (( do_notify )); then
     local body="Fleet (last ${period_label}): ${f_done} completed, ${f_ticks} ticks, $(fmt_tok "$f_tokens") tokens, ${f_blk} open [?] blocker(s)."
     if [[ -n "$blockers_list" ]]; then
-      body="${body}"$'\n'"Blockers:"
-      while IFS=$'\t' read -r p t; do
+      body="${body}"$'\n'"Blockers (reply '<project>#<N> your answer' to unblock):"
+      while IFS=$'\t' read -r p idx t; do
         [[ -n "$p" ]] || continue
-        body="${body}"$'\n'"  [${p}] ${t:0:80}"
+        body="${body}"$'\n'"  ${p}#${idx} ${t:0:80}"
       done < <(printf '%s' "$blockers_list")
     fi
     notify_send "backlog-agents digest (${period_label})" "$body"

@@ -53,6 +53,12 @@ _setup_repo() {
   # transcript + ceilings file.
   export CEILING_DISABLE=1
 
+  # Remote-unblock poll-and-apply (bin/backlog-agent process_unblock_requests /
+  # _d1_unblock_get): disabled by default so ordinary tick tests never reach the
+  # network; remote-unblock.bats re-enables it (REMOTE_UNBLOCK_DISABLE=0) behind a
+  # curl stub + seeded /api/unblock response.
+  export REMOTE_UNBLOCK_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

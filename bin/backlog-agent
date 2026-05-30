@@ -1211,38 +1211,12 @@ JSON
 # Both the plan-limit cooldown alert (notify_cooldown) and the dead-man's-switch
 # (_hookfail_record) route through here so there's exactly ONE config + code path.
 # The CLI monitor's _notify (bin/backlog-agents) reads the SAME canonical file.
-# Usage: notify_send "<title>" "<body>"  (title = Slack prefix + email subject).
-notify_send() {
-  local title="${1:-backlog-agent}" body="${2:-}"
-  [[ -n "$body" ]] || return 0
-  [[ -f "$NOTIFY_CONFIG" ]] || return 0
-  local slack_url email local_notify
-  slack_url="$(grep -oE '"slack_webhook_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$NOTIFY_CONFIG" 2>/dev/null \
-              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
-  email="$(grep -oE '"email"[[:space:]]*:[[:space:]]*"[^"]*"' "$NOTIFY_CONFIG" 2>/dev/null \
-              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
-  local_notify="$(grep -oE '"local_notify"[[:space:]]*:[[:space:]]*(true|false)' "$NOTIFY_CONFIG" 2>/dev/null \
-              | grep -oE '(true|false)$' | head -n1 || true)"
-  [[ -z "$slack_url" && -z "$email" && "$local_notify" != "true" ]] && return 0
-  if [[ -n "$slack_url" ]] && command -v curl >/dev/null 2>&1; then
-    # JSON-escape backslash + double-quote in our own controlled text (jq-free).
-    local esc payload
-    esc="$(printf '%s' "${title}: ${body}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-    payload="$(printf '{"text":"%s"}' "$esc")"
-    ( curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
-        --data "$payload" "$slack_url" >/dev/null 2>&1 || true ) &
-  fi
-  if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
-    ( printf '%s\n' "$body" | mail -s "$title" "$email" >/dev/null 2>&1 || true ) &
-  fi
-  if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
-    local osbody ostitle
-    osbody="$(printf '%s' "$body" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-    ostitle="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
-    ( osascript -e "display notification \"${osbody}\" with title \"${ostitle}\"" >/dev/null 2>&1 || true ) &
-  fi
-  return 0
-}
+# Usage: notify_send "<title>" "<body>"  (title = Slack/Telegram prefix + email subject).
+#
+# notify_send now lives in bin/_lib.sh (shared with the CLI's `digest`) so the
+# transport set — Slack / Telegram / email / macOS-local — has ONE definition.
+# NOTIFY_CONFIG (set above) is read by the shared function via its ${NOTIFY_CONFIG}
+# default. See _lib.sh for the implementation.
 
 # Fire the plan-limit cooldown alert (Layer 2). Thin wrapper over notify_send so
 # the cooldown alert and the dead-man's-switch share one config + code path.

@@ -120,3 +120,57 @@ prepush_hook_is_current() {
   [[ -s "$hook" ]] || return 1
   grep -q "${PREPUSH_HOOK_MARKER} (version ${PREPUSH_HOOK_VERSION})" "$hook" 2>/dev/null
 }
+
+# --- Outbound notify channel (W2; docs/dead-mans-switch.md, docs/fleet-digest.md) ---
+# ONE shared sender for every surfacing primitive — the DRIVER's alerts
+# (cooldown, dead-man's-switch, budget cap, circuit-breaker trip) AND the CLI's
+# digest. Reads the canonical config ~/.claude/agent-notify.json (override with
+# $NOTIFY_CONFIG): "slack_webhook_url" / "email" / "telegram_bot_token" +
+# "telegram_chat_id" / "local_notify". jq-free (grep/sed extract over our own
+# controlled keys). Every transport is best-effort + backgrounded so a slow/dead
+# endpoint can never block or abort a tick; an empty config is a silent no-op.
+# Usage: notify_send "<title>" "<body>"  (title = Slack/Telegram prefix + email subject).
+notify_send() {
+  local title="${1:-backlog-agent}" body="${2:-}"
+  local cfg="${NOTIFY_CONFIG:-$HOME/.claude/agent-notify.json}"
+  [[ -n "$body" ]] || return 0
+  [[ -f "$cfg" ]] || return 0
+  local slack_url email local_notify tg_token tg_chat
+  slack_url="$(grep -oE '"slack_webhook_url"[[:space:]]*:[[:space:]]*"[^"]*"' "$cfg" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  email="$(grep -oE '"email"[[:space:]]*:[[:space:]]*"[^"]*"' "$cfg" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  local_notify="$(grep -oE '"local_notify"[[:space:]]*:[[:space:]]*(true|false)' "$cfg" 2>/dev/null \
+              | grep -oE '(true|false)$' | head -n1 || true)"
+  tg_token="$(grep -oE '"telegram_bot_token"[[:space:]]*:[[:space:]]*"[^"]*"' "$cfg" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"([^"]*)".*/\1/' | head -n1 || true)"
+  # chat_id may be a quoted string OR an unquoted (possibly negative, for groups) number.
+  tg_chat="$(grep -oE '"telegram_chat_id"[[:space:]]*:[[:space:]]*"?-?[0-9A-Za-z_]+"?' "$cfg" 2>/dev/null \
+              | sed -E 's/.*:[[:space:]]*"?(-?[0-9A-Za-z_]+)"?.*/\1/' | head -n1 || true)"
+  [[ -z "$slack_url" && -z "$email" && -z "$tg_token" && "$local_notify" != "true" ]] && return 0
+  if [[ -n "$slack_url" ]] && command -v curl >/dev/null 2>&1; then
+    # JSON-escape backslash + double-quote in our own controlled text (jq-free).
+    local esc payload
+    esc="$(printf '%s' "${title}: ${body}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    payload="$(printf '{"text":"%s"}' "$esc")"
+    ( curl -fsS -m 10 -X POST -H 'Content-Type: application/json' \
+        --data "$payload" "$slack_url" >/dev/null 2>&1 || true ) &
+  fi
+  if [[ -n "$tg_token" && -n "$tg_chat" ]] && command -v curl >/dev/null 2>&1; then
+    # Telegram Bot API sendMessage; --data-urlencode handles all escaping (jq-free).
+    ( curl -fsS -m 10 -X POST \
+        --data-urlencode "chat_id=${tg_chat}" \
+        --data-urlencode "text=${title}: ${body}" \
+        "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true ) &
+  fi
+  if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
+    ( printf '%s\n' "$body" | mail -s "$title" "$email" >/dev/null 2>&1 || true ) &
+  fi
+  if [[ "$local_notify" == "true" ]] && command -v osascript >/dev/null 2>&1; then
+    local osbody ostitle
+    osbody="$(printf '%s' "$body" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    ostitle="$(printf '%s' "$title" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+    ( osascript -e "display notification \"${osbody}\" with title \"${ostitle}\"" >/dev/null 2>&1 || true ) &
+  fi
+  return 0
+}

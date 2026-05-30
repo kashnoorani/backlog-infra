@@ -84,6 +84,23 @@
 #                         APPROXIMATED as a tick with exit_code==0 AND a non-empty
 #                         work_commit. --json emits a machine-readable object.
 #
+#   backlog-agents digest [--period day|week] [--json] [--no-notify]
+#                         Automated fleet digest (the notify-channel consumer):
+#                         per-project completions / ticks / token spend THIS period
+#                         + open [?] blockers (the actionable unblock targets) + a
+#                         fleet roll-up, from each project's local per-tick ledger.
+#                         Pushes the summary via the shared notify channel
+#                         (~/.claude/agent-notify.json: macOS-local + Slack/Telegram/
+#                         email). --period day = last 24h (default), week = last 7d.
+#                         --json emits a machine-readable object; --no-notify renders
+#                         to stdout only (preview).
+#
+#   backlog-agents install-digest [--uninstall]
+#                         Install two launchd timers on this machine: a DAILY digest
+#                         (~09:00) and a WEEKLY roll-up (Mondays ~09:00). The digest
+#                         reads LOCAL ledgers, so it runs where the daemons run.
+#                         --uninstall (or `uninstall-digest`) removes both.
+#
 #   backlog-agents daemon-sync [--interval <seconds>] [--once]
 #                       Run `backlog-agents sync` in a loop, keeping all projects
 #                       pulled and agents healthy. Default interval is 86400s
@@ -2755,6 +2772,343 @@ do_metrics() {
   return 0
 }
 
+# ---- subcommand: digest ----
+# Automated fleet digest (W2; docs/fleet-digest.md) — the notify-channel consumer.
+# Renders "what each project accomplished THIS period": period-windowed
+# completions / ticks / token spend + open [?] blockers (the actionable unblock
+# targets) + a fleet roll-up, from each project's LOCAL per-tick ledger
+# (.claude/backlog-history.jsonl, same source as `metrics`), and surfaces it via
+# the shared notify_send (macOS-local + Slack/Telegram/email per agent-notify.json).
+#   --period day  -> last 24h    --period week -> last 7d   (default: day)
+#   --json        -> machine-readable object
+#   --no-notify   -> render to stdout only, no push (preview / tests)
+do_digest() {
+  local json=0 period="day" do_notify=1 a
+  while (( $# )); do
+    a="$1"
+    case "$a" in
+      --json)       json=1 ;;
+      --no-notify)  do_notify=0 ;;
+      --period)     shift; period="${1:-day}" ;;
+      --period=*)   period="${a#--period=}" ;;
+      day|week)     period="$a" ;;
+      *) echo "backlog-agents digest: unknown flag: $a" >&2; exit 2 ;;
+    esac
+    shift
+  done
+  local since_secs period_label
+  case "$period" in
+    day)  since_secs=86400;  period_label="24h" ;;
+    week) since_secs=604800; period_label="7d"  ;;
+    *) echo "backlog-agents digest: --period must be 'day' or 'week'" >&2; exit 2 ;;
+  esac
+  local now since
+  now="$(date +%s)"
+  since=$(( now - since_secs ))
+
+  # Project discovery — identical to do_metrics/snapshot (walk roots, dedupe realpath).
+  local -a candidates=() unique=()
+  local root proj_dir
+  for root in "${PROJECTS_ROOTS[@]}"; do
+    [[ -d "$root" ]] || continue
+    for proj_dir in "$root"/*/; do
+      [[ -d "$proj_dir" ]] || continue
+      candidates+=("${proj_dir%/}")
+    done
+  done
+  local seen='|' real
+  for proj_dir in "${candidates[@]:-}"; do
+    [[ -n "$proj_dir" ]] || continue
+    real="$(cd "$proj_dir" 2>/dev/null && pwd -P)" || continue
+    case "$seen" in *"|$real|"*) continue ;; esac
+    seen="${seen}${real}|"
+    unique+=("$real")
+  done
+
+  # Per-project windowed jq: rows whose ts >= $since. Emits a compact JSON object
+  # {ticks,ok,done,tokens,items:[completed item titles]}. ts may carry millis
+  # (".086Z") which fromdateiso8601 rejects, so strip the fractional part first;
+  # any unparseable ts sorts to epoch 0 (excluded) via the try/catch.
+  local jq_prog='
+    ($since|tonumber) as $since
+    | [ .[]
+        | ((try (((.ts // "") | gsub("\\.[0-9]+Z$";"Z")) | fromdateiso8601) catch 0)) as $e
+        | select($e >= $since) ] as $rs
+    | ($rs | length) as $ticks
+    | ([$rs[] | select((.exit_code // 1) == 0)] | length) as $ok
+    | ([$rs[] | select((.exit_code // 1) == 0
+                       and ((.work_commit // "") | tostring) != ""
+                       and ((.work_commit // "") | tostring) != "null")]) as $done_rows
+    | ($done_rows | length) as $done
+    | ([$rs[] | .tokens // 0] | add // 0) as $tokens
+    | ($done_rows | map(.item // "" | tostring) | map(select(. != "")) | unique) as $items
+    | {ticks:$ticks, ok:$ok, done:$done, tokens:$tokens, items:$items}
+  '
+
+  # Per-project parallel arrays + fleet accumulators.
+  local -a d_name=() d_ticks=() d_done=() d_tokens=() d_blk=() d_obj=()
+  local f_ticks=0 f_done=0 f_tokens=0 f_ok=0 f_blk=0
+  # Newline-delimited "project<TAB>item" accumulators for the body lists.
+  local completions_list="" blockers_list=""
+
+  local pname hist obj ticks ok done_ tokens bf blk bt it
+  for proj_dir in "${unique[@]:-}"; do
+    [[ -n "$proj_dir" ]] || continue
+    pname="$(basename "$proj_dir")"
+    hist="$(find_history_file "$proj_dir")"
+    if [[ -n "$hist" ]]; then
+      obj="$(jq -s -c --arg since "$since" "$jq_prog" "$hist" 2>/dev/null || echo '{}')"
+    else
+      obj='{}'
+    fi
+    [[ -n "$obj" ]] || obj='{}'
+    read -r ticks ok done_ tokens <<< "$(printf '%s' "$obj" \
+      | jq -r '"\(.ticks // 0) \(.ok // 0) \(.done // 0) \(.tokens // 0)"' 2>/dev/null || echo '0 0 0 0')"
+    [[ "$ticks"  =~ ^[0-9]+$ ]] || ticks=0
+    [[ "$ok"     =~ ^[0-9]+$ ]] || ok=0
+    [[ "$done_"  =~ ^[0-9]+$ ]] || done_=0
+    [[ "$tokens" =~ ^[0-9]+$ ]] || tokens=0
+
+    # Open [?] blockers from the project's backlog (anywhere; mirrors `unblock`).
+    bf="$(find_backlog_file "$proj_dir")"
+    local -a btitles=()
+    if [[ -n "$bf" ]]; then
+      while IFS= read -r bt; do
+        [[ -n "$bt" ]] || continue
+        btitles+=("$bt")
+        blockers_list="${blockers_list}${pname}"$'\t'"${bt}"$'\n'
+      done < <(awk '/^(- )?\[\?\] /{ line=$0; sub(/^(- )?\[\?\] /,"",line); sub(/ *<!-- @[^>]*-->$/,"",line); print line }' "$bf")
+    fi
+    blk=${#btitles[@]}
+
+    # Nothing happened AND nothing blocked ⇒ skip (no signal to report).
+    (( ticks == 0 && blk == 0 )) && continue
+
+    # Completed-item titles for the body list.
+    if [[ -n "$hist" ]]; then
+      while IFS= read -r it; do
+        [[ -n "$it" ]] || continue
+        completions_list="${completions_list}${pname}"$'\t'"${it}"$'\n'
+      done < <(printf '%s' "$obj" | jq -r '.items[]?' 2>/dev/null || true)
+    fi
+
+    d_name+=("$pname"); d_ticks+=("$ticks"); d_done+=("$done_")
+    d_tokens+=("$tokens"); d_blk+=("$blk"); d_obj+=("$obj")
+    f_ticks=$(( f_ticks + ticks )); f_ok=$(( f_ok + ok ))
+    f_done=$(( f_done + done_ )); f_tokens=$(( f_tokens + tokens )); f_blk=$(( f_blk + blk ))
+  done
+
+  if (( json )); then
+    local proj_json="[]" i
+    if (( ${#d_name[@]} )); then
+      for i in "${!d_name[@]}"; do
+        proj_json="$(jq -c \
+          --arg name "${d_name[$i]}" \
+          --argjson obj "${d_obj[$i]}" \
+          --argjson blocked "${d_blk[$i]}" \
+          '. + [{
+             project: $name,
+             ticks: ($obj.ticks // 0),
+             completed: ($obj.done // 0),
+             tokens: ($obj.tokens // 0),
+             blocked: $blocked,
+             completions: ($obj.items // []),
+             success_rate: (if ($obj.ticks // 0) > 0 then (($obj.ok // 0) / $obj.ticks) else null end)
+           }]' <<< "$proj_json")"
+      done
+    fi
+    jq -n \
+      --arg period "$period" \
+      --argjson window_secs "$since_secs" \
+      --argjson since_epoch "$since" \
+      --argjson projects "$proj_json" \
+      --argjson ticks "$f_ticks" \
+      --argjson completed "$f_done" \
+      --argjson tokens "$f_tokens" \
+      --argjson ok "$f_ok" \
+      --argjson blocked "$f_blk" \
+      '{
+         period: $period,
+         window_secs: $window_secs,
+         since_epoch: $since_epoch,
+         note: "completion APPROXIMATED as exit_code==0 AND non-empty work_commit; period-windowed by ledger ts",
+         projects: $projects,
+         fleet: {
+           ticks: $ticks, completed: $completed, tokens: $tokens, blocked: $blocked,
+           success_rate: (if $ticks > 0 then ($ok / $ticks) else null end)
+         }
+       }'
+    return 0
+  fi
+
+  # --- text report ---
+  printf '%sDIGEST%s  %s(last %s)%s\n' "${B}${CY}" "$RS" "$DIM" "$period_label" "$RS"
+  if (( ${#d_name[@]} == 0 )); then
+    printf '\n  %sNo project activity or open [?] blockers in the last %s.%s\n' "$DIM" "$period_label" "$RS"
+  else
+    echo
+    printf '  %s%-18s %-6s %-7s %-10s %-8s%s\n' "$DIM" "PROJECT" "DONE" "TICKS" "TOKENS" "BLOCKED" "$RS"
+    local i
+    for i in "${!d_name[@]}"; do
+      printf '  %-18s %-6s %-7s %-10s %-8s\n' \
+        "${d_name[$i]}" "${d_done[$i]}" "${d_ticks[$i]}" \
+        "$(fmt_tok "${d_tokens[$i]}")" "${d_blk[$i]}"
+    done
+    printf '  %s%-18s %-6s %-7s %-10s %-8s%s\n' \
+      "$B" "FLEET" "$f_done" "$f_ticks" "$(fmt_tok "$f_tokens")" "$f_blk" "$RS"
+  fi
+
+  if [[ -n "$blockers_list" ]]; then
+    printf '\n  %sOpen [?] blockers%s (answer with: %sbacklog-agent unblock%s):\n' "$B" "$RS" "$DIM" "$RS"
+    while IFS=$'\t' read -r p t; do
+      [[ -n "$p" ]] || continue
+      printf '    %s[%s]%s %s\n' "$DIM" "$p" "$RS" "${t:0:90}"
+    done < <(printf '%s' "$blockers_list")
+  fi
+  if [[ -n "$completions_list" ]]; then
+    printf '\n  %sCompletions this period:%s\n' "$B" "$RS"
+    while IFS=$'\t' read -r p t; do
+      [[ -n "$p" ]] || continue
+      printf '    %s[%s]%s %s\n' "$DIM" "$p" "$RS" "${t:0:90}"
+    done < <(printf '%s' "$completions_list")
+  fi
+  echo
+
+  # --- push via the shared notify channel ---
+  if (( do_notify )); then
+    local body="Fleet (last ${period_label}): ${f_done} completed, ${f_ticks} ticks, $(fmt_tok "$f_tokens") tokens, ${f_blk} open [?] blocker(s)."
+    if [[ -n "$blockers_list" ]]; then
+      body="${body}"$'\n'"Blockers:"
+      while IFS=$'\t' read -r p t; do
+        [[ -n "$p" ]] || continue
+        body="${body}"$'\n'"  [${p}] ${t:0:80}"
+      done < <(printf '%s' "$blockers_list")
+    fi
+    notify_send "backlog-agents digest (${period_label})" "$body"
+  fi
+  return 0
+}
+
+# ---- subcommand: install-digest / uninstall-digest ----
+# Two launchd StartCalendarInterval timers on this machine: a DAILY digest
+# (`digest --period day`, ~09:00) and a WEEKLY roll-up (`digest --period week`,
+# Mondays ~09:00). Mirrors install-monitor (xml_escape, replace-if-present,
+# bootstrap). The digest reads LOCAL ledgers, so it runs where the daemons run.
+_install_digest_timer() {
+  local suffix="$1" period="$2" cal_xml="$3"
+  local label="com.${USER}.backlog-agents-digest-${suffix}"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local bin_path; bin_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+
+  if [[ -f "$plist" ]]; then
+    info "replacing existing ${label} plist"
+    launchctl bootout "gui/$(id -u)/${label}" 2>/dev/null || true
+    local i=0
+    while launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1 && (( i < 10 )); do
+      sleep 1; i=$((i + 1))
+    done
+  fi
+
+  local label_x bin_path_x home_x bin_dir_x bin_dir
+  label_x="$(xml_escape "$label")"
+  bin_path_x="$(xml_escape "$bin_path")"
+  bin_dir="$(dirname "$bin_path")"; bin_dir_x="$(xml_escape "$bin_dir")"
+  home_x="$(xml_escape "$HOME")"
+
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${label_x}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>${bin_path_x}</string>
+        <string>digest</string>
+        <string>--period</string>
+        <string>${period}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>${home_x}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+${cal_xml}
+
+    <key>StandardOutPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-digest-${suffix}.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${home_x}/Library/Logs/backlog-agents-digest-${suffix}.stderr.log</string>
+</dict>
+</plist>
+EOF
+
+  if ! launchctl bootstrap "gui/$(id -u)" "$plist"; then
+    echo "backlog-agents: bootstrap failed for ${label}. plist is at $plist." >&2
+    return 1
+  fi
+  ok "installed ${label} (period=${period})"
+  info "  plist: ${plist}"
+}
+
+do_install_digest() {
+  local uninstall=0 a
+  for a in "$@"; do
+    case "$a" in
+      --uninstall) uninstall=1 ;;
+      *) echo "backlog-agents install-digest: unknown flag: $a" >&2; exit 2 ;;
+    esac
+  done
+  if (( uninstall )); then do_uninstall_digest; return; fi
+
+  local daily_cal weekly_cal
+  daily_cal='    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>'
+  weekly_cal='    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key><integer>1</integer>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>'
+
+  _install_digest_timer daily  day  "$daily_cal"
+  _install_digest_timer weekly week "$weekly_cal"
+  info "  preview now: backlog-agents digest --period day --no-notify"
+  info "  logs: ~/Library/Logs/backlog-agents-digest-{daily,weekly}.{stdout,stderr}.log"
+}
+
+do_uninstall_digest() {
+  local s label plist
+  for s in daily weekly; do
+    label="com.${USER}.backlog-agents-digest-${s}"
+    plist="$HOME/Library/LaunchAgents/${label}.plist"
+    if launchctl print "gui/$(id -u)/${label}" >/dev/null 2>&1; then
+      launchctl bootout "gui/$(id -u)/${label}" || true
+      ok "booted out ${label}"
+    fi
+    if [[ -f "$plist" ]]; then
+      rm "$plist"; ok "removed ${plist}"
+    else
+      info "no plist at ${plist}; nothing to remove."
+    fi
+  done
+}
+
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
@@ -2774,6 +3128,9 @@ case "$cmd" in
   start) shift; do_start "$@" ;;
   cooldown) shift; do_cooldown "$@" ;;
   metrics) shift; do_metrics "$@" ;;
+  digest) shift; do_digest "$@" ;;
+  install-digest) shift; do_install_digest "$@" ;;
+  uninstall-digest) do_uninstall_digest ;;
   daemon-sync) shift; do_daemon_sync "$@" ;;
   install-watchdog) do_install_watchdog ;;
   uninstall-watchdog) do_uninstall_watchdog ;;

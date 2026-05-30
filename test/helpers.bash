@@ -59,6 +59,12 @@ _setup_repo() {
   # (INJECTION_GUARD_DISABLE=0).
   export INJECTION_GUARD_DISABLE=1
 
+  # Deny-by-default autonomous tool/permission profile (bin/backlog-agent
+  # build_tool_profile_settings): OPT-IN, so already off by default. Pin it to 0
+  # explicitly so a stray env var can't leak the --settings injection into ordinary
+  # tick tests; tool-profile.bats re-enables it (AUTONOMOUS_TOOL_PROFILE=1).
+  export AUTONOMOUS_TOOL_PROFILE=0
+
   # Remote-unblock poll-and-apply (bin/backlog-agent process_unblock_requests /
   # _d1_unblock_get): disabled by default so ordinary tick tests never reach the
   # network; remote-unblock.bats re-enables it (REMOTE_UNBLOCK_DISABLE=0) behind a

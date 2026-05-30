@@ -358,6 +358,22 @@ CEILING_DISABLE="${CEILING_DISABLE:-0}"
 # preventive twin. Set to 1 in tests / to hard-disable the relocation guard.
 INJECTION_GUARD_DISABLE="${INJECTION_GUARD_DISABLE:-0}"
 
+# Deny-by-default autonomous tool/permission profile (W1, docs/threat-model.md §5).
+# The PREVENTIVE input-side complement to Guard 7 + the §4.3 prompt firewall: even
+# if a poisoned instruction slips past the firewall, the autonomous `claude -p`
+# tick runs under a tightened profile (injected via --settings) that DENIES the
+# obvious exfiltration / tampering paths — the model's network tools + common Bash
+# egress commands, reads of secret paths (~/.ssh, ~/.aws, health-key, .env), and
+# writes to the PROTECTED_PATHS shared-driver files (the preventive twin of the
+# detective Guard 3). Note `permissions.deny` always wins over allow and LAYERS
+# onto the daemon's existing config, so we add only deny rules (no defaultMode) —
+# the headless auto-accept the daemon relies on is untouched. Riskier than the
+# other guards (a too-broad deny would silently break ticks), so unlike the
+# default-enabled *_DISABLE flags this one is OPT-IN: default 0 (off); set to 1 to
+# apply the profile. The Layer-3 fallback agent is a different CLI and is left
+# unprofiled this slice. docs/tool-profile.md.
+AUTONOMOUS_TOOL_PROFILE="${AUTONOMOUS_TOOL_PROFILE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -2037,6 +2053,40 @@ resolve_ceiling() {
   return 0
 }
 
+# Emit the deny-by-default autonomous tool-profile settings JSON on stdout (no jq —
+# the rule strings are simple, no escaping needed). Passed inline to `claude -p`
+# via --settings when AUTONOMOUS_TOOL_PROFILE=1. docs/threat-model.md §5 /
+# docs/tool-profile.md. We emit ONLY permissions.deny (deny wins over allow and the
+# inline settings LAYER onto the daemon's existing config), so the daemon's headless
+# auto-accept and its git allow-list are untouched. Three deny classes:
+#   * network egress — the model's WebFetch/WebSearch tools + the common Bash
+#     exfil commands (a true git-remotes+D1-only allowlist isn't expressible here,
+#     and a blanket no-network Bash sandbox would break `git push`; residual
+#     egress is backstopped by the secret-scan pre-push + diff-size guards).
+#   * secret paths — reads of ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/backlog
+#     (the health-key), and .env files.
+#   * protected paths — Edit/Write to each PROTECTED_PATHS file (the preventive
+#     twin of the detective Guard 3; exact repo-relative names, so a project's own
+#     unrelated bin/ tooling stays writable).
+build_tool_profile_settings() {
+  local -a deny=(
+    WebFetch WebSearch
+    "Bash(curl:*)" "Bash(wget:*)" "Bash(nc:*)" "Bash(ncat:*)" "Bash(telnet:*)"
+    "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
+    "Read(~/.config/backlog/**)" "Read(.env)" "Read(./.env)" "Read(**/.env)"
+  )
+  local p
+  for p in $PROTECTED_PATHS; do
+    deny+=( "Edit(${p})" "Write(${p})" )
+  done
+  local json='' sep='' r
+  for r in "${deny[@]}"; do
+    json+="${sep}\"${r}\""
+    sep=','
+  done
+  printf '{"permissions":{"deny":[%s]}}' "$json"
+}
+
 # Read THIS tick's actual turns + headline tokens from claude's newest session
 # transcript into the globals USAGE_TURNS / USAGE_TOKENS (empty ⇒ unreadable ⇒
 # the caller FAILS OPEN). Mirrors backlog-agent-status.mjs findNewestTranscript +
@@ -2628,6 +2678,15 @@ tick_once() {
   else
     use_fallback=""; agent_name="claude"
     agent_cmd=( claude -p --fallback-model claude-haiku-4-5 )
+    # Preventive deny-by-default tool/permission profile (opt-in; docs/threat-model.md
+    # §5). Inject the constrained --settings so an injection that slips past the
+    # firewall still can't reach the network / read secrets / rewrite the shared
+    # driver. Only the `claude` path is profiled (the fallback agent is a different
+    # CLI, left unprofiled this slice).
+    if [[ "$AUTONOMOUS_TOOL_PROFILE" == "1" ]]; then
+      agent_cmd+=( --settings "$(build_tool_profile_settings)" )
+      log_event tool_profile_applied item "$item_title"
+    fi
     # Preventive per-item SPEND cap: claude self-stops when predicted spend would
     # exceed the budget (saves the runaway tick's tail). Only the native dollar cap
     # exists in this CLI (no --max-turns); turns/tokens are caught post-hoc below.

@@ -837,6 +837,26 @@ async function main() {
   const delays = [0, 2000, 4000, 8000, 16000];
   for (let i = 0; i < delays.length; i++) {
     if (delays[i] > 0) await sleep(delays[i]);
+    // Pull before each push to reconcile cross-machine divergence. Without this
+    // a non-fast-forward rejection burns all retries on a stale HEAD — the push
+    // is re-attempted 5× against an origin that has already advanced past our
+    // commit's parent. On rebase conflict, reset to origin (the hook's commit is
+    // idempotent; it will be re-created next tick).
+    const pull = spawnSync("git", ["pull", "--rebase", "origin", branch], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      timeout: 30000,
+    });
+    if (pull.status !== 0) {
+      console.error(`[backlog-agent-status] git pull --rebase failed:\n${pull.stderr}`);
+      spawnSync("git", ["reset", "--hard", `origin/${branch}`], {
+        cwd: REPO_ROOT,
+        encoding: "utf8",
+        timeout: 10000,
+      });
+      console.log(`[backlog-agent-status] reset to origin/${branch}; commit discarded`);
+      return;
+    }
     const r = spawnSync("git", ["push", "origin", branch], {
       cwd: REPO_ROOT,
       encoding: "utf8",

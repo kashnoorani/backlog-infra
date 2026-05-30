@@ -183,11 +183,11 @@ HOOKFAIL_STATE_FILE="${STATE_DIR}/backlog-agent-hookfail.json"
 DIFF_SIZE_MAX_FILES=20
 DIFF_SIZE_MAX_LINES=400
 
-# Protected-path guardrail (W2). If a tick's changes touch any of these
-# load-bearing infra files, log_event protected_path_touched and flag for
-# review. Belt-and-suspenders against an automated tick rewriting its own
-# machinery or release/ignore config. Space-separated repo-relative paths.
-PROTECTED_PATHS="bin/backlog-agent bin/backlog-agent-status.mjs release.mjs CLAUDE.md .gitignore"
+# Protected-path guardrail (W2). PROTECTED_PATHS now lives in bin/_lib.sh (sourced
+# above) so the detective Guard 3 check here and the preventive §5 tool-profile
+# deny set (build_tool_profile_settings, also in _lib.sh) share ONE list. If a
+# tick's changes touch any of these load-bearing infra files, log_event
+# protected_path_touched and flag for review. Space-separated repo-relative paths.
 
 # Fleet control: freeze / pause / stop (W3, docs/fleet-freeze.md). Because bin/ is
 # SHARED, a fleet-affecting infra change in flight should hold the REST of the
@@ -2088,39 +2088,10 @@ resolve_ceiling() {
   return 0
 }
 
-# Emit the deny-by-default autonomous tool-profile settings JSON on stdout (no jq —
-# the rule strings are simple, no escaping needed). Passed inline to `claude -p`
-# via --settings when AUTONOMOUS_TOOL_PROFILE=1. docs/threat-model.md §5 /
-# docs/tool-profile.md. We emit ONLY permissions.deny (deny wins over allow and the
-# inline settings LAYER onto the daemon's existing config), so the daemon's headless
-# auto-accept and its git allow-list are untouched. Three deny classes:
-#   * network egress — the model's WebFetch/WebSearch tools + the common Bash
-#     exfil commands (a true git-remotes+D1-only allowlist isn't expressible here,
-#     and a blanket no-network Bash sandbox would break `git push`; residual
-#     egress is backstopped by the secret-scan pre-push + diff-size guards).
-#   * secret paths — reads of ~/.ssh, ~/.aws, ~/.gnupg, ~/.config/backlog
-#     (the health-key), and .env files.
-#   * protected paths — Edit/Write to each PROTECTED_PATHS file (the preventive
-#     twin of the detective Guard 3; exact repo-relative names, so a project's own
-#     unrelated bin/ tooling stays writable).
-build_tool_profile_settings() {
-  local -a deny=(
-    WebFetch WebSearch
-    "Bash(curl:*)" "Bash(wget:*)" "Bash(nc:*)" "Bash(ncat:*)" "Bash(telnet:*)"
-    "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
-    "Read(~/.config/backlog/**)" "Read(.env)" "Read(./.env)" "Read(**/.env)"
-  )
-  local p
-  for p in $PROTECTED_PATHS; do
-    deny+=( "Edit(${p})" "Write(${p})" )
-  done
-  local json='' sep='' r
-  for r in "${deny[@]}"; do
-    json+="${sep}\"${r}\""
-    sep=','
-  done
-  printf '{"permissions":{"deny":[%s]}}' "$json"
-}
+# build_tool_profile_settings() — emits the deny-by-default --settings JSON injected
+# into the autonomous `claude -p` when AUTONOMOUS_TOOL_PROFILE=1 — now lives in
+# bin/_lib.sh (sourced above), shared with the CLI's `tool-profile --verify/--show`
+# so the deny set has ONE definition. docs/threat-model.md §5 / docs/tool-profile.md.
 
 # Read THIS tick's actual turns + headline tokens from claude's newest session
 # transcript into the globals USAGE_TURNS / USAGE_TOKENS (empty ⇒ unreadable ⇒
@@ -3459,6 +3430,14 @@ do_install_daemon() {
   project_root_x="$(xml_escape "$project_root")"
   home_x="$(xml_escape "$HOME")"
 
+  # §5 tool-profile flip-on (docs/tool-profile.md). Thread AUTONOMOUS_TOOL_PROFILE=1
+  # into the daemon's launchd env iff this project has opted in via the marker file
+  # (.claude/tool-profile.on) — opt-in per project so a canary survives a
+  # `sync`/reinstall (which regenerates this plist). No marker ⇒ empty ⇒ the plist
+  # is byte-identical to the pre-flip form. Rollback = rm the marker + reinstall.
+  local tp_env; tp_env="$(tool_profile_plist_env "$project_root")"
+  [[ -n "$tp_env" ]] && echo "tool-profile: marker present — daemon will run under the deny-by-default profile (AUTONOMOUS_TOOL_PROFILE=1)"
+
   cat > "$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3482,7 +3461,7 @@ do_install_daemon() {
         <key>PATH</key>
         <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>${home_x}</string>
+        <string>${home_x}</string>${tp_env}
     </dict>
 
     <key>RunAtLoad</key>

@@ -1,6 +1,7 @@
 # Deny-by-default autonomous tool/permission profile (threat-model §5)
 
-**Status: SHIPPED behind a default-OFF flag (W1, 2026-05-30).** The PREVENTIVE
+**Status: SHIPPED; default-OFF, flipped on per project via a marker file (W1,
+2026-05-30). See [Flip-on](#flip-on-greenlit-canary-first).** The PREVENTIVE
 input-side complement to the already-shipped Guard 7 (`_relocate_injected_open_items`)
 and the §4.3 untrusted-content prompt firewall. See `docs/threat-model.md` §5.
 
@@ -86,9 +87,43 @@ three deny classes are present; PROTECTED_PATHS Edit+Write coverage; composition
 `--max-budget-usd` (prompt stays last); and the telemetry event. Argv is captured via
 a recording `claude` PATH shim (same pattern as `per-item-ceiling.bats`).
 
-## Flip-on (later, greenlit)
+`test/tool-profile-flipon.bats` (7 cases) covers the flip-on machinery:
+`tool_profile_plist_env` gates the launchd env snippet on the marker file;
+`tool-profile --show` emits deny-only JSON; and `tool-profile --verify` reports PASS
+against a `claude` shim that *enforces* the deny set and FAIL against one that
+*ignores* it (proving the verify oracle detects both directions), plus the
+missing-binary and unknown-arg error paths.
 
-Set `AUTONOMOUS_TOOL_PROFILE=1` for one project's daemon, observe a few ticks for
-spurious denials (a legitimately-needed tool being blocked), then roll fleet-wide.
-The profile is purely additive deny rules, so the failure mode is a *blocked* tick,
-not a *runaway* one — fail-loud, easy to back out by clearing the flag.
+Note `build_tool_profile_settings` + `PROTECTED_PATHS` live in `bin/_lib.sh`, shared
+by the driver (injection + detective Guard 3) and the CLI (`tool-profile`), so the
+deny set has one definition.
+
+## Flip-on (greenlit; canary-first)
+
+The profile is flipped on **per project via a marker file**, so a canary can be
+turned on one project at a time and the flag **survives a `sync`/reinstall** (which
+regenerates the daemon plist). The deny set is purely additive, so the failure mode
+is a *blocked* tick, not a *runaway* one — fail-loud, easy to back out.
+
+**Mechanism:** `do_install_daemon` (`bin/backlog-agent`) calls
+`tool_profile_plist_env` (`bin/_lib.sh`); if `<project>/.claude/tool-profile.on`
+exists it threads `<key>AUTONOMOUS_TOOL_PROFILE</key><string>1</string>` into the
+daemon plist's `EnvironmentVariables`. The daemon inherits the env from launchd and
+the driver injects the constrained `--settings` on every tick. No marker ⇒ the plist
+is byte-identical to the pre-flip form.
+
+**Runbook (canary → fleet):**
+1. **Prove enforcement first** (per CLI version): `backlog-agents tool-profile --verify`.
+   Runs real one-off `claude -p` calls with the generated `--settings` and asserts a
+   secret read (`.env`) and a `PROTECTED_PATHS` Edit are **REFUSED**, while a benign
+   Read/Edit **SUCCEEDS** (deny is scoped, not a blanket block). This closes the gap
+   the hermetic tests can't: they assert the injected JSON, not the CLI's enforcement.
+   (`--show` prints the JSON.) Exits non-zero on any mismatch — do not flip on a FAIL.
+2. **Canary one project:** `touch <project>/.claude/tool-profile.on`, then
+   `(cd <project> && backlog-agent install-daemon)` to regenerate + reload the plist
+   (or `launchctl kickstart -k gui/$(id -u)/com.$USER.<project>.backlog-agent`).
+   Watch ≥1 real tick: `log_event tool_profile_applied` present, tick still completes,
+   no spurious tool-denied failures in the item's work.
+3. **Fleet-wide:** repeat the `touch` + reinstall for the remaining projects.
+4. **Rollback:** `rm <project>/.claude/tool-profile.on` + reinstall (or kickstart). A
+   too-broad deny is recoverable — the tick fails loud and the item is left unclaimed.

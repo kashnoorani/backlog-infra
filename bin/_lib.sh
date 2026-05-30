@@ -32,6 +32,57 @@ xml_escape() {
   printf '%s' "$s"
 }
 
+# --- Deny-by-default autonomous tool/permission profile (threat-model §5) ---
+# Shared by the DRIVER (backlog-agent: injects --settings when
+# AUTONOMOUS_TOOL_PROFILE=1, and the detective Guard 3 protected-path check) and
+# the CLI (backlog-agents tool-profile --verify/--show) so the deny set and the
+# protected-path list have ONE definition — the preventive (§5) and detective
+# (Guard 3) twins stay in sync. docs/tool-profile.md / docs/threat-model.md §5.
+#
+# Shared-driver + project-config files the autonomous tick must never rewrite.
+# Exact repo-relative names, so a project's own unrelated bin/ tooling stays
+# writable (per the user decision; not a blanket bin/** deny).
+PROTECTED_PATHS="bin/backlog-agent bin/backlog-agent-status.mjs release.mjs CLAUDE.md .gitignore"
+
+# Emit the constrained --settings JSON injected into the autonomous `claude -p`
+# (jq-free; rule strings are simple, no escaping needed). Contains ONLY
+# permissions.deny — deny wins + layers onto the daemon's config, leaving the
+# headless auto-accept untouched. Deny classes: network egress, secret-path
+# reads, and Edit/Write of each PROTECTED_PATHS file.
+build_tool_profile_settings() {
+  local -a deny=(
+    WebFetch WebSearch
+    "Bash(curl:*)" "Bash(wget:*)" "Bash(nc:*)" "Bash(ncat:*)" "Bash(telnet:*)"
+    "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
+    "Read(~/.config/backlog/**)" "Read(.env)" "Read(./.env)" "Read(**/.env)"
+  )
+  local p
+  for p in $PROTECTED_PATHS; do
+    deny+=( "Edit(${p})" "Write(${p})" )
+  done
+  local json='' sep='' r
+  for r in "${deny[@]}"; do
+    json+="${sep}\"${r}\""
+    sep=','
+  done
+  printf '{"permissions":{"deny":[%s]}}' "$json"
+}
+
+# §5 tool-profile flip-on is PER PROJECT via a marker file, so a canary can be
+# flipped one project at a time and survive a `sync`/reinstall (which regenerates
+# the daemon plist). Emit the launchd <EnvironmentVariables> snippet that sets
+# AUTONOMOUS_TOOL_PROFILE=1 iff the marker (.claude/tool-profile.on) exists under
+# $1 (project root); empty otherwise. The driver injects the constrained --settings
+# on every tick when the env is 1. Rollback = rm the marker + reinstall the daemon.
+# Quote-free output, so no XML escaping needed. do_install_daemon splices the result
+# into the plist's EnvironmentVariables dict; a bats test asserts it without a live
+# launchctl bootstrap.
+tool_profile_plist_env() {
+  local project_root="$1"
+  [[ -f "$project_root/.claude/tool-profile.on" ]] || return 0
+  printf '\n        <key>AUTONOMOUS_TOOL_PROFILE</key>\n        <string>1</string>'
+}
+
 # Check SSH connectivity to GitHub. Critical for cloning, pulling, and pushing.
 # $1 = timeout in seconds (default 5). Returns 0 if healthy, non-zero if broken.
 check_github_ssh() {

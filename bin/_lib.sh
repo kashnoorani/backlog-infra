@@ -86,7 +86,7 @@ tool_profile_plist_env() {
 # Check SSH connectivity to GitHub. Critical for cloning, pulling, and pushing.
 # $1 = timeout in seconds (default 5). Returns 0 if healthy, non-zero if broken.
 check_github_ssh() {
-  local timeout="${1:-5}"
+  local timeout=5
   local out
   out="$(ssh -o ConnectTimeout="$timeout" -o StrictHostKeyChecking=accept-new -T git@github.com 2>&1)" || true
   if echo "$out" | grep -qi "successfully authenticated"; then

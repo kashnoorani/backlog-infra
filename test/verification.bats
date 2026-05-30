@@ -98,7 +98,7 @@ EOF
   [ "$status" -eq 0 ]
   open_has_marker ' '          # reopened
   ! open_has_marker 'x'        # no longer claimed-complete
-  grep -q '"do the thing":1' "$WORK/$FAILCOUNTS"
+  grep -q '"do the thing":{"count":1' "$WORK/$FAILCOUNTS"
   grep -qE '"event":"verify_failed".*"item":"do the thing"' "$WORK/$EVENTS"
   [[ "$output" == *"[verify] FAILED"* ]]
 }
@@ -123,7 +123,7 @@ EOF
     open_has_marker ' '
     rm -f "$CLAUDE_CALLED"
   done
-  grep -q '"do the thing":3' "$WORK/$FAILCOUNTS"
+  grep -q '"do the thing":{"count":3' "$WORK/$FAILCOUNTS"
 
   run_tick
   [ "$status" -eq 0 ]
@@ -152,7 +152,7 @@ EOF
   run_tick GATE_TIMEOUT_SECS=2
   [ "$status" -eq 0 ]
   open_has_marker ' '          # reopened after the timeout-kill
-  grep -q '"do the thing":1' "$WORK/$FAILCOUNTS"
+  grep -q '"do the thing":{"count":1' "$WORK/$FAILCOUNTS"
   grep -qE '"event":"verify_failed".*"item":"do the thing"' "$WORK/$EVENTS"
 }
 

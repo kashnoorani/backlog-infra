@@ -46,7 +46,7 @@ _ceiling_event_count() {
 
 # The recorded consecutive-failure count for the item (0 if no file/key).
 _failcount() {
-  node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(String(o["do the thing"]||0));}catch{process.stdout.write("0");}' \
+  node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=o["do the thing"];const c=(v&&typeof v==="object")?(v.count||0):(v||0);process.stdout.write(String(c));}catch{process.stdout.write("0");}' \
     "$WORK/.claude/backlog-agent-failcounts.json" 2>/dev/null || echo 0
 }
 

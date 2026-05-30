@@ -140,8 +140,23 @@ AGENT_FALLBACK_FILE="${HOME}/.claude/agent-fallback.json"
 # it [ ]/[!] → [?] with an inline note and let the user weigh in. The counter
 # resets when the item completes ([x]) or a tick succeeds. Per-host ephemeral
 # state, gitignored like the event log.
-CIRCUIT_BREAKER_THRESHOLD=3
+CIRCUIT_BREAKER_THRESHOLD="${CIRCUIT_BREAKER_THRESHOLD:-3}"
 FAILCOUNTS_FILE="${STATE_DIR}/backlog-agent-failcounts.json"
+# Cumulative "retry budget" (W2) — the CONSECUTIVE breaker's sibling. The breaker
+# above resets on ANY clean tick, so a FLAPPING item (fail → partial progress →
+# fail → …) that never strings K failures together never trips it. The retry
+# budget is a CUMULATIVE failed-attempt cap on the SAME item that is reset ONLY on
+# completion ([x]) — so flapping eventually trips it (→ [?]) too. 0 = disabled.
+RETRY_BUDGET="${RETRY_BUDGET:-6}"
+# Optional per-item override of the two thresholds, opt-in like the ceilings file:
+# { "circuit_breaker_threshold":N, "retry_budget":N, "items": { "<title substr>":
+# { "circuit_breaker_threshold":N, "retry_budget":N } } }. Absent ⇒ env defaults.
+# A committable config (NOT gitignored — a hard item can legitimately need a higher
+# bar fleet-wide), mirroring backlog-ceilings.json.
+GUARDS_FILE="${STATE_DIR}/backlog-guards.json"
+# How many of the most-recent failure reasons to retain per item + render into the
+# auto-block [?] note when a breaker trips (so the user sees WHY it gave up).
+FAILREASONS_KEEP=3
 
 # Dead-man's-switch — repeated status-hook failure (W2, docs/dead-mans-switch.md).
 # [notify-channel consumer] The status hook does the tick's git ops (fetch / rebase
@@ -477,15 +492,37 @@ log_event() {
   printf '%s\n' "$line" >> "$EVENT_LOG_FILE" 2>/dev/null || true
 }
 
-# --- per-item circuit breaker (W2) ---
-# A flat JSON object { "<item title>": <consecutive-fail-count>, ... } in
-# $FAILCOUNTS_FILE. Keyed by the exact item title (same string log_event
-# carries), so quotes/backslashes in titles must round-trip safely — hence
-# node for parse/serialize rather than grep/sed. node is already a hard
+# --- per-item circuit breaker + retry budget (W2) ---
+# A JSON object in $FAILCOUNTS_FILE keyed by the exact item title (same string
+# log_event carries), so quotes/backslashes in titles must round-trip safely —
+# hence node for parse/serialize rather than grep/sed. node is already a hard
 # dependency (the status hook and compactor are .mjs). Best-effort: a missing
 # file or write failure is a silent no-op so the breaker can never abort a tick.
+#
+# Each value is a RECORD: { count, attempts, reasons:[...] } where
+#   * count    = CONSECUTIVE failures — reset to 0 by any clean tick (drives the
+#                circuit breaker, → [?] at CIRCUIT_BREAKER_THRESHOLD).
+#   * attempts = CUMULATIVE failures — reset ONLY on completion ([x]) (drives the
+#                retry budget, → [?] at RETRY_BUDGET, catching FLAPPING items).
+#   * reasons  = the last FAILREASONS_KEEP short failure reasons, rendered into
+#                the auto-block [?] note so the user sees WHY it gave up.
+# BACK-COMPAT: an older bare-int value `{ "<title>": N }` is read as
+# { count:N, attempts:N, reasons:[] } and rewritten as a record on the next bump,
+# so a live rollout over an existing per-host file degrades cleanly.
 
-# Echo the current consecutive-failure count for an item title (0 if absent or
+# Internal node snippet (string) that normalizes obj[item] into {count,attempts,
+# reasons}, tolerating the legacy bare-int form. Spliced into the readers below.
+_FAILREC_NORM='
+  const norm = (v) => {
+    if (v && typeof v === "object")
+      return { count: Number.isInteger(v.count) ? v.count : 0,
+               attempts: Number.isInteger(v.attempts) ? v.attempts : 0,
+               reasons: Array.isArray(v.reasons) ? v.reasons : [] };
+    const n = Number.isInteger(v) ? v : 0;
+    return { count: n, attempts: n, reasons: [] };
+  };'
+
+# Echo the current CONSECUTIVE-failure count for an item title (0 if absent or
 # the file is missing/unreadable/malformed).
 failcount_get() {
   local item="$1"
@@ -496,31 +533,69 @@ failcount_get() {
     const [file, item] = [process.argv[1], process.argv[2]];
     let obj = {};
     try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
-    const n = Number.isInteger(obj[item]) ? obj[item] : 0;
-    process.stdout.write(String(n));
+    '"$_FAILREC_NORM"'
+    process.stdout.write(String(norm(obj[item]).count));
   ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || echo 0
 }
 
-# Increment the consecutive-failure count for an item title; echoes the new
-# count. Creates the file on first failure.
-failcount_bump() {
+# Echo the current CUMULATIVE attempt count for an item title (the retry-budget
+# counter). 0 if absent/unreadable.
+attempts_get() {
   local item="$1"
   [[ -z "${FAILCOUNTS_FILE:-}" ]] && { echo 0; return 0; }
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  [[ -f "$FAILCOUNTS_FILE" ]] || { echo 0; return 0; }
   node -e '
     const fs = require("fs");
     const [file, item] = [process.argv[1], process.argv[2]];
     let obj = {};
     try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
-    const n = (Number.isInteger(obj[item]) ? obj[item] : 0) + 1;
-    obj[item] = n;
-    try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
-    process.stdout.write(String(n));
+    '"$_FAILREC_NORM"'
+    process.stdout.write(String(norm(obj[item]).attempts));
   ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || echo 0
 }
 
-# Drop an item from the failcount map (called when it completes or a tick
-# succeeds). Silent no-op if there's no file or no such key.
+# Echo the retained failure reasons for an item title, " | "-joined (empty if
+# none). Used to render the auto-block [?] note + the surfacing alert.
+failreasons_get() {
+  local item="$1"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && return 0
+  [[ -f "$FAILCOUNTS_FILE" ]] || return 0
+  node -e '
+    const fs = require("fs");
+    const [file, item] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    '"$_FAILREC_NORM"'
+    process.stdout.write(norm(obj[item]).reasons.join(" | "));
+  ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || true
+}
+
+# Record one failure for an item title: bump BOTH counters and append $2 (a short
+# reason, capped to the last FAILREASONS_KEEP). Echoes the new CONSECUTIVE count
+# (back-compat with the breaker's existing reads). Creates the file on first fail.
+failcount_bump() {
+  local item="$1" reason="${2:-}"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && { echo 0; return 0; }
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  node -e '
+    const fs = require("fs");
+    const [file, item, reason, keepStr] = process.argv.slice(1);
+    const keep = parseInt(keepStr, 10) || 3;
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    '"$_FAILREC_NORM"'
+    const r = norm(obj[item]);
+    r.count += 1; r.attempts += 1;
+    if (reason) { r.reasons.push(reason); if (r.reasons.length > keep) r.reasons = r.reasons.slice(-keep); }
+    obj[item] = r;
+    try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
+    process.stdout.write(String(r.count));
+  ' "$FAILCOUNTS_FILE" "$item" "$reason" "$FAILREASONS_KEEP" 2>/dev/null || echo 0
+}
+
+# Drop an item from the map entirely — the FULL reset, called on completion ([x])
+# or when a breaker trips (the item is no longer open). Clears count + attempts +
+# reasons. Silent no-op if there's no file or no such key.
 failcount_reset() {
   local item="$1"
   [[ -z "${FAILCOUNTS_FILE:-}" ]] && return 0
@@ -532,6 +607,70 @@ failcount_reset() {
     try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
     if (item in obj) { delete obj[item]; try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {} }
   ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || true
+}
+
+# Reset only the CONSECUTIVE streak (count→0) on a clean-but-incomplete tick,
+# PRESERVING the cumulative attempts + reasons (so a flapping item still climbs
+# toward the retry budget). Distinct from failcount_reset, which clears the lot on
+# completion. Silent no-op if there's no file or no such key.
+failcount_reset_consecutive() {
+  local item="$1"
+  [[ -z "${FAILCOUNTS_FILE:-}" ]] && return 0
+  [[ -f "$FAILCOUNTS_FILE" ]] || return 0
+  node -e '
+    const fs = require("fs");
+    const [file, item] = [process.argv[1], process.argv[2]];
+    let obj = {};
+    try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
+    '"$_FAILREC_NORM"'
+    if (item in obj) {
+      const r = norm(obj[item]);
+      if (r.count !== 0) { r.count = 0; obj[item] = r; try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {} }
+    }
+  ' "$FAILCOUNTS_FILE" "$item" 2>/dev/null || true
+}
+
+# Resolve the effective per-item thresholds for an item title into the globals
+# GUARD_CB_THRESHOLD + GUARD_RETRY_BUDGET. Precedence (each later layer overrides):
+#   env defaults (CIRCUIT_BREAKER_THRESHOLD / RETRY_BUDGET)  →  GUARDS_FILE
+#   top-level  →  GUARDS_FILE `items` entry whose KEY is a substring of the title.
+# FAIL-OPEN: unreadable config ⇒ env values only. Mirrors resolve_ceiling.
+resolve_guards() {
+  GUARD_CB_THRESHOLD="$CIRCUIT_BREAKER_THRESHOLD"
+  GUARD_RETRY_BUDGET="$RETRY_BUDGET"
+  command -v node >/dev/null 2>&1 || return 0
+  [[ -n "${1:-}" ]] || return 0
+  [[ -f "$GUARDS_FILE" ]] || return 0
+  local out
+  out="$(node -e '
+    const fs = require("fs");
+    const [file, item, envCb, envRb] = process.argv.slice(1);
+    const intOr = (v, d) => { const n = parseInt(v, 10); return Number.isInteger(n) ? n : d; };
+    let cb = intOr(envCb, 3), rb = intOr(envRb, 6);
+    const apply = (o) => {
+      if (!o || typeof o !== "object") return;
+      if (Number.isInteger(o.circuit_breaker_threshold)) cb = o.circuit_breaker_threshold;
+      if (Number.isInteger(o.retry_budget))              rb = o.retry_budget;
+    };
+    let cfg = null;
+    try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+    if (cfg && typeof cfg === "object") {
+      apply(cfg);                                       // project-level default
+      const items = cfg.items && typeof cfg.items === "object" ? cfg.items : null;
+      if (items) {                                      // per-item override
+        for (const k of Object.keys(items)) {
+          if (k && item.includes(k)) { apply(items[k]); break; }
+        }
+      }
+    }
+    const i = n => (n >= 0 ? Math.floor(n) : 0);
+    process.stdout.write(i(cb) + " " + i(rb));
+  ' "$GUARDS_FILE" "$1" "$CIRCUIT_BREAKER_THRESHOLD" "$RETRY_BUDGET" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 0
+  read -r GUARD_CB_THRESHOLD GUARD_RETRY_BUDGET <<<"$out"
+  [[ "$GUARD_CB_THRESHOLD" =~ ^[0-9]+$ ]] || GUARD_CB_THRESHOLD="$CIRCUIT_BREAKER_THRESHOLD"
+  [[ "$GUARD_RETRY_BUDGET" =~ ^[0-9]+$ ]] || GUARD_RETRY_BUDGET="$RETRY_BUDGET"
+  return 0
 }
 
 # --- helpers ---
@@ -2022,36 +2161,64 @@ tick_once() {
     return 0
   fi
 
-  # --- Guard 1 (W2): per-item circuit breaker ---
-  # If this exact item has already failed CIRCUIT_BREAKER_THRESHOLD ticks in a
-  # row, stop re-claiming it. Flip it [ ]/[!] → [?] in place with an inline
-  # note, commit+push just that markup (same unclaim commit+push pattern as
-  # below), and skip claude entirely so the user can weigh in. The per-item
-  # counter is reset only when the item completes or a tick succeeds.
-  local item_fails; item_fails="$(failcount_get "$item_title")"
-  if (( item_fails >= CIRCUIT_BREAKER_THRESHOLD )); then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] circuit breaker: '${item_title}' failed ${item_fails}x consecutively — auto-blocking [?] and skipping claude" | tee -a "$LOG_FILE"
-    # Flip the first eligible [ ]/[!] item in ## Open to [?] and append the
-    # auto-block note. Scoped to ## Open like the claim flip; matches only
-    # the first item so we never touch a later one.
+  # --- Guard 1 (W2): per-item circuit breaker + retry budget ---
+  # Two thresholds on the SAME item, either of which stops re-claiming it:
+  #   * CONSECUTIVE: failcount_get >= GUARD_CB_THRESHOLD — K failures in a row
+  #     (the original breaker; any clean tick resets this streak).
+  #   * RETRY BUDGET: attempts_get >= GUARD_RETRY_BUDGET — B CUMULATIVE failures
+  #     over the item's lifetime (reset only on completion), so a FLAPPING item
+  #     (fail → partial → fail → …) that never strings K together still trips.
+  # On a trip: flip the first eligible [ ]/[!] in ## Open to [?] with a note that
+  # names WHICH threshold tripped + the last FAILREASONS_KEEP failure reasons (so
+  # the user sees why it gave up), commit+push that markup, fire ONE notify_send
+  # (the item gave up unattended — an actionable blocker), skip claude, drop the
+  # counter so a later manual retry starts fresh. Thresholds are env-tunable with
+  # an optional per-item override (resolve_guards / GUARDS_FILE).
+  resolve_guards "$item_title"
+  local item_fails item_attempts; item_fails="$(failcount_get "$item_title")"
+  item_attempts="$(attempts_get "$item_title")"
+  local trip_kind="" trip_detail=""
+  if (( item_fails >= GUARD_CB_THRESHOLD )); then
+    trip_kind="consecutive"; trip_detail="consecutive ${item_fails}/${GUARD_CB_THRESHOLD}"
+  elif (( GUARD_RETRY_BUDGET > 0 && item_attempts >= GUARD_RETRY_BUDGET )); then
+    trip_kind="retry_budget"; trip_detail="retry-budget ${item_attempts}/${GUARD_RETRY_BUDGET}"
+  fi
+  if [[ -n "$trip_kind" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] circuit breaker: '${item_title}' tripped (${trip_detail}, ${item_attempts} total attempts) — auto-blocking [?] and skipping claude" | tee -a "$LOG_FILE"
+    # Build the auto-block note: the trip kind + the last K failure reasons. Pass
+    # via awk -v (reasons are controlled ASCII tags — no backslashes to mangle).
+    local cb_reasons cb_note
+    cb_reasons="$(failreasons_get "$item_title")"
+    cb_note=" — [circuit-breaker] auto-blocked (${trip_detail}) after ${item_attempts} failed attempt(s)"
+    [[ -n "$cb_reasons" ]] && cb_note="${cb_note}; recent failures: ${cb_reasons}"
+    # Flip the first eligible [ ]/[!] item in ## Open to [?] and append the note.
+    # Scoped to ## Open like the claim flip; matches only the first item.
     _local_awk_inplace "$BACKLOG_FILE" '
       BEGIN { in_open=0; done=0 }
       /^## Open/       { in_open=1; print; next }
       /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
       in_open && !done && /^(- )?\[[ !]\] / {
         sub(/\[[ !]\]/, "[?]")
-        $0 = $0 " — [circuit-breaker] auto-blocked after '"$CIRCUIT_BREAKER_THRESHOLD"' failed attempts"
+        $0 = $0 note
         done=1
       }
       { print }
-    ' 2>/dev/null || true
+    ' -v note="$cb_note" 2>/dev/null || true
     if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
       git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
       git -C "$PWD" commit -m "circuit-breaker: auto-block ${item_title}" >/dev/null 2>&1
       git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
       echo "  [circuit-breaker] auto-blocked ${item_title}" | tee -a "$LOG_FILE"
     fi
-    log_event circuit_tripped item "$item_title" fails "$item_fails"
+    log_event circuit_tripped item "$item_title" kind "$trip_kind" fails "$item_fails" attempts "$item_attempts"
+    # Surface it — the item's "and surface it" half. ONE push per trip (the
+    # failcount_reset below means a re-armed retry alerts again, like the
+    # dead-man's-switch / budget alert-once-per-incident pattern).
+    local cb_project cb_host
+    cb_project="$(basename "$(pwd)")"
+    cb_host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo '?')"
+    notify_send "backlog-agent circuit-breaker: ${cb_project}@${cb_host}" \
+      "⛔ '${item_title}' auto-blocked [?] (${trip_detail}, ${item_attempts} attempts) — silent retry storm stopped. Recent: ${cb_reasons:-n/a}. Needs your input (backlog-agent unblock)."
     # The item is no longer open; drop its counter so a later retry starts fresh.
     failcount_reset "$item_title"
     _run_status_hook "" 0 loop "$pre_head" "$pulled"
@@ -2235,10 +2402,11 @@ tick_once() {
         git -C "$PWD" commit -m "unclaim: ${item_title}" >/dev/null 2>&1
         git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
         echo "  [unclaim] ${item_title}" | tee -a "$LOG_FILE"
-        # Guard 1 (W2): record this consecutive failure. Once the count reaches
-        # CIRCUIT_BREAKER_THRESHOLD the next tick auto-blocks the item ([?]) up
+        # Guard 1 (W2): record this failure (with a reason for the [?] note). Once
+        # the consecutive count reaches GUARD_CB_THRESHOLD — or cumulative attempts
+        # reach GUARD_RETRY_BUDGET — the next tick auto-blocks the item ([?]) up
         # front instead of re-claiming and re-failing.
-        local new_fails; new_fails="$(failcount_bump "$item_title")"
+        local new_fails; new_fails="$(failcount_bump "$item_title" "claude exit ${claude_exit}")"
         log_event item_failed item "$item_title" fails "$new_fails"
       fi
     fi
@@ -2311,7 +2479,7 @@ tick_once() {
             else
               echo "  [ceiling] WARNING: '${item_title}' over ceiling but no [~] match in ## Open to reopen — needs manual attention" | tee -a "$LOG_FILE"
             fi
-            local cfails; cfails="$(failcount_bump "$item_title")"
+            local cfails; cfails="$(failcount_bump "$item_title" "ceiling: ${over}")"
             log_event item_ceiling item "$item_title" breach "$over" reopened true fails "$cfails"
           fi
         fi
@@ -2360,7 +2528,7 @@ tick_once() {
         else
           echo "  [verify] WARNING: '${item_title}' failed its gate but could not be auto-reopened (no [x] match in ## Open) — needs manual attention" | tee -a "$LOG_FILE"
         fi
-        local vfails; vfails="$(failcount_bump "$item_title")"
+        local vfails; vfails="$(failcount_bump "$item_title" "verify: exit ${gate_rc}")"
         log_event verify_failed item "$item_title" exit_code "$gate_rc" gate "${GATE_CMD[*]}" fails "$vfails"
       else
         echo "  [verify] gate passed for '${item_title}'" | tee -a "$LOG_FILE"
@@ -2369,11 +2537,19 @@ tick_once() {
       rm -f "$gate_out" 2>/dev/null || true
     fi
 
-    # Guard 1 (W2): a clean tick clears the item's consecutive-failure streak —
-    # but only when neither verification NOR the ceiling failed (either already
-    # bumped above; resetting here would erase that and defeat the breaker).
+    # Guard 1 (W2): a clean tick clears the item's CONSECUTIVE streak — but only
+    # when neither verification NOR the ceiling failed (either already bumped
+    # above; resetting here would erase that and defeat the breaker). On a clean
+    # tick that COMPLETED the item ([x]), do the FULL reset (drop the cumulative
+    # retry-budget attempts too — the work is done). On a clean-but-incomplete
+    # tick (partial progress, item still open), reset only the consecutive streak
+    # and PRESERVE attempts so a flapping item still climbs toward the budget.
     if [[ "$verify_failed" != "true" && "$ceiling_breached" != "true" ]]; then
-      failcount_reset "$item_title"
+      if _completion_claimed "$item_title"; then
+        failcount_reset "$item_title"
+      else
+        failcount_reset_consecutive "$item_title"
+      fi
     fi
 
     # --- Guards 2 & 3 (W2): inspect what claude actually committed this tick ---

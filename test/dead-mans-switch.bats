@@ -281,3 +281,23 @@ EOF
   # Exactly one dead-man push for proj-dead despite multiple sweeps.
   [ "$(grep -c 'proj-dead' "$HOME/.posted" 2>/dev/null || echo 0)" -eq 1 ]
 }
+
+# a7. Backlog item #55: the HELD infra repo's FROZEN log re-matches Patterns 1-3
+#     every sweep. The flag must be DE-DUPED — emitted once per incident, not every
+#     120s — so it stops driving a monitor-status commit+push to backlog-infra on
+#     every sweep (the cross-machine monitor-sweep churn / divergence source).
+@test "monitor: infra repo flag is de-duped across sweeps (#55 churn fix)" {
+  setup_fake_fleet
+  # Frozen held-daemon log carrying the stale push-failure line (Pattern 3).
+  echo "error: failed to push some refs to origin" > "$ACTIVE/backlog-infra/.claude/backlog-agent.log"
+  bash "$AGENTS_BIN" monitor --interval 1 > "$HOME/.monout" 2>&1 &
+  local mpid=$!
+  sleep 3                                    # ~3 sweeps at interval 1
+  kill "$mpid" 2>/dev/null || true
+  wait "$mpid" 2>/dev/null || true
+  # The infra push-reject FLAG is emitted exactly ONCE despite multiple sweeps.
+  local n; n="$(grep -c 'git push rejected — infra repo' "$HOME/.monout" 2>/dev/null)" || true
+  [ "${n:-0}" -eq 1 ]
+  # And a later sweep reports no issues (steady-state quiet → no per-sweep commit).
+  grep -q 'OK (no issues)' "$HOME/.monout"
+}

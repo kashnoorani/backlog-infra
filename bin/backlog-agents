@@ -1607,6 +1607,30 @@ JSON
     fi
   }
 
+  # --- infra-repo flag de-dup across sweeps (backlog item #55) ---
+  # The infra daemon is HELD and its .claude/backlog-agent.log is FROZEN, so the
+  # git-failure Patterns 1-3 re-match the same stale lines on EVERY sweep. Left
+  # unchecked that re-printed the FLAG, re-incremented flagged_total, and — because
+  # a flagged sweep counts as an "action" — drove a monitor-status commit+push to
+  # backlog-infra every 120s: the source of the cross-machine monitor-sweep churn
+  # and divergence. _infra_flag_seen records a (project,kind) the FIRST time it is
+  # flagged in this monitor process and returns 1 (suppress) on every repeat, so a
+  # steady-state held infra repo contributes NO action and the only commits left are
+  # the 300s heartbeat. _infra_flag_rearm clears the record when the condition is no
+  # longer present so a genuinely new occurrence re-flags. Mirrors the _dms_alerted
+  # per-incident dedup; '|'-delimited set, bash-3.2-safe.
+  _infra_flag_seen() {
+    local key="$1:$2"
+    case "$_infra_flagged" in
+      *"|${key}|"*) return 1 ;;
+      *) _infra_flagged="${_infra_flagged}${key}|"; return 0 ;;
+    esac
+  }
+  _infra_flag_rearm() {
+    local key="$1:$2"
+    _infra_flagged="${_infra_flagged//|${key}|/|}"
+  }
+
   local -a recent_actions=()
 
   # Dead-man's-switch (docs/dead-mans-switch.md): a daemon whose INDEPENDENT D1
@@ -1618,6 +1642,9 @@ JSON
   # re-arms all, which is fine). bash-3.2-safe (no associative arrays).
   local _dms_stale_secs="${DMS_STALE_SECS:-3600}"
   local _dms_alerted='|'
+  # Per-incident dedup of infra-repo git-failure flags (#55), persisted across
+  # sweeps for the monitor's lifetime (a restart re-arms all, which is fine).
+  local _infra_flagged='|'
 
   _monitor_run() {
     local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1677,25 +1704,33 @@ JSON
             # monitor must NEVER stash/reset it (it would eat in-flight interactive
             # work, and the held daemon's log lines are frozen/stale so a fix would
             # re-fire every sweep). Flag only — the same exclusion as do_sync + the
-            # dead-man's-switch watcher.
-            fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree — infra repo (interactive, daemon held); flag only, not auto-reset")
-            sweep_flagged=$((sweep_flagged + 1))
-            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"flagged_infra\"}")
+            # dead-man's-switch watcher. De-duped across sweeps (#55): flag ONCE per
+            # incident, else the frozen log drives a monitor-status commit every sweep.
+            if _infra_flag_seen "$name" git_dirty; then
+              fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree — infra repo (interactive, daemon held); flag only, not auto-reset")
+              sweep_flagged=$((sweep_flagged + 1))
+              recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"flagged_infra\"}")
+            fi
           else
             fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git dirty tree ($([[ $safe_to_fix -eq 0 ]] && echo 'BLOCKED' || echo 'detected'))")
             sweep_flagged=$((sweep_flagged + 1))
             recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_dirty\",\"result\":\"$([[ $safe_to_fix -eq 0 ]] && echo 'blocked_inflight' || echo 'flagged')\"}")
           fi
         fi
+      else
+        _is_infra_project "$name" && _infra_flag_rearm "$name" git_dirty
       fi
 
       # Pattern 2: git fast-forward failure
       if echo "$recent" | grep -qiE 'fatal: Cannot fast-forward'; then
         if _is_infra_project "$name"; then
           # infra repo: interactive + daemon held — flag only, never reset.
-          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git fast-forward conflict — infra repo (interactive, daemon held); flag only, not auto-reset")
-          sweep_flagged=$((sweep_flagged + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"flagged_infra\"}")
+          # De-duped across sweeps (#55): flag ONCE per incident.
+          if _infra_flag_seen "$name" git_ff_conflict; then
+            fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git fast-forward conflict — infra repo (interactive, daemon held); flag only, not auto-reset")
+            sweep_flagged=$((sweep_flagged + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"flagged_infra\"}")
+          fi
         elif (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
           git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
@@ -1704,16 +1739,21 @@ JSON
           sweep_fixed=$((sweep_fixed + 1))
           recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_ff_conflict\",\"result\":\"fixed\"}")
         fi
+      else
+        _is_infra_project "$name" && _infra_flag_rearm "$name" git_ff_conflict
       fi
 
       # Pattern 3: git push failure
       if echo "$recent" | grep -qiE 'failed to push some refs'; then
         if _is_infra_project "$name"; then
           # infra repo: interactive + daemon held — flag only, never reset. (This is
-          # the case that re-fired every sweep off the held daemon's frozen log.)
-          fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git push rejected — infra repo (interactive, daemon held); flag only, not auto-reset")
-          sweep_flagged=$((sweep_flagged + 1))
-          recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"flagged_infra\"}")
+          # the case that re-fired every sweep off the held daemon's frozen log —
+          # de-duped across sweeps (#55) so it flags ONCE per incident, not every 120s.)
+          if _infra_flag_seen "$name" git_push_rejected; then
+            fix_descriptions+=("  ${YL}FLAG${RS}  ${name}: git push rejected — infra repo (interactive, daemon held); flag only, not auto-reset")
+            sweep_flagged=$((sweep_flagged + 1))
+            recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"flagged_infra\"}")
+          fi
         elif (( safe_to_fix && fix )); then
           git -C "$proj_dir" fetch origin 2>/dev/null || true
           git -C "$proj_dir" reset --hard "origin/$(git -C "$proj_dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)" 2>/dev/null || \
@@ -1722,6 +1762,8 @@ JSON
           sweep_fixed=$((sweep_fixed + 1))
           recent_actions+=("{\"ts\":\"$(date -u '+%Y-%m-%dT%H:%M:%SZ')\",\"project\":\"${name}\",\"action\":\"git_push_rejected\",\"result\":\"fixed\"}")
         fi
+      else
+        _is_infra_project "$name" && _infra_flag_rearm "$name" git_push_rejected
       fi
 
       # Pattern 4: stale lock

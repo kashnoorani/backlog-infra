@@ -286,11 +286,25 @@ git log -1 --format=%h origin/main -- bin   # the reference (fetch first)
 
 ```bash
 cd ~/dev/projects/active/backlog-infra
-git fetch origin && git pull --ff-only origin main   # land the fix locally
-backlog-agents canary        # validate the now-current driver before re-rolling
-backlog-agents sync          # pull every project + restart every daemon on the fix
-backlog-agents --fetch       # DRIVER column should now be green everywhere
+git fetch origin
+git status --porcelain        # MUST be empty — stash/commit any real edit first
+git reset --hard origin/main  # land the fix (NOT pull --ff-only — see note)
+backlog-agents canary         # validate the now-current driver before re-rolling
+backlog-agents sync           # reconcile every clone + restart every daemon on the fix
+backlog-agents --fetch        # DRIVER column should now be green everywhere
 ```
+
+> **Why `reset --hard`, not `pull --ff-only`?** The lead machine's `monitor`
+> *rebases* origin as it sweeps (rewriting `monitor: sweep …` SHAs), so a
+> follower's `main` is perpetually diverged by monitor-churn and `pull --ff-only`
+> always fails (`fatal: Not possible to fast-forward`). Reconciling to origin is
+> safe because the daemon is idempotent (`docs/cross-machine-locking.md`
+> §"Key invariants") — but **only with a clean tree**: `git status --porcelain`
+> first and stash/commit any uncommitted work, or the reset nukes it.
+> `backlog-agents sync` now does this reconcile automatically per clone
+> (`_follower_reconcile`: clean-tree + monitor-only-ahead tripwires gate the
+> reset; `SYNC_RECONCILE_DISABLE=1` to opt out), so the manual `reset` is only for
+> the infra checkout you run `canary` from.
 
 To push a fix to the *whole fleet* without waiting on the 24 h `daemon-sync`,
 run `backlog-agents sync` on each machine (the cross-machine on-demand trigger
@@ -449,7 +463,7 @@ grep -i "reclaim\|claim:" .claude/backlog-agent.log | tail
 |---|---|---|
 | Project/machine STALE | `backlog-agents`, `backlog-agent log` | diagnose cause (B3/B4/B5), then `backlog-agents sync` |
 | Double-daemon | `backlog-agents doctor` (HARD FAIL) | rm legacy plist + `backlog-agent install-daemon` |
-| Driver version-skew | `backlog-agents --fetch` (DRIVER ⚠), `canary --check` | `git pull --ff-only`, `backlog-agents canary`, `backlog-agents sync` |
+| Driver version-skew | `backlog-agents --fetch` (DRIVER ⚠), `canary --check` | `git reset --hard origin/main` (clean tree — monitor-churn diverges follower main; NOT `pull --ff-only`), `backlog-agents canary`, `backlog-agents sync` |
 | Cooldown stuck | `backlog-agents` ALERTS, `cat agent-cooldown.json` | `rm agent-cooldown.json` (if stale), `monitor --once --fix` |
 | Status-hook git failures | `backlog-agent log` grep, `doctor` | pull driver fix (B3) or `monitor --once --fix` |
 | Stuck `[~]` / reclaim runaway | `backlog-agents` STUCK, inflight file | fix liveness (B5); let TTL reaper free it; reinstall daemon |

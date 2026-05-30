@@ -1025,8 +1025,68 @@ _sync_gate_check() {
 # self-modifies the shared driver and is operated interactively).
 _is_infra_project() { [[ "$1" == "$INFRA_PROJECT" ]]; }
 
+# Pull a follower clone up to origin, RECONCILING monitor-churn divergence
+# instead of giving up like a bare `pull --ff-only`.
+#
+# Why this exists: the lead machine's `monitor` *rebases* origin as it sweeps,
+# rewriting `monitor: sweep …` commit SHAs. A follower that earlier ff-pulled
+# that history now diverges (`fatal: Not possible to fast-forward`), so the old
+# `pull --ff-only … || warn "leaving alone"` strands the operator with ~dozens
+# of stale monitor-sweep commits that already exist on origin under new SHAs.
+# The daemon self-heals this every tick (docs/cross-machine-locking.md §2
+# "Hardened pull pathway": fetch → reset --hard origin/<branch>); this is the
+# operator-facing twin of exactly that pathway.
+#
+# Safety (mirrors the ★ reset-hazard the operator must respect by hand): a
+# `reset --hard` here is only safe for *monitor-churn* divergence. Two tripwires
+# gate it — (1) the working tree must be CLEAN (never nuke uncommitted operator
+# work), and (2) every commit ahead of origin must be a `monitor:` sweep (a
+# non-monitor un-pushed commit is real work we must not discard). If either
+# fires, fall back to the historical warn+leave-alone and surface it. The reset
+# is provably safe under those gates by the same invariant as the daemon reset:
+# "the daemon is idempotent → reset --hard recovery is always safe"
+# (docs/cross-machine-locking.md §"Key invariants"). Set
+# SYNC_RECONCILE_DISABLE=1 to force the old warn-only behaviour.
+_follower_reconcile() {
+  local proj="$1" branch="$2" name="$3"
+  # Fast path: a clean fast-forward (no divergence) still works.
+  if git -C "$proj" pull --ff-only origin "$branch" >/dev/null 2>&1; then
+    ok "$name (on $branch)"
+    return 0
+  fi
+  if [[ "${SYNC_RECONCILE_DISABLE:-0}" == 1 ]]; then
+    warn "$name: pull --ff-only failed (dirty or diverged); leaving alone (reconcile disabled)"
+    return 0
+  fi
+  # ff-only failed: dirty, diverged (monitor-churn), or offline. Need an
+  # up-to-date origin ref to judge divergence.
+  if ! git -C "$proj" fetch origin "$branch" >/dev/null 2>&1; then
+    warn "$name: fetch failed (offline?); leaving alone"
+    return 0
+  fi
+  # Tripwire 1 — never reset over uncommitted operator work.
+  if [[ -n "$(git -C "$proj" status --porcelain 2>/dev/null)" ]]; then
+    warn "$name: working tree dirty; leaving alone (commit/stash, then re-sync)"
+    return 0
+  fi
+  # Tripwire 2 — every un-pushed commit ahead of origin must be a monitor sweep.
+  local nonmonitor
+  nonmonitor="$(git -C "$proj" log "origin/$branch..HEAD" --format='%s' 2>/dev/null | grep -cvE '^monitor:' || true)"
+  if [[ "${nonmonitor//[[:space:]]/}" != 0 ]]; then
+    warn "$name: ${nonmonitor//[[:space:]]/} un-pushed non-monitor commit(s) ahead; leaving alone (push or reconcile manually)"
+    return 0
+  fi
+  # Pure monitor-churn divergence (clean tree, only monitor sweeps ahead):
+  # reconcile to origin, mirroring the daemon's hardened pull pathway.
+  if git -C "$proj" reset --hard "origin/$branch" >/dev/null 2>&1; then
+    ok "$name (reconciled monitor-churn divergence → origin/$branch)"
+  else
+    warn "$name: reset --hard origin/$branch failed; leaving alone"
+  fi
+}
+
 do_sync() {
-  local NO_PULL=0 RESTART_ONLY=0 NO_GATE=0 GATE_ONLY=0 INCLUDE_INFRA=0
+  local NO_PULL=0 RESTART_ONLY=0 NO_GATE=0 GATE_ONLY=0 INCLUDE_INFRA=0 PROJECTS_ONLY=0
   for arg in "$@"; do
     case "$arg" in
       --no-pull)       NO_PULL=1 ;;
@@ -1034,6 +1094,7 @@ do_sync() {
       --no-gate)       NO_GATE=1 ;;
       --gate-only)     GATE_ONLY=1 ;;
       --include-infra) INCLUDE_INFRA=1 ;;
+      --projects-only) PROJECTS_ONLY=1 ;;
       *) echo "backlog-agents sync: unknown flag: $arg" >&2; exit 2 ;;
     esac
   done
@@ -1045,14 +1106,19 @@ do_sync() {
   fi
 
   if (( NO_PULL == 0 )); then
-    need_github_ssh "backlog-agents sync" || warn "SSH to GitHub is broken — pulls will fail"
+    # --projects-only reconciles the active clones and returns (no dotfiles,
+    # no kash_setup, no daemon restart) — the operator-facing "land the driver
+    # fix on this follower" path, and the hermetic seam for the reconcile tests.
+    if (( PROJECTS_ONLY == 0 )); then
+      need_github_ssh "backlog-agents sync" || warn "SSH to GitHub is broken — pulls will fail"
 
-    info "pulling dotfiles"
-    git -C "$DOTFILES" pull --ff-only origin main && ok "dotfiles up to date"
+      info "pulling dotfiles"
+      git -C "$DOTFILES" pull --ff-only origin main && ok "dotfiles up to date"
 
-    info "running kash_setup.sh (idempotent)"
-    ( . "$DOTFILES/bootstrap/kash_setup.sh" ) || warn "kash_setup.sh reported errors above"
-    ok "bootstrap done"
+      info "running kash_setup.sh (idempotent)"
+      ( . "$DOTFILES/bootstrap/kash_setup.sh" ) || warn "kash_setup.sh reported errors above"
+      ok "bootstrap done"
+    fi
 
     if [[ -d "$ACTIVE_ROOT" ]]; then
       info "pulling each active project"
@@ -1060,16 +1126,15 @@ do_sync() {
         [[ -d "$proj/.git" ]] || continue
         local local_name; local_name="$(basename "$proj")"
         if branch="$(git -C "$proj" symbolic-ref --short HEAD 2>/dev/null)"; then
-          if git -C "$proj" pull --ff-only origin "$branch" >/dev/null 2>&1; then
-            ok "$local_name (on $branch)"
-          else
-            warn "$local_name: pull --ff-only failed (probably dirty or diverged); leaving alone"
-          fi
+          # Reconcile monitor-churn divergence instead of bare ff-only (#53).
+          _follower_reconcile "$proj" "$branch" "$local_name"
         else
           warn "$local_name: detached HEAD; skipping pull"
         fi
       done
     fi
+
+    if (( PROJECTS_ONLY )); then return 0; fi
   fi
 
   # ---- gate the restart on canary + version-skew (see _sync_gate_check) ----

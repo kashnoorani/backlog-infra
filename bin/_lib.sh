@@ -1,4 +1,5 @@
 # _lib.sh — shared helpers sourced by backlog-infra/bin scripts.
+# shellcheck shell=bash  # sourced, never executed — declare the dialect for SC2148.
 # Source this at the top of each script (after set -euo pipefail):
 #   LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   . "$LIB_DIR/_lib.sh"

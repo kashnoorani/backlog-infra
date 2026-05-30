@@ -1120,7 +1120,8 @@ do_sync() {
     # to avoid killing a running Claude session mid-work.
     local inflight="$repo/.claude/backlog-agent-tick.inflight"
     if [[ -f "$inflight" ]]; then
-      local age="$(perl -e 'print time - (stat(shift))[9]' "$inflight" 2>/dev/null || echo 0)"
+      local age
+      age="$(perl -e 'print time - (stat(shift))[9]' "$inflight" 2>/dev/null || echo 0)"
       if (( age < 1800 )); then
         warn "$name: tick in flight (${age}s ago), skipping restart"
         restarted=$((restarted + 1))
@@ -2394,10 +2395,11 @@ _fleet_skew_zero() {
 }
 
 do_freeze() {
-  local ARM=0 STATUS=0 CHECK=0 EVAL=0 reason="" sha="" by="manual"
+  local STATUS=0 CHECK=0 EVAL=0 reason="" sha="" by="manual"
   while (( $# )); do
     case "$1" in
-      --arm)    ARM=1 ;;
+      --arm)    : ;;   # accepted for symmetry; arming is the fall-through default
+                       # (no --status/--check/--eval), so there's nothing to set.
       --status) STATUS=1 ;;
       --check)  CHECK=1 ;;
       --eval)   EVAL=1 ;;
@@ -3027,7 +3029,8 @@ do_digest() {
 
   # --- push via the shared notify channel ---
   if (( do_notify )); then
-    local body="Fleet (last ${period_label}): ${f_done} completed, ${f_ticks} ticks, $(fmt_tok "$f_tokens") tokens, ${f_blk} open [?] blocker(s)."
+    local body
+    body="Fleet (last ${period_label}): ${f_done} completed, ${f_ticks} ticks, $(fmt_tok "$f_tokens") tokens, ${f_blk} open [?] blocker(s)."
     if [[ -n "$blockers_list" ]]; then
       body="${body}"$'\n'"Blockers (reply '<project>#<N> your answer' to unblock):"
       while IFS=$'\t' read -r p idx t; do

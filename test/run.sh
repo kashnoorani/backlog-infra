@@ -10,10 +10,13 @@ REPO_ROOT="$(cd .. && pwd)"
 # --- shellcheck (lint the shell scripts) ---
 if command -v shellcheck >/dev/null 2>&1; then
   echo "== shellcheck =="
-  # SC1091: don't follow sourced _lib.sh; SC2310/2311: set -e + function-in-if
-  # are idiomatic here. Tighten over time.
-  shellcheck -e SC1091 -S warning "$REPO_ROOT/bin/backlog-agent" "$REPO_ROOT/bin/_lib.sh" || {
-    echo "shellcheck reported issues (non-fatal for now)"; }
+  # BLOCKING, matching CI (.github/workflows/test.yml) — the warnings are cleared
+  # (#54), so a new one is a real regression and should fail the canary. SC1091:
+  # don't follow the sourced _lib.sh. set -e propagates a non-zero shellcheck.
+  shellcheck -e SC1091 -S warning \
+    "$REPO_ROOT/bin/backlog-agent" "$REPO_ROOT/bin/_lib.sh" \
+    "$REPO_ROOT/bin/backlog-agents" "$REPO_ROOT/bin/backlog-secret-scan" \
+    "$REPO_ROOT/bin/backlog-snapshot.sh" "$REPO_ROOT/bin/dev-projects"
 else
   echo "== shellcheck not installed — skipping lint (brew install shellcheck) =="
 fi

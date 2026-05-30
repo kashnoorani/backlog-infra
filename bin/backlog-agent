@@ -117,6 +117,7 @@ COOLDOWN_FILE="${STATE_DIR}/agent-cooldown.json"
 # Opt-in cooldown alerts (docs/multi-agent-design.md, Layer 2). When a
 # cooldown is armed, notify_cooldown reads this file and fires a Slack
 # and/or email alert. Absent file / empty keys → silent no-op.
+# shellcheck disable=SC2034  # consumed cross-file by notify_send in _lib.sh ($NOTIFY_CONFIG)
 NOTIFY_CONFIG="${HOME}/.claude/agent-notify.json"
 
 # Layer 3 (docs/multi-agent-design.md): opt-in alternative-agent fallback.
@@ -2377,9 +2378,11 @@ tick_once() {
   # Pre-check SSH so failures produce a clear diagnostic rather than a
   # confusing "Permission denied (publickey)" buried in the log.
   local pulled=0 head_before head_after
-  local ssh_ok=0
-  check_github_ssh && ssh_ok=1
-  if git -C "$PWD" rev-parse --abbrev-ref @{u} >/dev/null 2>&1; then
+  # Run the SSH precheck purely for its diagnostic side-effect (a clear log line
+  # on auth failure); its result isn't consumed. `|| true` keeps a failed probe
+  # from tripping set -e.
+  check_github_ssh || true
+  if git -C "$PWD" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
     head_before="$(git -C "$PWD" rev-parse HEAD 2>/dev/null || echo '')"
     # Fetch first (always safe, no-op on failure), then fast-forward
     # if possible. If HEAD has diverged from origin (local commits
@@ -2944,8 +2947,11 @@ tick_once() {
         # the actionable response is key rotation, not a code retry). Scoped to
         # work_base..work_head; runs the builtin floor directly (no hook needed).
         if [[ "$SECRET_SCAN_DISABLE" != "1" && -x "$SECRET_SCAN_BIN" ]]; then
-          local secret_out secret_rc=0
-          secret_out="$(SECRET_SCAN_DISABLE=0 "$SECRET_SCAN_BIN" --range "$work_base" "$work_head" 2>&1)" || secret_rc=$?
+          # Run the builtin floor for its exit code only; its stdout/stderr is
+          # suppressed so a match never echoes the secret-like content into the
+          # tick log (the WARNING below is the user-facing signal).
+          local secret_rc=0
+          SECRET_SCAN_DISABLE=0 "$SECRET_SCAN_BIN" --range "$work_base" "$work_head" >/dev/null 2>&1 || secret_rc=$?
           if [[ $secret_rc -ne 0 ]]; then
             echo "  [WARNING] secret-scan: '${item_title}' pushed a commit with secret-like content (the pre-push hook was bypassed/absent) — ROTATE the key; it is in git history" | tee -a "$LOG_FILE"
             log_event secret_detected item "$item_title" range "${work_base}..${work_head}"

@@ -30,4 +30,15 @@ if [ -z "$BATS" ]; then
 fi
 
 echo "== bats ($("$BATS" --version)) =="
+
+# Run tests in parallel when GNU parallel is available (each test is hermetic —
+# its own $BATS_TEST_TMPDIR + redirected $HOME, see helpers.bash). Fall back to
+# serial on hosts without GNU parallel so the canary still runs everywhere.
+# Override the job count with BATS_JOBS; set BATS_JOBS=1 to force serial.
+JOBS="${BATS_JOBS:-$(command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu || nproc 2>/dev/null || echo 1)}"
+if [ "$JOBS" -gt 1 ] && command -v parallel >/dev/null 2>&1; then
+  echo "== running ${JOBS}-way parallel (GNU parallel) =="
+  exec "$BATS" -j "$JOBS" "$PWD"/*.bats
+fi
+echo "== running serially (set BATS_JOBS>1 + install GNU parallel to parallelize) =="
 exec "$BATS" "$PWD"/*.bats

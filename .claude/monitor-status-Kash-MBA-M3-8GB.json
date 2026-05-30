@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-30T12:39:08Z",
+  "last_sweep_at": "2026-05-30T12:45:15Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M3-8GB",
-  "sweeps_total": 60,
+  "sweeps_total": 63,
   "fixed_total": 5,
   "flagged_total": 6,
   "recent_actions": [{"ts":"2026-05-30T12:08:20Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T12:08:20Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T12:08:20Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T12:08:20Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T12:08:20Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T12:34:59Z","project":"backlog-dashboard","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3664},{"ts":"2026-05-30T12:39:05Z","project":"RallyCut-claude","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3604},{"ts":"2026-05-30T12:39:06Z","project":"TaizMail","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3601},{"ts":"2026-05-30T12:39:06Z","project":"dark-mode-safari","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3605},{"ts":"2026-05-30T12:39:07Z","project":"predictive-history","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3604},{"ts":"2026-05-30T12:39:07Z","project":"sacred-geography","host":"Kash-MBA-M1-16GB","action":"dead_mans_switch","result":"alerted","age_sec":3602}]

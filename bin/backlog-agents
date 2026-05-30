@@ -1643,6 +1643,18 @@ do_monitor() {
     _notify_raw "$@"
   }
 
+  # CI-aware push throttle — skip heartbeat pushes when the prior CI run on main
+  # is red so the monitor doesn't flood inboxes with failure emails for a CI break
+  # it didn't cause. Action pushes (had_action=1) bypass the gate — those are
+  # operationally meaningful (stale lock fixed, daemon restarted, etc.). Fail-open:
+  # gh not installed, not authenticated, or network error → return 1 (allow push).
+  _ci_is_red() {
+    local conclusion
+    conclusion="$(gh run list --branch=main --workflow=test.yml --limit=1 \
+      --json conclusion -q '.[0].conclusion' 2>/dev/null || true)"
+    [[ "$conclusion" == "failure" ]]
+  }
+
   _write_status() {
     local had_action="${1:-0}"
     local now_iso; now_iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -1675,6 +1687,13 @@ JSON
       should_commit=1
     fi
     if (( should_commit )); then
+      # CI-aware throttle: skip HEARTBEAT-ONLY pushes when CI is red so the monitor
+      # doesn't flood inboxes with failure emails for a CI break it didn't cause.
+      # Action pushes (had_action=1) bypass — real fixes should land regardless.
+      if (( had_action == 0 )) && _ci_is_red; then
+        git -C "$ACTIVE_ROOT/backlog-infra" checkout -- "$status_file" 2>/dev/null || true
+        return 0
+      fi
       git -C "$ACTIVE_ROOT/backlog-infra" add "$status_file" 2>/dev/null || true
       git -C "$ACTIVE_ROOT/backlog-infra" pull --rebase origin main >/dev/null 2>&1 || true
       git -C "$ACTIVE_ROOT/backlog-infra" commit -m "monitor: sweep ${sweeps_total} (${fixed_total} fixed, ${flagged_total} flagged)" >/dev/null 2>&1 || true

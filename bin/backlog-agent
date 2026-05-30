@@ -285,6 +285,37 @@ BUDGET_STATE_FILE="${STATE_DIR}/backlog-agent-budget.json"
 # Set to 1 in tests / to hard-disable budget enforcement (no per-project pause).
 BUDGET_DISABLE="${BUDGET_DISABLE:-0}"
 
+# --- Per-item token/turn/spend ceiling (W2; docs/per-item-ceiling.md) ---
+# [pause-primitive consumer, scope=ITEM] The finest-grained pause primitive: a
+# single hard item can spiral (many turns, huge spend) WITHIN one tick, BELOW the
+# per-project budget's rolling-window radar (the budget caps a project's *rolling*
+# spend; one expensive tick can run away before it trips). Two layers:
+#   * PREVENTIVE (saves spend): when a per-item USD cap is set, pass claude
+#     `--max-budget-usd` so it self-stops before overspending. NB: this claude CLI
+#     has NO `--max-turns` flag, so the only native preventive cap is the dollar
+#     one; turns/tokens are enforced POST-HOC (below). Fallback agents get no flag.
+#   * POST-HOC (catches the runaway): after the tick, read THIS session's actual
+#     turns + tokens from claude's newest transcript (the same source the status
+#     hook parses — no change to the `claude -p` text invocation) and, if over the
+#     ceiling on an INCOMPLETE item, REOPEN it ([~]→[ ]) with an inline note +
+#     failcount_bump, composing with the Guard-1 circuit breaker (→ [?] after K
+#     consecutive). A COMPLETED item ([x]) that ran hot is LOGGED, not reopened
+#     (reopening finished work would only re-spend it). Keep any commit (mirror
+#     Guards 2/3/4 — no auto-revert of an already-pushed commit). NOT infra-exempt:
+#     a runaway TASK is a bug-catch, not a deliberate policy pause (unlike the
+#     budget/freeze fleet holds), and a spiraling infra item is the most dangerous.
+# Inert/opt-in: absent ⇒ uncapped (env defaults 0). Per-project + per-item caps in
+# CEILINGS_FILE override the env defaults. FAIL-OPEN: unparseable usage ⇒ no
+# enforcement (today's behaviour). node (a hard dep) does the JSON; no jq.
+CEILINGS_FILE="${STATE_DIR}/backlog-ceilings.json"
+MAX_TURNS_PER_TICK="${MAX_TURNS_PER_TICK:-0}"            # 0 = uncapped
+# Token sum is input+output+cache_creation (excludes cache_read) — IDENTICAL to
+# the budget ledger's `tokens` headline, so the two caps measure the same thing.
+MAX_TOKENS_PER_TICK="${MAX_TOKENS_PER_TICK:-0}"          # 0 = uncapped
+MAX_BUDGET_USD_PER_TICK="${MAX_BUDGET_USD_PER_TICK:-0}"  # 0 = no --max-budget-usd
+# Set to 1 in tests / to hard-disable the ceiling (no preventive flag, no post-hoc).
+CEILING_DISABLE="${CEILING_DISABLE:-0}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -1537,6 +1568,118 @@ run_gate() {
   return "$grc"
 }
 
+# --- Per-item token/turn/spend ceiling helpers (W2; docs/per-item-ceiling.md) ---
+
+# Resolve the effective per-item ceilings for an item title into the globals
+# CEIL_TURNS, CEIL_TOKENS (integers, 0 = uncapped) and CEIL_BUDGET_USD (a number
+# string, "0" = no preventive cap). Precedence (each later layer overrides):
+#   env defaults (MAX_*_PER_TICK)  →  CEILINGS_FILE top-level (project default)
+#   →  CEILINGS_FILE `items` entry whose KEY is a substring of the item title.
+# Absent everything ⇒ 0/0/0 (uncapped). FAIL-OPEN: unreadable config ⇒ env values
+# only. node (a hard dep) parses the JSON robustly; no jq. Called once pre-tick
+# (to build --max-budget-usd) and reused post-tick (the globals persist).
+resolve_ceiling() {
+  CEIL_TURNS=0; CEIL_TOKENS=0; CEIL_BUDGET_USD=0
+  [[ "$CEILING_DISABLE" == "1" ]] && return 0
+  command -v node >/dev/null 2>&1 || return 0
+  [[ -n "${1:-}" ]] || return 0
+  local out
+  out="$(node -e '
+    const fs = require("fs");
+    const [file, item, envTurns, envTokens, envBudget] = process.argv.slice(1);
+    const numOr = (v, d) => { const n = parseFloat(v); return Number.isFinite(n) ? n : d; };
+    let turns = numOr(envTurns, 0), tokens = numOr(envTokens, 0), budget = numOr(envBudget, 0);
+    const apply = (o) => {
+      if (!o || typeof o !== "object") return;
+      if (Number.isFinite(o.max_turns))      turns  = o.max_turns;
+      if (Number.isFinite(o.max_tokens))     tokens = o.max_tokens;
+      if (Number.isFinite(o.max_budget_usd)) budget = o.max_budget_usd;
+    };
+    let cfg = null;
+    try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch {}
+    if (cfg && typeof cfg === "object") {
+      apply(cfg);                                       // project-level default
+      const items = cfg.items && typeof cfg.items === "object" ? cfg.items : null;
+      if (items) {                                      // per-item override
+        for (const k of Object.keys(items)) {
+          if (k && item.includes(k)) { apply(items[k]); break; }
+        }
+      }
+    }
+    const i = n => (n > 0 ? Math.floor(n) : 0);
+    const u = n => (n > 0 ? n : 0);
+    process.stdout.write(i(turns) + " " + i(tokens) + " " + u(budget));
+  ' "$CEILINGS_FILE" "$1" "$MAX_TURNS_PER_TICK" "$MAX_TOKENS_PER_TICK" "$MAX_BUDGET_USD_PER_TICK" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 0
+  read -r CEIL_TURNS CEIL_TOKENS CEIL_BUDGET_USD <<<"$out"
+  [[ "$CEIL_TURNS"      =~ ^[0-9]+$ ]]            || CEIL_TURNS=0
+  [[ "$CEIL_TOKENS"     =~ ^[0-9]+$ ]]            || CEIL_TOKENS=0
+  [[ "$CEIL_BUDGET_USD" =~ ^[0-9]+(\.[0-9]+)?$ ]] || CEIL_BUDGET_USD=0
+  return 0
+}
+
+# Read THIS tick's actual turns + headline tokens from claude's newest session
+# transcript into the globals USAGE_TURNS / USAGE_TOKENS (empty ⇒ unreadable ⇒
+# the caller FAILS OPEN). Mirrors backlog-agent-status.mjs findNewestTranscript +
+# extractUsage: the transcript lives under ~/.claude/projects/<cwd-with-/-as-->/
+# (newest *.jsonl by mtime); each `claude -p` writes a fresh session there, so the
+# newest one right after claude exits is THIS tick's. Headline tokens =
+# input+output+cache_creation (excludes cache_read), identical to the ledger's
+# `tokens` so the ceiling and the per-project budget measure the same quantity.
+_read_tick_usage() {
+  USAGE_TURNS=""; USAGE_TOKENS=""
+  command -v node >/dev/null 2>&1 || return 0
+  local out
+  out="$(node -e '
+    const fs = require("fs"), os = require("os"), path = require("path");
+    const cwd = process.argv[1];
+    const dir = path.join(os.homedir(), ".claude", "projects", cwd.split("/").join("-"));
+    let newest = null, mt = 0;
+    try {
+      for (const n of fs.readdirSync(dir)) {
+        if (!n.endsWith(".jsonl")) continue;
+        const f = path.join(dir, n);
+        let m; try { m = fs.statSync(f).mtimeMs; } catch { continue; }
+        if (m > mt) { mt = m; newest = f; }
+      }
+    } catch { process.exit(0); }                        // no dir ⇒ fail open
+    if (!newest) process.exit(0);
+    let text; try { text = fs.readFileSync(newest, "utf8"); } catch { process.exit(0); }
+    let lastResult = null, turns = 0;
+    const seen = new Set();
+    const summed = { input: 0, output: 0, cache_creation: 0 };
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let o; try { o = JSON.parse(line); } catch { continue; }
+      if (o.type === "result" && (o.usage || o.num_turns != null)) {
+        lastResult = o;
+      } else if (o.type === "assistant" && o.message && o.message.usage) {
+        const id = o.message.id;
+        if (id) { if (seen.has(id)) continue; seen.add(id); }
+        const usg = o.message.usage;
+        summed.input          += usg.input_tokens ?? 0;
+        summed.output         += usg.output_tokens ?? 0;
+        summed.cache_creation += usg.cache_creation_input_tokens ?? 0;
+        if (o.message.stop_reason) turns++;
+      }
+    }
+    let t, tok;
+    if (lastResult && lastResult.usage) {
+      const usg = lastResult.usage;
+      t   = lastResult.num_turns != null ? lastResult.num_turns : turns;
+      tok = (usg.input_tokens ?? 0) + (usg.output_tokens ?? 0) + (usg.cache_creation_input_tokens ?? 0);
+    } else {
+      t = turns; tok = summed.input + summed.output + summed.cache_creation;
+    }
+    process.stdout.write(String(t) + " " + String(tok));
+  ' "$PWD" 2>/dev/null || true)"
+  [[ -n "$out" ]] || return 0
+  read -r USAGE_TURNS USAGE_TOKENS <<<"$out"
+  [[ "$USAGE_TURNS"  =~ ^[0-9]+$ ]] || USAGE_TURNS=""
+  [[ "$USAGE_TOKENS" =~ ^[0-9]+$ ]] || USAGE_TOKENS=""
+  return 0
+}
+
 # --- Secret-scanning pre-push gate: install (docs/secret-scan.md) ---
 # The hook stub (prepush_hook_body), version/marker, and foreign/current
 # detectors live in _lib.sh — shared with the CLI's install-hooks + doctor.
@@ -2023,12 +2166,21 @@ tick_once() {
   # configured fallback agent on the SAME prompt instead. If the fallback
   # command can't be built (defensive — availability was already checked),
   # fall back to claude so the tick isn't lost.
+  # Resolve the per-item ceilings ONCE here (CEIL_TURNS / CEIL_TOKENS / CEIL_BUDGET_USD,
+  # globals). Used now to build the preventive --max-budget-usd flag, and reused
+  # post-tick for the turns/tokens guard. docs/per-item-ceiling.md.
+  resolve_ceiling "$item_title"
   local -a agent_cmd
   if [[ -n "$use_fallback" ]] && build_fallback_cmd "$prompt"; then
     agent_cmd=( "${FALLBACK_CMD[@]}" )
   else
     use_fallback=""; agent_name="claude"
-    agent_cmd=( claude -p --fallback-model claude-haiku-4-5 "$prompt" )
+    agent_cmd=( claude -p --fallback-model claude-haiku-4-5 )
+    # Preventive per-item SPEND cap: claude self-stops when predicted spend would
+    # exceed the budget (saves the runaway tick's tail). Only the native dollar cap
+    # exists in this CLI (no --max-turns); turns/tokens are caught post-hoc below.
+    [[ "$CEIL_BUDGET_USD" != "0" ]] && agent_cmd+=( --max-budget-usd "$CEIL_BUDGET_USD" )
+    agent_cmd+=( "$prompt" )
   fi
   local claude_pid wd_pid
   "${agent_cmd[@]}" < /dev/null > "$capture_file" 2>&1 &
@@ -2105,6 +2257,67 @@ tick_once() {
     local work_committed=false
     [[ -n "$work_base" && -n "$work_head" && "$work_head" != "$work_base" ]] && work_committed=true
 
+    # --- Guard 6 (W2): per-item token/turn ceiling (docs/per-item-ceiling.md) ---
+    # [pause-primitive consumer, scope=ITEM] The preventive --max-budget-usd cap
+    # (built above) saves the spend tail; this is the POST-HOC backstop catching
+    # the runaway TASK that turns/tokens-spiraled within this one tick (below the
+    # per-project budget's rolling radar). Read THIS session's actual usage from
+    # claude's newest transcript and, if over an effective ceiling, act:
+    #   * INCOMPLETE item ([~] still): reopen [~]→[ ] + inline note + failcount_bump
+    #     (composes with the Guard-1 breaker → [?] after K). This is the runaway the
+    #     ceiling exists to stop continuing next tick. Keep any commit (Guards 2/3/4).
+    #   * COMPLETED item ([x] this tick): LOG only — the grind already ended in
+    #     success; reopening finished work would only re-spend it. Surface the cost.
+    # Runs regardless of work_committed (a no-commit spin is the worst runaway).
+    # FAIL-OPEN: unreadable usage ⇒ no action. Mutually exclusive with Guard 4's
+    # reopen by construction (Guard 4 only fires on [x]; the ceiling only reopens [~]).
+    local ceiling_breached=false
+    if [[ "$claimed" == "true" && "$CEILING_DISABLE" != "1" ]] \
+         && (( CEIL_TURNS > 0 || CEIL_TOKENS > 0 )); then
+      _read_tick_usage
+      if [[ -n "$USAGE_TURNS" && -n "$USAGE_TOKENS" ]]; then
+        local over=""
+        # --max-budget-usd self-stops AT the cap, so a turn ceiling hit is `>=`
+        # (reaching it is the breach); tokens is `>` (strictly over the cap).
+        (( CEIL_TOKENS > 0 && USAGE_TOKENS > CEIL_TOKENS )) && over+="tokens ${USAGE_TOKENS}/${CEIL_TOKENS} "
+        (( CEIL_TURNS  > 0 && USAGE_TURNS >= CEIL_TURNS  )) && over+="turns ${USAGE_TURNS}/${CEIL_TURNS} "
+        if [[ -n "$over" ]]; then
+          over="${over% }"
+          if _completion_claimed "$item_title"; then
+            echo "  [ceiling] '${item_title}' completed but ran hot (${over}) — flagging (not reopening finished work)" | tee -a "$LOG_FILE"
+            log_event item_ceiling item "$item_title" breach "$over" reopened false completed true
+          else
+            ceiling_breached=true
+            echo "  [ceiling] '${item_title}' exceeded its per-item ceiling (${over}) — reopening + bumping failcount (commit kept, flagged)" | tee -a "$LOG_FILE"
+            # Reopen [~]→[ ] for THIS item (literal title substring match), strip
+            # the owner stamp (else it leaks into the stripped title on the next
+            # pick + claim, drifting the failcount key — same fix as Guards 4 / the
+            # exit≠0 unclaim), and append an inline ceiling note. Scoped git add.
+            _local_awk_inplace "$BACKLOG_FILE" '
+              BEGIN { in_open=0; done=0 }
+              /^## Open/       { in_open=1; print; next }
+              /^## [A-Z]/      { if (done) exit; in_open=0; print; next }
+              in_open && !done && /^(- )?\[~\] / && index($0, title) {
+                sub(/\[~\]/, "[ ]"); sub(/ +<!-- @[^>]*-->[ ]*$/, "")
+                $0 = $0 " <!-- ceiling: " note " -->"; done=1
+              }
+              { print }
+            ' -v title="$item_title" -v note="$over" 2>/dev/null || true
+            if ! git -C "$PWD" diff --quiet "$BACKLOG_FILE" 2>/dev/null; then
+              git -C "$PWD" add "$BACKLOG_FILE" 2>/dev/null
+              git -C "$PWD" commit -m "ceiling: reopen ${item_title}" >/dev/null 2>&1
+              git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || true
+              echo "  [ceiling] reopened ${item_title}" | tee -a "$LOG_FILE"
+            else
+              echo "  [ceiling] WARNING: '${item_title}' over ceiling but no [~] match in ## Open to reopen — needs manual attention" | tee -a "$LOG_FILE"
+            fi
+            local cfails; cfails="$(failcount_bump "$item_title")"
+            log_event item_ceiling item "$item_title" breach "$over" reopened true fails "$cfails"
+          fi
+        fi
+      fi
+    fi
+
     # --- Guard 4 (W2): per-tick outcome verification (the first VETOING guard) ---
     # exit 0 + claude's self-report is NOT proof the gate is green. When this tick
     # both LANDED A COMMIT and CLAIMED COMPLETION (the item is now [x]) and the
@@ -2157,8 +2370,9 @@ tick_once() {
     fi
 
     # Guard 1 (W2): a clean tick clears the item's consecutive-failure streak —
-    # but only when verification did NOT fail (a failure already bumped above).
-    if [[ "$verify_failed" != "true" ]]; then
+    # but only when neither verification NOR the ceiling failed (either already
+    # bumped above; resetting here would erase that and defeat the breaker).
+    if [[ "$verify_failed" != "true" && "$ceiling_breached" != "true" ]]; then
       failcount_reset "$item_title"
     fi
 
@@ -2232,7 +2446,7 @@ tick_once() {
         # Guard 4 ordering: VERIFY FIRST — never arm the freeze (hold the whole
         # fleet) on a bin/ commit that just FAILED its own gate; the item is being
         # reopened, so there's no verified infra change to propagate.
-        if [[ "$verify_failed" != "true" ]] && freeze_exempt && command -v backlog-agents >/dev/null 2>&1; then
+        if [[ "$verify_failed" != "true" && "$ceiling_breached" != "true" ]] && freeze_exempt && command -v backlog-agents >/dev/null 2>&1; then
           local fleet_hit=""
           while IFS= read -r f; do
             [[ -z "$f" ]] && continue

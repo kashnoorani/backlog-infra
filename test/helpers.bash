@@ -46,6 +46,13 @@ _setup_repo() {
   # seeded budgets file + history ledger.
   export BUDGET_DISABLE=1
 
+  # Per-item token/turn/spend ceiling (bin/backlog-agent resolve_ceiling + the
+  # post-hoc Guard 6): disabled by default so ordinary tick tests never read a
+  # transcript, never inject --max-budget-usd, and never reopen on usage;
+  # per-item-ceiling.bats re-enables it (CEILING_DISABLE=0) with a seeded
+  # transcript + ceilings file.
+  export CEILING_DISABLE=1
+
   # Deterministic, prompt-free git.
   export GIT_TERMINAL_PROMPT=0
   export GIT_AUTHOR_NAME=Test GIT_AUTHOR_EMAIL=test@example.com

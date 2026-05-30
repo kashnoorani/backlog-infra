@@ -536,6 +536,40 @@ log_event() {
   printf '%s\n' "$line" >> "$EVENT_LOG_FILE" 2>/dev/null || true
 }
 
+# --- fault injection (#54 part c — test-only resilience harness) ---
+# Deterministic pause hook for the two-clone CONCURRENT CAS push-rejection race
+# (test/integration-twoclone.bats). The sequential ticks the harness already runs
+# can't hit the window where two clones commit a claim off the SAME base and one
+# push is rejected — reproducing it needs a tick to PAUSE between its claim commit
+# and its claim push so the other clone's push lands first. This is that pause.
+#
+# A STRICT NO-OP unless $INJECT_FAULT is set, so it is inert on the live fleet
+# (INJECT_FAULT is never configured there — it's a test-only env var). Format:
+#   INJECT_FAULT=<point>:<barrier-file>   block until <barrier-file> exists (the
+#                                         test touches it to release this tick —
+#                                         lets it interleave two live ticks), or
+#   INJECT_FAULT=<point>:sleep:<secs>     block for <secs> (fixed-delay variant).
+# The barrier wait is BOUNDED by INJECT_FAULT_TIMEOUT (default 60s) so a mis-wired
+# test can never wedge a tick forever. <point> today: claim_pre_push.
+_inject_fault() {
+  [[ -z "${INJECT_FAULT:-}" ]] && return 0
+  local point="$1" want="${INJECT_FAULT%%:*}"
+  [[ "$point" != "$want" ]] && return 0
+  local spec="${INJECT_FAULT#*:}"
+  if [[ "$spec" == sleep:* ]]; then
+    sleep "${spec#sleep:}" 2>/dev/null || true
+  else
+    local waited=0 limit="${INJECT_FAULT_TIMEOUT:-60}"
+    while [[ ! -e "$spec" ]]; do
+      sleep 0.1
+      waited=$((waited + 1))
+      [[ "$waited" -ge $((limit * 10)) ]] && break
+    done
+  fi
+  log_event inject_fault point "$point" spec "$spec"
+  return 0
+}
+
 # --- per-item circuit breaker + retry budget (W2) ---
 # A JSON object in $FAILCOUNTS_FILE keyed by the exact item title (same string
 # log_event carries), so quotes/backslashes in titles must round-trip safely —
@@ -2589,6 +2623,12 @@ tick_once() {
       git -C "$PWD" add "$BACKLOG_FILE"
       if git -C "$PWD" commit -m "claim: ${item_title}" >/dev/null 2>&1; then
         local claim_pushed=true
+        # #54(c): deterministic fault point for the two-clone concurrent CAS
+        # push-rejection race — the claim is committed but NOT yet pushed, so a
+        # test can pause here, let the other clone's push land, then release this
+        # one into a genuine non-fast-forward rejection (→ the recovery below).
+        # No-op unless INJECT_FAULT=claim_pre_push:<barrier> is set.
+        _inject_fault claim_pre_push
         git -C "$PWD" push origin "$(git -C "$PWD" rev-parse --abbrev-ref HEAD 2>/dev/null)" 2>/dev/null || claim_pushed=false
         if [[ "$claim_pushed" == "true" ]]; then
           claimed=true

@@ -15,16 +15,17 @@
 #   * a completed item is never re-worked by the other clone — one winner      (T2)
 #   * a dead clone's [~] claim is reaped + handed off cross-machine, and the
 #     reclaim-before-claim ordering keeps the claim a non-zero diff            (T3)
+#   * the true *concurrent* CAS push-rejection race — both clones commit a claim
+#     off the SAME base, one push lands, the other is rejected → rebase-conflict
+#     → reset --hard to origin (one winner, no double-work)                    (T4)
 #
-# Deliberately NOT covered here — the true *concurrent* CAS push-rejection race
-# (both clones commit a claim off the same base, one push lands, the other is
-# rejected → reset --hard). Hitting that window deterministically requires
-# pausing a tick between its fetch and its push, which is exactly what the
-# item's `--inject-fault` mode (part c) is for. With sequential ticks the loser
-# always *fetches* the winner's claim before it would push, so it takes the
-# benign skip/handoff path below rather than the reset path. The reset-on-
-# divergence recovery itself is covered single-clone in tick.bats ("diverged
-# local HEAD is reset to origin").
+# T4 reaches that window deterministically via the driver's `_inject_fault` hook
+# (#54 part c): the losing tick is paused between its claim COMMIT and its claim
+# PUSH (INJECT_FAULT=claim_pre_push:<barrier>) so the winner's push lands first.
+# Without the pause the loser always *fetches* the winner's claim before it would
+# push and takes the benign skip/handoff path instead of the reset path. The
+# single-clone reset-on-divergence recovery is also covered in tick.bats
+# ("diverged local HEAD is reset to origin").
 #
 # Opt out of this (slower, multi-clone) file with TWOCLONE_DISABLE=1, mirroring
 # the suite's *_DISABLE convention; it runs by default so the canary covers it.
@@ -160,4 +161,73 @@ origin_commit_count() { git -C "$WORK" fetch -q origin; git -C "$WORK" log origi
   # And the dead clone A, on its next fetch, converges on B's completion.
   git -C "$WORK" fetch -q origin
   [[ "$(git -C "$WORK" show origin/main:docs/Backlog.md)" == *"[x] handoff task"* ]]
+}
+
+# T4 — the true CONCURRENT CAS push-rejection race (the part-(c) keystone). Both
+# clones claim the SAME item off the SAME base; B is paused between its claim
+# COMMIT and its claim PUSH (INJECT_FAULT=claim_pre_push) so A's claim+completion
+# reach origin first. When B is released its push is a genuine non-fast-forward
+# rejection → B rebases, conflicts on the same backlog line, and reset --hard's to
+# origin. That reset-on-divergence path is exactly what sequential ticks can't
+# reach (the loser would otherwise fetch A's claim before pushing and skip
+# benignly). Asserts: one winner, the item worked exactly once, B's claim never
+# lands, and B converges on origin with no stuck [~].
+@test "concurrent claim race: the rejected pusher rebase-conflicts and resets to origin" {
+  seed_and_clone_b "- [ ] solo task"
+  make_curl live                     # neither tick has a stale claim to probe
+  make_claude_complete_push          # A claims + completes + pushes (B never reaches claude)
+
+  local barrier="$BATS_TEST_TMPDIR/release-b"
+  local b_out="$BATS_TEST_TMPDIR/b_tick.out"
+
+  # B must claim under a DIFFERENT host identity than A. Both clones otherwise run
+  # on this one test host, so their claim lines (`[~] … <!-- @host -->`) are
+  # byte-identical and B's rebased claim is dropped as already-applied — the
+  # benign "rebase + retry" path, not the conflict we're testing. Production
+  # clones are different machines; emulate that with a B-only `hostname` shim so
+  # B's owner stamp differs and the rebase genuinely conflicts → reset to origin.
+  local bshim="$BATS_TEST_TMPDIR/shim-b"
+  mkdir -p "$bshim"
+  printf '#!/usr/bin/env bash\necho clone-b-host\n' > "$bshim/hostname"
+  chmod +x "$bshim/hostname"
+
+  # B starts first and parks AFTER committing its claim, BEFORE pushing it.
+  # 3>&- closes bats's status FD in the background job so `wait` can't hang.
+  ( cd "$WORK_B" && PATH="$bshim:$PATH" \
+      INJECT_FAULT="claim_pre_push:$barrier" INJECT_FAULT_TIMEOUT=30 \
+      "$AGENT_BIN" tick >"$b_out" 2>&1 3>&- ) &
+  local b_pid=$!
+
+  # Wait until B has committed its claim (i.e. it is parked at the barrier).
+  local waited=0
+  until git -C "$WORK_B" log -1 --format='%s' 2>/dev/null | grep -q '^claim: solo task'; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [ "$waited" -ge 300 ] && break    # 30s safety net
+  done
+  git -C "$WORK_B" log -1 --format='%s' | grep -q '^claim: solo task'  # B really parked
+
+  # A ticks to completion while B is parked: A's claim + completion reach origin.
+  cd "$WORK"; run_tick
+  [ "$status" -eq 0 ]
+
+  # Release B into a now-guaranteed rejected push, and let its tick finish.
+  touch "$barrier"
+  wait "$b_pid"; local b_rc=$?
+  [ "$b_rc" -eq 0 ]                                   # claim-lost path returns 0
+
+  # B took the reset-on-divergence recovery, not the benign skip/handoff.
+  grep -q 'reset to origin' "$b_out"
+
+  # Origin is the arbiter: A won the item; it was completed exactly once and B's
+  # losing claim never landed.
+  local backlog; backlog="$(origin_backlog)"
+  [[ "$backlog" == *"[x] solo task"* ]]
+  [ "$(origin_commit_count 'work: did the thing')" -eq 1 ]
+  [ "$(origin_commit_count 'claim: solo task')" -eq 1 ]
+
+  # B converged on origin (reset --hard): no stuck [~], HEAD == origin/main.
+  ! open_marker_in "$WORK_B" '~'
+  git -C "$WORK_B" fetch -q origin
+  [ "$(git -C "$WORK_B" rev-parse HEAD)" = "$(git -C "$WORK_B" rev-parse origin/main)" ]
 }

@@ -2512,7 +2512,7 @@ do_canary() {
 #   backlog-agents unfreeze                     manual override clear
 #
 # Overrides (testing): BACKLOGS_API_BASE, FREEZE_URL, HEALTH_URL, FREEZE_LIVENESS_SECS.
-API_BASE="${BACKLOGS_API_BASE:-https://fleet.kashifnoorani.org}"
+API_BASE="${BACKLOGS_API_BASE:-https://kash-backlogs.pages.dev}"
 FREEZE_URL="${FREEZE_URL:-${API_BASE}/api/fleet-control}"
 HEALTH_URL="${HEALTH_URL:-${API_BASE}/api/health}"
 COOLDOWN_URL="${COOLDOWN_URL:-${API_BASE}/api/cooldown}"

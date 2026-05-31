@@ -212,7 +212,7 @@ DIFF_SIZE_MAX_LINES=400
 # (it already speaks jq + computes version-skew); the driver only does the cheap
 # jq-free read here and delegates the rest.
 # Base URL for the CF dashboard API (health-ingest, fleet-control, etc.).
-API_BASE="${BACKLOGS_API_BASE:-https://fleet.kashifnoorani.org}"
+API_BASE="${BACKLOGS_API_BASE:-https://kash-backlogs.pages.dev}"
 FREEZE_URL="${FREEZE_URL:-${API_BASE}/api/fleet-control}"
 FREEZE_PROJECT="${FREEZE_PROJECT:-backlog-infra}"
 FREEZE_CACHE="${STATE_DIR}/fleet-freeze.cache"

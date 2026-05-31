@@ -55,6 +55,9 @@ build_tool_profile_settings() {
     "Bash(curl:*)" "Bash(wget:*)" "Bash(nc:*)" "Bash(ncat:*)" "Bash(telnet:*)"
     "Read(~/.ssh/**)" "Read(~/.aws/**)" "Read(~/.gnupg/**)"
     "Read(~/.config/backlog/**)" "Read(.env)" "Read(./.env)" "Read(**/.env)"
+    "Edit(docs/Backlog.md)" "Write(docs/Backlog.md)"
+    "Edit(Backlog.md)" "Write(Backlog.md)"
+    "Edit(backlog.txt)" "Write(backlog.txt)"
   )
   local p
   for p in $PROTECTED_PATHS; do

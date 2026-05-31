@@ -297,6 +297,9 @@ SECRET_SCAN_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/backl
 # Set to 1 in tests / to hard-disable the secret gate (skips ensure + Guard 5).
 SECRET_SCAN_DISABLE="${SECRET_SCAN_DISABLE:-0}"
 
+# Pre-tick backlog snapshot — off-repo safety net. Set SNAPSHOT_DISABLE=1 to skip.
+SNAPSHOT_BIN="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/backlog-snapshot.sh"
+
 # --- Per-project budget enforcement (W2; docs/per-project-budget.md) ---
 # [pause-primitive consumer, scope=project] A self-imposed *spend* cap, distinct
 # from the account-level plan-limit cooldown (Anthropic's hard cap, Layer 2): if
@@ -2663,6 +2666,11 @@ tick_once() {
   # signature after a failure, then flush it to the log.
   local capture_file
   capture_file="$(mktemp 2>/dev/null || echo "${STATE_DIR}/.claude-out.$$")"
+  # Pre-tick backlog snapshot — off-repo safety net so a corrupted Backlog is a
+  # one-command restore instead of git archaeology. SNAPSHOT_DISABLE=1 to skip.
+  if [[ "${SNAPSHOT_DISABLE:-0}" != "1" && -x "$SNAPSHOT_BIN" ]]; then
+    "$SNAPSHOT_BIN" >/dev/null 2>&1 || true
+  fi
   # Snapshot HEAD immediately before claude runs so Guards 2/3 can scope their
   # diff to exactly the commit(s) claude pushed this tick (excluding the
   # daemon's own reclaim/claim commits, which only touch the backlog file).

@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-31T10:11:41Z",
+  "last_sweep_at": "2026-05-31T10:17:49Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 663,
+  "sweeps_total": 666,
   "fixed_total": 187,
   "flagged_total": 30,
   "recent_actions": [{"ts":"2026-05-31T08:49:37Z","project":"dark-mode-safari","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T08:55:46Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T08:55:46Z","project":"dark-mode-safari","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T08:57:51Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T08:59:55Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:04:02Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:06:06Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:08:11Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:10:14Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:12:17Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:14:21Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:16:25Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:18:29Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:20:34Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T09:26:42Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T09:28:45Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T09:28:45Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T09:28:45Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T09:28:45Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T09:28:45Z","project":"sacred-geography","action":"stale_lock","result":"fixed"}]

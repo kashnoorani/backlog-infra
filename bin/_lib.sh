@@ -89,6 +89,19 @@ tool_profile_plist_env() {
   printf '\n        <key>AUTONOMOUS_TOOL_PROFILE</key>\n        <string>1</string>'
 }
 
+# Post-completion review pass (docs/post-completion-review.md). Same per-project,
+# per-machine, never-committed marker mechanism as tool_profile_plist_env, under a
+# sibling dir: ~/.claude/post-review/<project>.on. Emit the launchd
+# <EnvironmentVariables> snippet that sets POST_COMPLETION_REVIEW=1 iff the marker
+# for $1 exists; empty otherwise (plist byte-identical to the pre-flip form). When
+# 1, a completed tick gets a cheap haiku review of work_base..work_head vs the item
+# intent (annotate-only — flags, never reopens). Rollback = rm marker + reinstall.
+post_review_plist_env() {
+  local project="$1"
+  [[ -f "$HOME/.claude/post-review/${project}.on" ]] || return 0
+  printf '\n        <key>POST_COMPLETION_REVIEW</key>\n        <string>1</string>'
+}
+
 # Check SSH connectivity to GitHub. Critical for cloning, pulling, and pushing.
 # $1 = timeout in seconds (default 5). Returns 0 if healthy, non-zero if broken.
 check_github_ssh() {

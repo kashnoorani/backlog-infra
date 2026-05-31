@@ -65,6 +65,12 @@ _setup_repo() {
   # tick tests; tool-profile.bats re-enables it (AUTONOMOUS_TOOL_PROFILE=1).
   export AUTONOMOUS_TOOL_PROFILE=0
 
+  # Post-completion semantic review (bin/backlog-agent post_completion_review +
+  # Guard 8): OPT-IN, off by default. Pin it to 0 explicitly so a completing tick in
+  # an ordinary test never fires the extra haiku review call;
+  # post-completion-review.bats re-enables it (POST_COMPLETION_REVIEW=1).
+  export POST_COMPLETION_REVIEW=0
+
   # Remote-unblock poll-and-apply (bin/backlog-agent process_unblock_requests /
   # _d1_unblock_get): disabled by default so ordinary tick tests never reach the
   # network; remote-unblock.bats re-enables it (REMOTE_UNBLOCK_DISABLE=0) behind a

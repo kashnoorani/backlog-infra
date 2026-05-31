@@ -378,6 +378,23 @@ INJECTION_GUARD_DISABLE="${INJECTION_GUARD_DISABLE:-0}"
 # unprofiled this slice. docs/tool-profile.md.
 AUTONOMOUS_TOOL_PROFILE="${AUTONOMOUS_TOOL_PROFILE:-0}"
 
+# Post-completion review pass (W2, docs/post-completion-review.md). [guard-primitive
+# consumer] A green gate (Guard 4) proves a completed tick BUILDS; it does not prove
+# the diff MATCHES the item's stated intent (the canonical failure: a tick "edits the
+# backlog" but also drops an unrelated [?] item — the build still passes). When 1, a
+# completed tick gets a cheap second agent (haiku) that diffs work_base..work_head
+# against the item title+body and flags intent-vs-change mismatches incl. unrelated
+# collateral edits. ANNOTATE-ONLY: it logs + notifies, the [x] STANDS (no reopen —
+# observe signal quality before letting it veto). OPT-IN like the tool profile: default
+# 0 (off); flipped per project via the per-machine marker ~/.claude/post-review/<proj>.on
+# (threaded into the daemon plist by do_install_daemon). The haiku call adds latency +
+# tokens to every completion, hence opt-in + canary-first.
+POST_COMPLETION_REVIEW="${POST_COMPLETION_REVIEW:-0}"
+# Cap (insertions+deletions) of the diff sent to the reviewer. Above it the review is
+# SKIPPED and logged (no silent caps — Guard 2 separately flags oversize commits). 0 =
+# uncapped.
+POST_REVIEW_MAX_LINES="${POST_REVIEW_MAX_LINES:-2000}"
+
 # Match worker-eligible items: `[ ] foo` (new), `- [ ] foo` (GFM new),
 # or the same with `[!]` (answered, ready to retry after a `[?]` round-trip).
 # Bare `[ ]` (no leading `- `) is the legacy form, still accepted.
@@ -1874,6 +1891,81 @@ _completion_claimed() {
     | grep -F -- "$item" | grep -qE '^(- )?\[x\] '
 }
 
+# --- Guard 8 (W2): post-completion semantic review (docs/post-completion-review.md) ---
+# [guard-primitive consumer] A green gate (Guard 4) proves the completed change
+# BUILDS; it does not prove it MATCHES the item's stated intent. Diff
+# work_base..work_head against the item title+body with a cheap haiku agent and flag
+# intent-vs-change mismatches (incl. unrelated collateral edits — the failure Guard 4
+# can't see because nothing breaks). ANNOTATE-ONLY by design: log + notify, the [x]
+# STANDS (no reopen — siblings Guards 2/3/5 are flag-only too; we observe signal
+# quality before considering a veto). OPT-IN: inert unless POST_COMPLETION_REVIEW=1
+# (per-project marker). Diff capped at POST_REVIEW_MAX_LINES — SKIP + log above it (no
+# silent caps). FAIL-OPEN: missing claude / empty diff / unparseable verdict ⇒ no
+# action. Args: <item_title> <work_base_sha> <work_head_sha>.
+post_completion_review() {
+  local item_title="$1" work_base="$2" work_head="$3"
+  [[ "$POST_COMPLETION_REVIEW" == "1" ]] || return 0
+  command -v claude >/dev/null 2>&1 || return 0
+  [[ -n "$work_base" && -n "$work_head" && "$work_base" != "$work_head" ]] || return 0
+
+  # Size guard — SKIP (not truncate) above the ceiling, and log so it is never silent.
+  local review_lines
+  review_lines="$(git -C "$PWD" diff --numstat "$work_base" "$work_head" 2>/dev/null \
+    | awk '{ a=($1=="-"?0:$1); d=($2=="-"?0:$2); sum+=a+d } END { print sum+0 }' || echo 0)"
+  review_lines="${review_lines:-0}"
+  if (( POST_REVIEW_MAX_LINES > 0 && review_lines > POST_REVIEW_MAX_LINES )); then
+    echo "  [post-review] skipped '${item_title}' — diff ${review_lines} lines > ${POST_REVIEW_MAX_LINES} cap (Guard 2 flags oversize separately)" | tee -a "$LOG_FILE"
+    log_event post_completion_review_skipped item "$item_title" reason oversize lines "$review_lines" max_lines "$POST_REVIEW_MAX_LINES"
+    return 0
+  fi
+
+  local item_body diff_text prompt out verdict reason
+  # Best-effort intent context: the item's line in the backlog (titles are long
+  # single-line entries here). Falls back to the bare title.
+  item_body="$(grep -F -- "$item_title" "$BACKLOG_FILE" 2>/dev/null | head -1 || true)"
+  [[ -z "$item_body" ]] && item_body="$item_title"
+  diff_text="$(git -C "$PWD" diff "$work_base" "$work_head" 2>/dev/null || echo '')"
+  [[ -z "$diff_text" ]] && return 0
+
+  prompt="You are a strict code-review checker. An autonomous agent just marked a backlog item DONE. Judge ONLY two things: (1) does the committed diff actually fulfil the item's stated intent? (2) does it contain unrelated collateral changes — edits not needed for this item? Be skeptical; a passing build does not mean the intent was met.
+
+BACKLOG ITEM:
+${item_body}
+
+COMMITTED DIFF (git diff ${work_base}..${work_head}):
+${diff_text}
+
+Respond with EXACTLY these two lines and nothing else:
+VERDICT: MATCH (diff fulfils the item AND has no unrelated collateral changes) OR MISMATCH (does not fulfil the item, OR contains unrelated changes)
+REASON: <one short sentence>"
+
+  # Pass the prompt on stdin (a large diff would blow ARG_MAX as an argv). Pin haiku
+  # for cost; FAIL-OPEN on any error.
+  out="$(printf '%s' "$prompt" | claude -p --model claude-haiku-4-5 2>/dev/null || true)"
+  if [[ -z "$out" ]]; then
+    log_event post_completion_review_error item "$item_title" reason no_output
+    return 0
+  fi
+
+  verdict="$(printf '%s\n' "$out" | grep -oiE 'VERDICT:[[:space:]]*(MATCH|MISMATCH)' | head -1 \
+    | grep -oiE 'MISMATCH|MATCH' | tr '[:lower:]' '[:upper:]' || true)"
+  reason="$(printf '%s\n' "$out" | grep -iE 'REASON:' | head -1 | sed -E 's/^[[:space:]]*REASON:[[:space:]]*//I' || true)"
+  [[ -z "$reason" ]] && reason="(no reason given)"
+
+  if [[ "$verdict" == "MISMATCH" ]]; then
+    echo "  [post-review] MISMATCH for '${item_title}': ${reason} (annotate-only — [x] stands)" | tee -a "$LOG_FILE"
+    log_event post_completion_mismatch item "$item_title" range "${work_base}..${work_head}" lines "$review_lines" reason "$reason"
+    local prhost; prhost="$(_health_host 2>/dev/null || hostname -s 2>/dev/null || echo '?')"
+    notify_send "backlog-agent post-review MISMATCH: $(basename "$PWD")@${prhost}" \
+      "🔎 backlog-agent [$(basename "$PWD")@${prhost}] flagged a possible intent-vs-change mismatch on the just-completed item '${item_title}'. The [x] stands (annotate-only) — review the diff. Reason: ${reason}. Range ${work_base}..${work_head}."
+  elif [[ "$verdict" == "MATCH" ]]; then
+    log_event post_completion_match item "$item_title" lines "$review_lines"
+  else
+    echo "  [post-review] unparseable verdict for '${item_title}' — no action (fail-open)" | tee -a "$LOG_FILE"
+    log_event post_completion_review_error item "$item_title" reason unparseable_verdict
+  fi
+}
+
 # --- Guard 7 (W1): backlog-injection provenance helper (docs/threat-model.md §4.1) ---
 # Relocate EXECUTABLE ([ ]/[!]) items that appeared in ## Open between work_base
 # and the current working tree (other than the claimed item) into ## Thinking.
@@ -2927,6 +3019,16 @@ tick_once() {
       fi
     fi
 
+    # --- Guard 8 (W2): post-completion semantic review (annotate-only) ---
+    # Only review a tick that genuinely COMPLETED the item ([x]) and SURVIVED the
+    # build gate / ceiling (i.e. wasn't reopened above) — reviewing reopened or
+    # incomplete work would be noise. Inert unless POST_COMPLETION_REVIEW=1.
+    if [[ "$claimed" == "true" && "$work_committed" == "true" \
+          && "$verify_failed" != "true" && "$ceiling_breached" != "true" ]] \
+         && _completion_claimed "$item_title"; then
+      post_completion_review "$item_title" "$work_base" "$work_head"
+    fi
+
     # --- Guards 2 & 3 (W2): inspect what claude actually committed this tick ---
     # Both scope their diff to work_base..work_head — the commit(s) claude pushed,
     # excluding the daemon's own reclaim/claim/verify-reopen markup commits.
@@ -3460,6 +3562,12 @@ do_install_daemon() {
   local tp_env; tp_env="$(tool_profile_plist_env "$project")"
   [[ -n "$tp_env" ]] && echo "tool-profile: marker present — daemon will run under the deny-by-default profile (AUTONOMOUS_TOOL_PROFILE=1)"
 
+  # Post-completion review flip-on (docs/post-completion-review.md). Same per-machine
+  # marker mechanism: ~/.claude/post-review/<project>.on ⇒ POST_COMPLETION_REVIEW=1 in
+  # the daemon env. No marker ⇒ empty ⇒ plist byte-identical. Rollback = rm + reinstall.
+  local pr_env; pr_env="$(post_review_plist_env "$project")"
+  [[ -n "$pr_env" ]] && echo "post-review: marker present — daemon will run the post-completion review pass (POST_COMPLETION_REVIEW=1)"
+
   cat > "$plist_path" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3483,7 +3591,7 @@ do_install_daemon() {
         <key>PATH</key>
         <string>${bin_dir_x}:${home_x}/dotfiles/bin:${home_x}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>${home_x}</string>${tp_env}
+        <string>${home_x}</string>${tp_env}${pr_env}
     </dict>
 
     <key>RunAtLoad</key>

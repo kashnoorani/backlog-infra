@@ -70,16 +70,19 @@ build_tool_profile_settings() {
 
 # §5 tool-profile flip-on is PER PROJECT via a marker file, so a canary can be
 # flipped one project at a time and survive a `sync`/reinstall (which regenerates
-# the daemon plist). Emit the launchd <EnvironmentVariables> snippet that sets
-# AUTONOMOUS_TOOL_PROFILE=1 iff the marker (.claude/tool-profile.on) exists under
-# $1 (project root); empty otherwise. The driver injects the constrained --settings
-# on every tick when the env is 1. Rollback = rm the marker + reinstall the daemon.
-# Quote-free output, so no XML escaping needed. do_install_daemon splices the result
-# into the plist's EnvironmentVariables dict; a bats test asserts it without a live
-# launchctl bootstrap.
+# the daemon plist). The marker lives OUTSIDE the repo at
+# ~/.claude/tool-profile/<project>.on — per-machine state that must never be
+# committed (an in-repo marker isn't reliably gitignored and would propagate the
+# flip to other machines), matching where the canary/budgets/notify config already
+# live. Emit the launchd <EnvironmentVariables> snippet that sets
+# AUTONOMOUS_TOOL_PROFILE=1 iff the marker for $1 (project name) exists; empty
+# otherwise. The driver injects the constrained --settings on every tick when the
+# env is 1. Rollback = rm the marker + reinstall the daemon. Quote-free output, so
+# no XML escaping needed. do_install_daemon splices the result into the plist's
+# EnvironmentVariables dict; a bats test asserts it without a live launchctl bootstrap.
 tool_profile_plist_env() {
-  local project_root="$1"
-  [[ -f "$project_root/.claude/tool-profile.on" ]] || return 0
+  local project="$1"
+  [[ -f "$HOME/.claude/tool-profile/${project}.on" ]] || return 0
   printf '\n        <key>AUTONOMOUS_TOOL_PROFILE</key>\n        <string>1</string>'
 }
 

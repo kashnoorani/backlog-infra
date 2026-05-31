@@ -3431,11 +3431,12 @@ do_install_daemon() {
   home_x="$(xml_escape "$HOME")"
 
   # §5 tool-profile flip-on (docs/tool-profile.md). Thread AUTONOMOUS_TOOL_PROFILE=1
-  # into the daemon's launchd env iff this project has opted in via the marker file
-  # (.claude/tool-profile.on) — opt-in per project so a canary survives a
-  # `sync`/reinstall (which regenerates this plist). No marker ⇒ empty ⇒ the plist
-  # is byte-identical to the pre-flip form. Rollback = rm the marker + reinstall.
-  local tp_env; tp_env="$(tool_profile_plist_env "$project_root")"
+  # into the daemon's launchd env iff this project has opted in via the per-machine
+  # marker ~/.claude/tool-profile/<project>.on (outside the repo, never committed) —
+  # opt-in per project so a canary survives a `sync`/reinstall (which regenerates
+  # this plist). No marker ⇒ empty ⇒ the plist is byte-identical to the pre-flip
+  # form. Rollback = rm the marker + reinstall.
+  local tp_env; tp_env="$(tool_profile_plist_env "$project")"
   [[ -n "$tp_env" ]] && echo "tool-profile: marker present — daemon will run under the deny-by-default profile (AUTONOMOUS_TOOL_PROFILE=1)"
 
   cat > "$plist_path" <<EOF

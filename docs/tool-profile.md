@@ -106,11 +106,14 @@ regenerates the daemon plist). The deny set is purely additive, so the failure m
 is a *blocked* tick, not a *runaway* one — fail-loud, easy to back out.
 
 **Mechanism:** `do_install_daemon` (`bin/backlog-agent`) calls
-`tool_profile_plist_env` (`bin/_lib.sh`); if `<project>/.claude/tool-profile.on`
+`tool_profile_plist_env` (`bin/_lib.sh`); if `~/.claude/tool-profile/<project>.on`
 exists it threads `<key>AUTONOMOUS_TOOL_PROFILE</key><string>1</string>` into the
 daemon plist's `EnvironmentVariables`. The daemon inherits the env from launchd and
 the driver injects the constrained `--settings` on every tick. No marker ⇒ the plist
-is byte-identical to the pre-flip form.
+is byte-identical to the pre-flip form. The marker lives **outside the repo** (in
+`~/.claude/`, like the canary/budgets/notify config) so it is per-machine and never
+committed — an in-repo marker isn't reliably gitignored and would propagate the flip
+to other machines.
 
 **Runbook (canary → fleet):**
 1. **Prove enforcement first** (per CLI version): `backlog-agents tool-profile --verify`.
@@ -119,11 +122,13 @@ is byte-identical to the pre-flip form.
    Read/Edit **SUCCEEDS** (deny is scoped, not a blanket block). This closes the gap
    the hermetic tests can't: they assert the injected JSON, not the CLI's enforcement.
    (`--show` prints the JSON.) Exits non-zero on any mismatch — do not flip on a FAIL.
-2. **Canary one project:** `touch <project>/.claude/tool-profile.on`, then
-   `(cd <project> && backlog-agent install-daemon)` to regenerate + reload the plist
-   (or `launchctl kickstart -k gui/$(id -u)/com.$USER.<project>.backlog-agent`).
-   Watch ≥1 real tick: `log_event tool_profile_applied` present, tick still completes,
-   no spurious tool-denied failures in the item's work.
-3. **Fleet-wide:** repeat the `touch` + reinstall for the remaining projects.
-4. **Rollback:** `rm <project>/.claude/tool-profile.on` + reinstall (or kickstart). A
-   too-broad deny is recoverable — the tick fails loud and the item is left unclaimed.
+2. **Canary one project:** `mkdir -p ~/.claude/tool-profile && touch
+   ~/.claude/tool-profile/<project>.on`, then `(cd <project> && backlog-agent
+   install-daemon)` to regenerate + reload the plist (or `launchctl kickstart -k
+   gui/$(id -u)/com.$USER.<project>.backlog-agent`). Watch ≥1 real tick:
+   `log_event tool_profile_applied` present, tick still completes, no spurious
+   tool-denied failures in the item's work.
+3. **Fleet-wide:** repeat the `touch` + reinstall for the remaining projects — per
+   machine (the marker is per-machine; flip it on each host you want profiled).
+4. **Rollback:** `rm ~/.claude/tool-profile/<project>.on` + reinstall (or kickstart).
+   A too-broad deny is recoverable — the tick fails loud and the item is left unclaimed.

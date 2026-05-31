@@ -22,20 +22,30 @@ AGENTS_BIN="${BATS_TEST_DIRNAME}/../bin/backlog-agents"
 # tool_profile_plist_env — per-project marker gates the launchd env snippet
 # ==========================================================================
 
+# The marker lives at $HOME/.claude/tool-profile/<project>.on (outside the repo).
 @test "plist-env: no marker → empty (plist byte-identical to pre-flip form)" {
-  local proj="$BATS_TEST_TMPDIR/proj"; mkdir -p "$proj/.claude"
-  run bash -c '. "$1"; tool_profile_plist_env "$2"' _ "$LIB" "$proj"
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME/.claude/tool-profile"
+  run bash -c '. "$1"; tool_profile_plist_env "$2"' _ "$LIB" "myproj"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
 }
 
 @test "plist-env: marker present → emits AUTONOMOUS_TOOL_PROFILE=1 env block" {
-  local proj="$BATS_TEST_TMPDIR/proj"; mkdir -p "$proj/.claude"
-  touch "$proj/.claude/tool-profile.on"
-  run bash -c '. "$1"; tool_profile_plist_env "$2"' _ "$LIB" "$proj"
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME/.claude/tool-profile"
+  touch "$HOME/.claude/tool-profile/myproj.on"
+  run bash -c '. "$1"; tool_profile_plist_env "$2"' _ "$LIB" "myproj"
   [ "$status" -eq 0 ]
   echo "$output" | grep -q '<key>AUTONOMOUS_TOOL_PROFILE</key>'
   echo "$output" | grep -q '<string>1</string>'
+}
+
+# A marker for a DIFFERENT project must not flip this one (per-project keying).
+@test "plist-env: marker for another project does not flip this one" {
+  export HOME="$BATS_TEST_TMPDIR/home"; mkdir -p "$HOME/.claude/tool-profile"
+  touch "$HOME/.claude/tool-profile/otherproj.on"
+  run bash -c '. "$1"; tool_profile_plist_env "$2"' _ "$LIB" "myproj"
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
 }
 
 # ==========================================================================

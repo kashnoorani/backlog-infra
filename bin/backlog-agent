@@ -322,6 +322,11 @@ BUDGETS_FILE="${BUDGETS_FILE:-${HOME}/.claude/backlog-budgets.json}"
 BUDGET_STATE_FILE="${STATE_DIR}/backlog-agent-budget.json"
 # Set to 1 in tests / to hard-disable budget enforcement (no per-project pause).
 BUDGET_DISABLE="${BUDGET_DISABLE:-0}"
+# Minimum seconds between budget-pause alerts (defense-in-depth: the {alerted} flag is
+# the primary throttle, but this timestamp fallback catches the case where the state
+# file is spuriously reset — e.g. the ledger is briefly unreadable during a git
+# rebase, _budget_over_cap returns empty, and rm -f clears the state file).
+BUDGET_ALERT_COOLDOWN_SECS="${BUDGET_ALERT_COOLDOWN_SECS:-3600}"
 
 # --- Per-item token/turn/spend ceiling (W2; docs/per-item-ceiling.md) ---
 # [pause-primitive consumer, scope=ITEM] The finest-grained pause primitive: a
@@ -1626,18 +1631,29 @@ _budget_alert_once() {
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   # Always refresh `reason` (so the banner shows the current breach); only `fire`
   # the alert on the rising edge (alerted flag not yet set this breach).
-  local fire
+  local fire now_epoch
+  now_epoch="$(date +%s)"
   fire="$(node -e '
     const fs = require("fs");
-    const [file, reason] = [process.argv[1], process.argv[2]];
+    const [file, reason, cooldownStr, nowStr] = [process.argv[1], process.argv[2], process.argv[3], process.argv[4]];
+    const cooldown = parseInt(cooldownStr, 10) || 3600;
+    const now = parseInt(nowStr, 10) || Math.floor(Date.now()/1000);
     let obj = {};
     try { obj = JSON.parse(fs.readFileSync(file, "utf8")) || {}; } catch { obj = {}; }
     let fire = 0;
-    if (!obj.alerted) { fire = 1; obj.alerted = true; }
+    // Fire iff: the {alerted} flag is not yet set AND (there is no prior timestamp
+    // OR the cooldown has elapsed). The {alerted} flag is the primary throttle;
+    // last_alert_ts is a belt-and-suspenders fallback that catches the case where
+    // the state file was spuriously reset (e.g. ledger briefly unreadable during a
+    // git rebase → _budget_over_cap returns empty → rm -f clears the file).
+    if (!obj.alerted) {
+      const last = Number.isFinite(obj.last_alert_ts) ? obj.last_alert_ts : 0;
+      if (last === 0 || (now - last) > cooldown) { fire = 1; obj.alerted = true; obj.last_alert_ts = now; }
+    }
     obj.reason = reason;
     try { fs.writeFileSync(file, JSON.stringify(obj) + "\n"); } catch {}
     process.stdout.write("" + fire);
-  ' "$BUDGET_STATE_FILE" "$reason" 2>/dev/null || echo 0)"
+  ' "$BUDGET_STATE_FILE" "$reason" "$BUDGET_ALERT_COOLDOWN_SECS" "$now_epoch" 2>/dev/null || echo 0)"
   [[ "$fire" == "1" ]] || return 0
   local project host
   project="$(_health_project)"

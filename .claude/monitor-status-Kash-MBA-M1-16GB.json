@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-31T07:54:07Z",
+  "last_sweep_at": "2026-05-31T08:00:16Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 596,
+  "sweeps_total": 599,
   "fixed_total": 163,
   "flagged_total": 19,
   "recent_actions": [{"ts":"2026-05-31T07:06:38Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:10:44Z","project":"backlog-dashboard","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:12:48Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:14:52Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:14:52Z","project":"dark-mode-safari","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:18:59Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:21:03Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:23:07Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:25:11Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:27:15Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:29:19Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:31:23Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:33:28Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:35:33Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:37:37Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:39:42Z","project":"dark-mode-safari","action":"git_dirty","result":"blocked_inflight"},{"ts":"2026-05-31T07:41:46Z","project":"dark-mode-safari","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:43:51Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:43:51Z","project":"dark-mode-safari","action":"git_dirty","result":"fixed"},{"ts":"2026-05-31T07:47:57Z","project":"backlog-dashboard","action":"git_dirty","result":"fixed"}]

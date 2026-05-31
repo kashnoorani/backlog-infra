@@ -148,6 +148,7 @@
 #   --day      bucket right column by today instead of 7d
 #   --compact  single-line per project, skip machines table
 #   --artifacts show uncommitted changes per host per project
+#   --shipped  show multi-window git work-commit breakdown
 #
 # Sync flags:
 #   --no-pull         skip dotfiles + project pulls (just restart agents)
@@ -281,6 +282,43 @@ top_open_item() {
   ' "$file"
 }
 
+# ---- git-based work counting ----
+
+# Noise commit subjects that should NOT count as real work.
+_is_noise_commit() {
+  local subject="$1"
+  case "$subject" in
+    backlog-agent-status:*) return 0 ;;
+    claim:*)               return 0 ;;
+    reclaim:*)             return 0 ;;
+    auto-complete:*)       return 0 ;;
+    *)                     return 1 ;;
+  esac
+}
+
+# Print one epoch-per-second for every non-noise commit in a repo within
+# [since, until). since/until are Unix epoch seconds; git requires @<epoch>.
+_work_commit_epochs() {
+  local repo="$1" since="$2" until="${3:-}"
+  local since_arg="" until_arg=""
+  [[ -n "$since" ]] && since_arg="--since=@$since"
+  [[ -n "$until" ]] && until_arg="--until=@$until"
+  local line epoch subject
+  git -C "$repo" log --format='%ct %s' $since_arg $until_arg 2>/dev/null \
+    | while IFS= read -r line; do
+        epoch="${line%% *}"
+        subject="${line#* }"
+        _is_noise_commit "$subject" && continue
+        printf '%s\n' "$epoch"
+      done
+}
+
+# Count non-noise commits in a repo for [since, until).
+_work_commit_count() {
+  local repo="$1" since="$2" until="${3:-}"
+  _work_commit_epochs "$repo" "$since" "$until" | wc -l | tr -d ' '
+}
+
 # ---- subcommand: dashboard (default) ----
 
 snapshot() {
@@ -295,6 +333,14 @@ snapshot() {
   fi
 
   local -a rows=()
+
+  # Fleet-wide shipped counters (git-based, noise excluded).
+  local fleet_shipped_today=0 fleet_shipped_week=0
+  local today_midnight today_midnight_epoch
+  today_midnight="$(date '+%Y-%m-%d') 00:00:00"
+  today_midnight_epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "$today_midnight" '+%s' 2>/dev/null || echo 0)"
+  local week_start_epoch
+  week_start_epoch="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date -v-Mon '+%Y-%m-%d') 00:00:00" '+%s' 2>/dev/null || echo 0)"
 
   # Fleet-wide host tracking (cross-machine).
   local this_host; this_host="$(hostname)"
@@ -401,6 +447,17 @@ snapshot() {
     fi
 
     local name; name="$(basename "$proj")"
+
+    # Per-project work-commit counts (git-based, noise excluded).
+    local proj_today=0 proj_week=0
+    if [[ -d "$proj/.git" ]]; then
+      proj_today="$(_work_commit_count "$proj" "$today_midnight_epoch" 2>/dev/null || echo 0)"
+      proj_week="$(_work_commit_count "$proj" "$week_start_epoch" 2>/dev/null || echo 0)"
+      [[ "$proj_today" =~ ^[0-9]+$ ]] || proj_today=0
+      [[ "$proj_week"  =~ ^[0-9]+$ ]] || proj_week=0
+      fleet_shipped_today=$(( fleet_shipped_today + proj_today ))
+      fleet_shipped_week=$((  fleet_shipped_week  + proj_week  ))
+    fi
     local last_tick last_item last_exit last_pull
     last_tick="$(jq -r '.last_tick_at // empty' "$status")"
     last_item="$(jq -r '.last_item // ""' "$status")"
@@ -523,7 +580,7 @@ snapshot() {
     case "$state" in fresh) state_rank=0 ;; idle) state_rank=1 ;; STALE) state_rank=2 ;; esac
     local sort_key; printf -v sort_key '%d%d%06d' "$has_item" "$state_rank" "$age"
 
-    rows+=("$sort_key|$name|$age_str|$active_host_short|$item_short|$state|$state_color|$(fmt_tok $sum_5h)|$(fmt_tok $sum_right)|$last_pull|$log_mb|$other_hosts|$age")
+    rows+=("$sort_key|$name|$age_str|$active_host_short|$item_short|$state|$state_color|$(fmt_tok $sum_5h)|$(fmt_tok $sum_right)|$last_pull|$log_mb|$other_hosts|$age|$proj_today")
   done
 
   # Sort rows by priority: open items first, then freshness, then recency.
@@ -586,16 +643,14 @@ snapshot() {
     "$B" "$this_host_short" "$RS" \
     "$GN" "$this_machine_projects" "$RS" "$total"
 
-  # Fleet-wide backlog counts: sum open and done across all active projects.
-  local total_open=0 total_done=0
+  # Fleet-wide backlog counts: sum open across all active projects.
+  local total_open=0
   for proj_dir in "${unique[@]}"; do
     local s; s="$(find_status_file "$proj_dir")"
     [[ -n "$s" ]] || continue
-    local o d
+    local o
     o="$(jq -r '(.backlog.open // 0 | tostring)' "$s" 2>/dev/null || echo 0)"
-    d="$(jq -r '(.backlog.done // 0 | tostring)' "$s" 2>/dev/null || echo 0)"
     [[ "$o" =~ ^[0-9]+$ ]] && total_open=$((total_open + o))
-    [[ "$d" =~ ^[0-9]+$ ]] && total_done=$((total_done + d))
   done
 
   local have_sync=0 have_watch=0
@@ -607,8 +662,8 @@ snapshot() {
     printf '  machines: %d (%s%d active%s, %s%d idle%s, %s%d stale%s)  |' \
       "${#_map_keys[@]}" "$GN" "$m_active" "$RS" "$DIM" "$m_idle" "$RS" "$RD" "$m_stale" "$RS"
   fi
-  printf '  open: %s%d%s  done: %s%d%s  |' \
-    "$GN" "$total_open" "$RS" "$DIM" "$total_done" "$RS"
+  printf '  open: %s%d%s  shipped: %s%d (today)%s / %s%d (week)%s  |' \
+    "$GN" "$total_open" "$RS" "$GN" "$fleet_shipped_today" "$RS" "$DIM" "$fleet_shipped_week" "$RS"
   printf '  this machine: %s%d daemons%s' "$B" "$local_daemons" "$RS"
   if (( have_sync && have_watch )); then
     printf ', watchdog %s✓%s\n' "$GN" "$RS"
@@ -818,23 +873,23 @@ snapshot() {
   if (( ! COMPACT )); then
 
   if (( EFFORT )) ; then
-    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-7s %-7s %-8s%s\n' \
-      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "LOG" "$RS"
+    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-5s %-7s %-7s %-8s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "TODAY" "5h" "$right_label" "LOG" "$RS"
   else
-    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-7s %-7s%s\n' \
-      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "5h" "$right_label" "$RS"
+    printf '  %s%-18s %-9s %-9s %-36s %-6s %-9s %-4s %-5s %-7s %-7s%s\n' \
+      "$DIM" "PROJECT" "LAST BY" "TICK" "ITEM" "STATE" "ALSO BY" "PULL" "TODAY" "5h" "$right_label" "$RS"
   fi
   for row in "${rows[@]}"; do
-    local name age host item state state_color s5h sR pulled log_mb other_hosts _sort _age
-    IFS='|' read -r _sort name age host item state state_color s5h sR pulled log_mb other_hosts _age <<< "$row"
+    local name age host item state state_color s5h sR pulled log_mb other_hosts _sort _age proj_today
+    IFS='|' read -r _sort name age host item state state_color s5h sR pulled log_mb other_hosts _age proj_today <<< "$row"
     (( ${#name} > 18 )) && name="${name:0:15}…"
     (( ${#other_hosts} > 9 )) && other_hosts="${other_hosts:0:6}…"
     if (( EFFORT )); then
-      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s %-8s\n' \
-        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR" "$log_mb"
+      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-5s %-7s %-7s %-8s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$proj_today" "$s5h" "$sR" "$log_mb"
     else
-      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-7s %-7s\n' \
-        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$s5h" "$sR"
+      printf '  %-18s %-9s %-9s %-36s %s%-6s%s %-9s %-4s %-5s %-7s %-7s\n' \
+        "$name" "$host" "$age" "$item" "$state_color" "$state" "$RS" "$other_hosts" "$pulled" "$proj_today" "$s5h" "$sR"
     fi
   done
   fi  # ! COMPACT
@@ -973,16 +1028,96 @@ snapshot() {
   fi  # ! COMPACT
   fi
 
+  # ---- shipped: multi-window git-based work-commit breakdown ----
+  if (( SHIPPED )); then
+    local now_ts="$now"
+    local td_mid="$today_midnight_epoch"
+    local yest_mid=$(( td_mid - 86400 ))
+    local rolling_24h=$(( now_ts - 86400 ))
+    local rolling_48h=$(( now_ts - 172800 ))
+    local rolling_7d=$((  now_ts - 604800 ))
+    local prev_week_start=$(( week_start_epoch - 604800 ))
+    local month_start; month_start="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-%m-01') 00:00:00" '+%s' 2>/dev/null || echo 0)"
+    local rolling_30d=$(( now_ts - 2592000 ))
+    local year_start; year_start="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(date '+%Y-01-01') 00:00:00" '+%s' 2>/dev/null || echo 0)"
+
+    echo
+    printf '  %sSHIPPED%s (meaningful git commits, excludes daemon telemetry)\n' "${B}${CY}" "${RS}"
+    printf '  %-18s %5s %5s %5s %5s %5s %5s %5s %5s %5s\n' \
+      "PROJECT" "TODAY" "24H" "YEST" "48H" "WK" "7D" "PWK" "MO" "30D"
+
+    local sp_count=0
+    for proj_dir in "${unique[@]}"; do
+      [[ -d "$proj_dir/.git" ]] || continue
+      local pname; pname="$(basename "$proj_dir")"
+      local epochs
+      epochs="$(_work_commit_epochs "$proj_dir" "$year_start" 2>/dev/null || true)"
+
+      local ct=0 c24=0 cy=0 c48=0 cwk=0 c7d=0 cpwk=0 cmo=0 c30d=0
+      while IFS= read -r ep; do
+        [[ -z "$ep" || "$ep" == "0" ]] && continue
+        (( ep >= td_mid ))          && (( ct++ ))
+        (( ep >= rolling_24h ))     && (( c24++ ))
+        (( ep >= yest_mid && ep < td_mid )) && (( cy++ ))
+        (( ep >= rolling_48h ))     && (( c48++ ))
+        (( ep >= week_start_epoch ))&& (( cwk++ ))
+        (( ep >= rolling_7d ))      && (( c7d++ ))
+        (( ep >= prev_week_start && ep < week_start_epoch )) && (( cpwk++ ))
+        (( ep >= month_start ))     && (( cmo++ ))
+        (( ep >= rolling_30d ))     && (( c30d++ ))
+      done <<< "$epochs"
+
+      printf '  %-18s %5d %5d %5d %5d %5d %5d %5d %5d %5d\n' \
+        "$pname" "$ct" "$c24" "$cy" "$c48" "$cwk" "$c7d" "$cpwk" "$cmo" "$c30d"
+      sp_count=$(( sp_count + 1 ))
+    done
+    if (( sp_count == 0 )); then
+      printf '  %s(no projects with .git directories)%s\n' "$DIM" "$RS"
+    fi
+
+    # Monthly breakdown for current year
+    echo
+    printf '  %sMONTHLY%s (%s)\n' "${B}${CY}" "${RS}" "$(date '+%Y')"
+    local current_month; current_month="$(date '+%-m' 2>/dev/null || date '+%m' | sed 's/^0//')"
+    local month_labels=("JAN" "FEB" "MAR" "APR" "MAY" "JUN" "JUL" "AUG" "SEP" "OCT" "NOV" "DEC")
+    local hdr; printf -v hdr '  %-18s' "PROJECT"
+    local m
+    for (( m=1; m<=current_month; m++ )); do
+      hdr+=$(printf ' %4s' "${month_labels[$((m-1))]}")
+    done
+    printf '%s\n' "$hdr"
+
+    for proj_dir in "${unique[@]}"; do
+      [[ -d "$proj_dir/.git" ]] || continue
+      local pname; pname="$(basename "$proj_dir")"
+      local mrow; printf -v mrow '  %-18s' "$pname"
+      for (( m=1; m<=current_month; m++ )); do
+        local ms me
+        ms="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(printf '%s-%02d-01 00:00:00' "$(date '+%Y')" "$m")" '+%s' 2>/dev/null || echo 0)"
+        if (( m == current_month )); then
+          me="$now_ts"
+        else
+          me="$(date -j -f '%Y-%m-%d %H:%M:%S' "$(printf '%s-%02d-01 00:00:00' "$(date '+%Y')" "$((m+1))")" '+%s' 2>/dev/null || echo 0)"
+        fi
+        local mc
+        mc="$(_work_commit_count "$proj_dir" "$ms" "$me" 2>/dev/null || echo 0)"
+        [[ "$mc" =~ ^[0-9]+$ ]] || mc=0
+        mrow+=$(printf ' %4s' "$mc")
+      done
+      printf '%s\n' "$mrow"
+    done
+  fi
+
   # ---- compact mode: skip everything below, render single-line per project ----
   if (( COMPACT )); then
     echo
-    printf '  %-18s %-7s %-9s %-6s %-7s %s\n' "PROJECT" "STATE" "LAST BY" "PULL" "5h" "ITEM"
+    printf '  %-18s %-7s %-9s %-6s %-5s %-7s %s\n' "PROJECT" "STATE" "LAST BY" "PULL" "TODAY" "5h" "ITEM"
     for row in "${rows[@]}"; do
-      local _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age
-      IFS='|' read -r _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age <<< "$row"
+      local _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age proj_today
+      IFS='|' read -r _sort name age_str host item state state_color s5h sR pulled _log_mb _oh _age proj_today <<< "$row"
       (( ${#item} > 40 )) && item="${item:0:37}…"
-      printf '  %-18s %s%-6s%s %-9s %-6s %-7s %s\n' \
-        "$name" "$state_color" "$state" "$RS" "$host" "$pulled" "$s5h" "$item"
+      printf '  %-18s %s%-6s%s %-9s %-6s %-5s %-7s %s\n' \
+        "$name" "$state_color" "$state" "$RS" "$host" "$pulled" "$proj_today" "$s5h" "$item"
     done
     return
   fi
@@ -3381,7 +3516,7 @@ do_tool_profile() {
 # ---- dispatch ----
 
 # Flags only apply to the default (snapshot) command.
-FETCH=0; WATCH=0; EFFORT=0; DAY=0; COMPACT=0; ARTIFACTS=0
+FETCH=0; WATCH=0; EFFORT=0; DAY=0; COMPACT=0; ARTIFACTS=0; SHIPPED=0
 
 cmd="${1:-}"
 case "$cmd" in
@@ -3422,6 +3557,7 @@ case "$cmd" in
         --day)    DAY=1 ;;
         --compact) COMPACT=1 ;;
         --artifacts) ARTIFACTS=1 ;;
+        --shipped)   SHIPPED=1 ;;
         *) echo "backlog-agents: unknown flag: $arg" >&2; exit 2 ;;
       esac
     done

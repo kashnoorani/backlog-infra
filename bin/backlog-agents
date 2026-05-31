@@ -2511,13 +2511,14 @@ do_canary() {
 #   backlog-agents freeze --eval                auto-clear iff skew-zero + canary
 #   backlog-agents unfreeze                     manual override clear
 #
-# Overrides (testing): FREEZE_URL, HEALTH_URL, FREEZE_LIVENESS_SECS.
-FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
-HEALTH_URL="${HEALTH_URL:-https://kash-backlogs.pages.dev/api/health}"
-COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
+# Overrides (testing): BACKLOGS_API_BASE, FREEZE_URL, HEALTH_URL, FREEZE_LIVENESS_SECS.
+API_BASE="${BACKLOGS_API_BASE:-https://fleet.kashifnoorani.org}"
+FREEZE_URL="${FREEZE_URL:-${API_BASE}/api/fleet-control}"
+HEALTH_URL="${HEALTH_URL:-${API_BASE}/api/health}"
+COOLDOWN_URL="${COOLDOWN_URL:-${API_BASE}/api/cooldown}"
 # Per-(project,host) liveness point-read (the same signal the reaper uses); the
 # dead-man's-switch staleness watcher in `monitor` consults it. docs/dead-mans-switch.md.
-HEARTBEAT_URL="${HEARTBEAT_URL:-https://kash-backlogs.pages.dev/api/heartbeat}"
+HEARTBEAT_URL="${HEARTBEAT_URL:-${API_BASE}/api/heartbeat}"
 # DECISION B liveness window: a host whose heartbeat is older than this is not
 # counted toward skew-zero (a powered-off laptop must not pin the freeze). 90m,
 # mirroring the reaper's stale-claim threshold.
@@ -2609,8 +2610,9 @@ _fleet_skew_zero() {
   local ref; ref="$(_driver_ref_sha)"
   [[ -z "$ref" ]] && return 1
   command -v curl >/dev/null 2>&1 || return 1
-  local body code
-  body="$(curl -s -m 8 -w $'\n%{http_code}' "$HEALTH_URL" 2>/dev/null)" || return 1
+  local body code auth
+  local key; key="$(_health_key)"; [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  body="$(curl -s -m 8 ${auth[@]+"${auth[@]}"} -w $'\n%{http_code}' "$HEALTH_URL" 2>/dev/null)" || return 1
   code="$(printf '%s' "$body" | tail -n1)"; body="$(printf '%s' "$body" | sed '$d')"
   [[ "$code" == "200" ]] || return 1
   local skewed

@@ -211,7 +211,9 @@ DIFF_SIZE_MAX_LINES=400
 # Arm/clear WRITES + the fleet-wide clear EVALUATION live in `backlog-agents`
 # (it already speaks jq + computes version-skew); the driver only does the cheap
 # jq-free read here and delegates the rest.
-FREEZE_URL="${FREEZE_URL:-https://kash-backlogs.pages.dev/api/fleet-control}"
+# Base URL for the CF dashboard API (health-ingest, fleet-control, etc.).
+API_BASE="${BACKLOGS_API_BASE:-https://fleet.kashifnoorani.org}"
+FREEZE_URL="${FREEZE_URL:-${API_BASE}/api/fleet-control}"
 FREEZE_PROJECT="${FREEZE_PROJECT:-backlog-infra}"
 FREEZE_CACHE="${STATE_DIR}/fleet-freeze.cache"
 FLEET_AFFECTING_PREFIX="bin/"
@@ -232,7 +234,7 @@ FREEZE_DISABLE="${FREEZE_DISABLE:-0}"
 # cooldown stays intact as that fallback. The signal AUTO-EXPIRES at until_epoch
 # (no manual clear needed — the first daemon past the reset proceeds and it
 # lapses). docs/account-cooldown.md.
-COOLDOWN_URL="${COOLDOWN_URL:-https://kash-backlogs.pages.dev/api/cooldown}"
+COOLDOWN_URL="${COOLDOWN_URL:-${API_BASE}/api/cooldown}"
 # Set to 1 in tests / to hard-disable the account-cooldown read + publish.
 ACCOUNT_COOLDOWN_DISABLE="${ACCOUNT_COOLDOWN_DISABLE:-0}"
 
@@ -249,7 +251,7 @@ ACCOUNT_COOLDOWN_DISABLE="${ACCOUNT_COOLDOWN_DISABLE:-0}"
 # marks the row applied. Item addressing is `<project>#<index>` + an optional
 # title-prefix guard (a stale index ⇒ NO-OP + re-notify, never the wrong item).
 # docs/remote-unblock.md.
-UNBLOCK_URL="${UNBLOCK_URL:-https://kash-backlogs.pages.dev/api/unblock}"
+UNBLOCK_URL="${UNBLOCK_URL:-${API_BASE}/api/unblock}"
 # Set to 1 in tests / to hard-disable the remote-unblock poll + apply.
 REMOTE_UNBLOCK_DISABLE="${REMOTE_UNBLOCK_DISABLE:-0}"
 
@@ -1074,7 +1076,7 @@ _d1_heartbeat_epoch() {
   local project host url body http_code
   project="$(_urlencode "$(_health_project)")"
   host="$(_urlencode "${host_arg:-$(_health_host)}")"
-  url="https://kash-backlogs.pages.dev/api/heartbeat?project=${project}&host=${host}"
+  url="${API_BASE}/api/heartbeat?project=${project}&host=${host}"
 
   # -s silent, -m 5 hard cap, -w to capture the HTTP status separately so we can
   # require a 200 before trusting the body. On curl failure $? != 0 -> empty.

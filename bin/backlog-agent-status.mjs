@@ -692,6 +692,7 @@ async function main() {
   if (existsSync(healthKeyFile)) {
     try {
       const key = readFileSync(healthKeyFile, "utf8").trim();
+      const apiBase = process.env.BACKLOGS_API_BASE || "https://fleet.kashifnoorani.org";
       const projectName = (() => {
         try { return JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).name; }
         catch { return REPO_ROOT.split("/").pop(); }
@@ -706,7 +707,7 @@ async function main() {
           }
         } catch {}
       }
-      fetch("https://kash-backlogs.pages.dev/api/health-ingest", {
+      fetch(`${apiBase}/api/health-ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${key}` },
         body: JSON.stringify({

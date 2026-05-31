@@ -1,9 +1,9 @@
 {
-  "last_sweep_at": "2026-05-31T06:17:28Z",
+  "last_sweep_at": "2026-05-31T06:23:37Z",
   "running": true,
   "fix_mode": 1,
   "host": "Kash-MBA-M1-16GB",
-  "sweeps_total": 549,
+  "sweeps_total": 552,
   "fixed_total": 153,
   "flagged_total": 7,
   "recent_actions": [{"ts":"2026-05-30T20:06:32Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:08:37Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:10:43Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:12:49Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:14:54Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:17:00Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:19:05Z","project":"predictive-history","action":"git_push_rejected","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"predictive-history","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T20:51:50Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-30T22:03:55Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:16:21Z","project":"TaizMail","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:51:15Z","project":"sacred-geography","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:53:18Z","project":"RallyCut-claude","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:53:18Z","project":"backlog-dashboard","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:53:18Z","project":"dark-mode-safari","action":"stale_lock","result":"fixed"},{"ts":"2026-05-31T01:53:18Z","project":"predictive-history","action":"stale_lock","result":"fixed"}]

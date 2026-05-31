@@ -187,9 +187,15 @@ prepush_hook_is_current() {
 # "telegram_chat_id" / "local_notify". jq-free (grep/sed extract over our own
 # controlled keys). Every transport is best-effort + backgrounded so a slow/dead
 # endpoint can never block or abort a tick; an empty config is a silent no-op.
-# Usage: notify_send "<title>" "<body>"  (title = Slack/Telegram prefix + email subject).
+# HTML-escape the 3 characters Telegram's HTML parser treats as markup.
+# Usage: _html_esc "some <string> with & chars"
+_html_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# Usage: notify_send "<title>" "<body>" ["<tg_html>"]
+# Optional 3rd arg: pre-formatted HTML for Telegram (parse_mode=HTML). When omitted,
+# Telegram receives plain "${title}: ${body}". Slack / email / macOS always get plain text.
 notify_send() {
-  local title="${1:-backlog-agent}" body="${2:-}"
+  local title="${1:-backlog-agent}" body="${2:-}" tg_html="${3:-}"
   local cfg="${NOTIFY_CONFIG:-$HOME/.claude/agent-notify.json}"
   [[ -n "$body" ]] || return 0
   [[ -f "$cfg" ]] || return 0
@@ -216,10 +222,20 @@ notify_send() {
   fi
   if [[ -n "$tg_token" && -n "$tg_chat" ]] && command -v curl >/dev/null 2>&1; then
     # Telegram Bot API sendMessage; --data-urlencode handles all escaping (jq-free).
-    ( curl -fsS -m 10 -X POST \
-        --data-urlencode "chat_id=${tg_chat}" \
-        --data-urlencode "text=${title}: ${body}" \
-        "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true ) &
+    # When a pre-formatted tg_html body is provided, send it with parse_mode=HTML so
+    # bold/code/line-breaks render. Otherwise fall back to plain "${title}: ${body}".
+    if [[ -n "$tg_html" ]]; then
+      ( curl -fsS -m 10 -X POST \
+          --data-urlencode "chat_id=${tg_chat}" \
+          --data-urlencode "text=${tg_html}" \
+          --data-urlencode "parse_mode=HTML" \
+          "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true ) &
+    else
+      ( curl -fsS -m 10 -X POST \
+          --data-urlencode "chat_id=${tg_chat}" \
+          --data-urlencode "text=${title}: ${body}" \
+          "https://api.telegram.org/bot${tg_token}/sendMessage" >/dev/null 2>&1 || true ) &
+    fi
   fi
   if [[ -n "$email" ]] && command -v mail >/dev/null 2>&1; then
     ( printf '%s\n' "$body" | mail -s "$title" "$email" >/dev/null 2>&1 || true ) &

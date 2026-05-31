@@ -3121,7 +3121,8 @@ do_digest() {
 
   # --- push via the shared notify channel ---
   if (( do_notify )); then
-    local body
+    local body tg_body _di
+    # Plain text (Slack / email / macOS)
     body="Fleet (last ${period_label}): ${f_done} completed, ${f_ticks} ticks, $(fmt_tok "$f_tokens") tokens, ${f_blk} open [?] blocker(s)."
     if [[ -n "$blockers_list" ]]; then
       body="${body}"$'\n'"Blockers (reply '<project>#<N> your answer' to unblock):"
@@ -3130,7 +3131,33 @@ do_digest() {
         body="${body}"$'\n'"  ${p}#${idx} ${t:0:80}"
       done < <(printf '%s' "$blockers_list")
     fi
-    notify_send "backlog-agents digest (${period_label})" "$body"
+    # HTML body for Telegram
+    tg_body="$(printf '📊 <b>Fleet Digest</b> — last %s\n' "$period_label")"
+    if (( ${#d_name[@]} )); then
+      for _di in "${!d_name[@]}"; do
+        if (( d_done[_di] > 0 || d_ticks[_di] > 0 )); then
+          local _icon="✅"; (( d_done[_di] == 0 )) && _icon="💤"
+          tg_body="${tg_body}"$'\n'"${_icon} <b>${d_name[_di]}</b>  ${d_done[_di]} done · ${d_ticks[_di]} ticks · $(fmt_tok "${d_tokens[_di]}") tok"
+        fi
+      done
+    fi
+    tg_body="${tg_body}"$'\n\n'"📦 <b>Fleet:</b> ${f_done} done · ${f_ticks} ticks · $(fmt_tok "$f_tokens") tok · ${f_blk} blocker(s)"
+    if [[ -n "$blockers_list" ]]; then
+      tg_body="${tg_body}"$'\n\n'"🔴 <b>Blockers</b> — reply to unblock:"
+      while IFS=$'\t' read -r p idx t; do
+        [[ -n "$p" ]] || continue
+        tg_body="${tg_body}"$'\n'"• <b>${p}#${idx}</b>  $(_html_esc "${t:0:80}")"
+        tg_body="${tg_body}"$'\n'"  → <code>${p}#${idx} your answer</code>"
+      done < <(printf '%s' "$blockers_list")
+    fi
+    if [[ -n "$completions_list" ]]; then
+      tg_body="${tg_body}"$'\n\n'"✅ <b>Completions</b>"
+      while IFS=$'\t' read -r p t; do
+        [[ -n "$p" ]] || continue
+        tg_body="${tg_body}"$'\n'"• [<b>${p}</b>]  $(_html_esc "${t:0:80}")"
+      done < <(printf '%s' "$completions_list")
+    fi
+    notify_send "backlog-agents digest (${period_label})" "$body" "$tg_body"
   fi
   return 0
 }

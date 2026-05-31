@@ -282,8 +282,8 @@ cmd_new() {
   echo "    # 1. Fill in package.json scripts (build / deploy:preview / deploy)"
   echo "    #    — see WORKFLOW.md \"Bootstrap checklist\" step 5"
   echo "    # 2. Adjust scripts/release.mjs if your CDN isn't Cloudflare Pages"
-  echo "    # 3. Copy CLAUDE.md sections (Backlog draining + Release workflow)"
-  echo "    #    from ~/dev/projects/active/sacred-geography/CLAUDE.md"
+  echo "    # 3. Edit CLAUDE.md — fill in placeholder sections (overview,"
+  echo "    #    commands, project layout, what NOT to do)"
   echo "    # 4. On your CDN, set the production branch to 'release'"
   echo "    # 5. Populate docs/Backlog.md with first items"
 }

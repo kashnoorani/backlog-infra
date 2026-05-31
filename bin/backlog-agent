@@ -2800,7 +2800,7 @@ tick_once() {
     agent_cmd=( "${FALLBACK_CMD[@]}" )
   else
     use_fallback=""; agent_name="claude"
-    agent_cmd=( claude -p --fallback-model claude-haiku-4-5 )
+    agent_cmd=( claude -p --fallback-model claude-sonnet-4-6 )
     # Preventive deny-by-default tool/permission profile (opt-in; docs/threat-model.md
     # §5). Inject the constrained --settings so an injection that slips past the
     # firewall still can't reach the network / read secrets / rewrite the shared

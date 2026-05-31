@@ -1159,6 +1159,35 @@ _d1_control_get() {
   return 0
 }
 
+# --- Per-project pause check (W6 agent-level controls) ---
+# Queries the D1 bus for this project's per-project pause state. Echoes "1" if
+# the project is paused, NOTHING otherwise. FAIL-OPEN: a D1 outage or missing
+# table returns empty, so the project keeps ticking — per-project pause is a
+# soft signal, not a hard gate.
+_d1_project_pause_get() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local key_file="$HOME/.config/backlog/health-key"
+  local auth=() key project_esc
+  if [[ -f "$key_file" ]]; then
+    key="$(tr -d '[:space:]' < "$key_file" 2>/dev/null || true)"
+    [[ -n "$key" ]] && auth=(-H "Authorization: Bearer $key")
+  fi
+  [[ -z "$PROJECT" ]] && return 0
+  # URL-encode the project name (replace spaces + special chars)
+  project_esc="$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PROJECT'))" 2>/dev/null || printf '%s' "$PROJECT" | sed 's/ /%20/g')"
+  local body http_code paused
+  body="$(curl -s -m 5 ${auth[@]+"${auth[@]}"} "$FREEZE_URL?project=${project_esc}" 2>/dev/null)" || return 0
+  http_code="$(printf '%s' "$body" | tail -n1)"
+  body="$(printf '%s' "$body" | sed '$d')"
+  [[ "$http_code" == "200" ]] || return 0
+  paused="$(printf '%s' "$body" \
+            | grep -oE '"project_paused"[[:space:]]*:[[:space:]]*[0-9]+' \
+            | grep -oE '[0-9]+$' | head -n1 || true)"
+  [[ "$paused" == "1" ]] || return 0
+  printf '1'
+  return 0
+}
+
 # --- Account-level cooldown read (W2; docs/account-cooldown.md) ---
 # Echo the account cooldown's `until_epoch` from the D1 bus (dedicated
 # /api/cooldown row), or NOTHING on any failure / when no cooldown is active —
@@ -2494,6 +2523,23 @@ tick_once() {
       fi
       ;;
   esac
+
+  # --- Per-project pause (W6 agent-level controls) ---
+  # Operator-armed hold on a SINGLE project (not fleet-wide). Like budget
+  # enforcement above: the daemon heartbeat-ticks but skips claude work until
+  # the project is unpaused. FAIL-OPEN: D1 unreachable ⇒ project keeps ticking.
+  # Unlike fleet freeze/pause, there is NO infra exemption — any project can
+  # be paused from the dashboard.
+  if [[ -n "$(_d1_project_pause_get)" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] per-project pause active — ${PROJECT} is paused from the dashboard; heartbeat only (skipping claude until unpaused)" | tee -a "$LOG_FILE"
+    pre_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+    _run_status_hook "" 0 loop "$pre_head" 0
+    _post_tick_cleanup
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] tick done (per-project pause)" | tee -a "$LOG_FILE"
+    log_event tick_done outcome project_pause project "$PROJECT" duration_s "$(( $(date +%s) - tick_start_epoch ))"
+    TICK_OUTCOME=project_pause
+    return 0
+  fi
 
   # Pull before reading the backlog — catches cross-machine changes from
   # other computers that pushed to origin. Best-effort: no upstream is fine,
